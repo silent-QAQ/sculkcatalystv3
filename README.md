@@ -139,3 +139,13 @@ cargo run
 - `PUT /api/servers/{id}/file` 保存配置、脚本、日志和 Markdown 等文本文件
 - `POST /api/servers/{id}/directory` 在服务器工作区中新建目录
 - 拒绝绝对路径、`..` 路径穿越、符号链接和 `server.jar` 等二进制覆盖
+
+## 开源协议
+
+本项目采用分区许可：
+
+- 除特别声明的文件外，项目主体基于 [Apache License 2.0](LICENSE) 开源，允许使用、分发和二次修改；分发修改版本时必须保留原作者、版权与许可声明，并注明修改内容。
+- Sculk Cloud 云账号系统相关文件基于 [PolyForm Noncommercial License 1.0.0](LICENSES/PolyForm-Noncommercial-1.0.0.md) 提供，仅允许协议规定的非商业用途，禁止未经授权的商业使用。
+- 完整的受限文件范围与署名要求见 [NOTICE](NOTICE)。未明确列入 `NOTICE` 的文件适用 Apache License 2.0。
+
+PolyForm Noncommercial 许可部分属于源码可用（source-available），不属于 OSI 定义的开源软件。如需商业使用 Sculk Cloud，请联系原作者另行取得商业授权。

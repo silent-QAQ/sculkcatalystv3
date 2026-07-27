@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 param(
     [string]$BaseUrl = 'http://127.0.0.1:8788',
     [string]$RelayBaseUrl = 'http://127.0.0.1:9944'

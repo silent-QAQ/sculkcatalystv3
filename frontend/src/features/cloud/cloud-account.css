@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0 */
+
 .cloud-console{--cloud-cyan:#67b6cb;--cloud-amber:#e3aa62;--cloud-red:#e77979;--cloud-panel:#11171d;--cloud-raised:#171e26;position:relative;width:min(1120px,100%);margin:0 auto;color:#e8edf2;font-size:11px}
 .cloud-console *{box-sizing:border-box}
 .cloud-console button,.cloud-console input,.cloud-console select,.cloud-console textarea{font:inherit}

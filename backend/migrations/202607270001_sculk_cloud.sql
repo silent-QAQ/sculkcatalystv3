@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 CREATE TABLE cloud_users (
     id UUID PRIMARY KEY,
     email TEXT NOT NULL,

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 use crate::AppState;
 use aes_gcm::{
     Aes256Gcm, Nonce,

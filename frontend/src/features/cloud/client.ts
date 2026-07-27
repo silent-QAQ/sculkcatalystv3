@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 import { apiUrl } from '../../lib/api'
 
 const TOKEN_KEY = 'sculk-cloud-session'
