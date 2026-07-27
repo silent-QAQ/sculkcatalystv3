@@ -1,0 +1,10 @@
+.files-view > aside > header { align-items:center; }
+.files-view > aside > header > span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.files-view > aside > header > button { width:22px; height:22px; display:grid; place-items:center; padding:0; border:0; border-radius:5px; color:#778390; background:transparent; }
+.files-view > aside > header > button:hover { color:#d4dbe2; background:rgba(255,255,255,.05); }
+.files-view > aside > button > span { overflow:hidden; flex:1; text-align:left; text-overflow:ellipsis; white-space:nowrap; }
+.files-view > aside > button > small { margin-left:auto; color:#505c68; font-size:7px; }
+.new-folder { display:flex; gap:4px; margin:0 0 8px; padding:0 3px; }
+.new-folder input { min-width:0; height:27px; flex:1; padding:0 7px; border:1px solid rgba(50,213,176,.18); border-radius:5px; outline:0; color:#cbd2da; background:#0c1116; font-size:8px; }
+.new-folder button { height:27px; padding:0 7px; border:0; border-radius:5px; color:#08241e; background:#32d5b0; font-size:7px; }
+.config-editor[readonly] { color:#74808c; cursor:not-allowed; }
