@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+name: sculk-resource
+
+services:
+  api:
+    container_name: sculk-resource-api
+    image: sculk-resource-api:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.resource-center
+      network: host
+    network_mode: host
+    env_file:
+      - ${SCULK_RESOURCE_ROOT:-/opt/sculk-resource}/config/resource.env
+    volumes:
+      - ${SCULK_RESOURCE_ROOT:-/opt/sculk-resource}/data:/app/data
+      - ${SCULK_RESOURCE_ROOT:-/opt/sculk-resource}/objects:/app/objects
+    restart: unless-stopped
+
+  caddy:
+    container_name: sculk-resource-caddy
+    image: caddy:2.10-alpine
+    network_mode: host
+    env_file:
+      - ${SCULK_RESOURCE_ROOT:-/opt/sculk-resource}/config/caddy.env
+    volumes:
+      - ${SCULK_RESOURCE_ROOT:-/opt/sculk-resource}/config/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${SCULK_RESOURCE_ROOT:-/opt/sculk-resource}/objects:/srv/objects:ro
+      - ${SCULK_RESOURCE_ROOT:-/opt/sculk-resource}/caddy-data:/data
+      - ${SCULK_RESOURCE_ROOT:-/opt/sculk-resource}/caddy-config:/config
+      - ${SCULK_RESOURCE_ROOT:-/opt/sculk-resource}/logs:/var/log/caddy
+    depends_on:
+      - api
+    restart: unless-stopped

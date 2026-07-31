@@ -1,0 +1,24 @@
+Sculk Catalyst V3
+Copyright 2026 silent-QAQ
+
+The project is primarily licensed under the Apache License, Version 2.0.
+Files explicitly identified below are licensed under the PolyForm
+Noncommercial License 1.0.0 instead:
+
+- backend/src/cloud.rs
+- backend/migrations/202607270001_sculk_cloud.sql
+- backend/migrations/202607280002_cloud_workspace.sql
+- backend/migrations/202607300003_cloud_agents.sql
+- frontend/src/features/cloud/**
+- frontend/src/features/settings/sections/AccountSection.vue
+- scripts/start-cloud.ps1
+- scripts/stop-cloud.ps1
+- scripts/cloud-smoke-test.ps1
+- docker-compose.cloud.yml
+- .env.cloud.example
+
+Required Notice: Copyright 2026 silent-QAQ. Sculk Cloud components are licensed under the PolyForm Noncommercial License 1.0.0 and may be used only for permitted noncommercial purposes.
+
+Redistributions and modified versions must retain this NOTICE file, the
+applicable license text, the original author attribution, and a prominent
+description of any modified files.

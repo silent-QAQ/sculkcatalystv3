@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+
+# Frontend build output
+frontend/dist/
+frontend/dist-cloud/
+
+# Rust build output
+backend/target/
+backend/target-cloud/
+backend/target-*/
+agent/target/
+
+# Local package caches and generated bundles
+.npm-cache/
+.pnpm-store/
+artifacts/generated/
+backend/deploy-backups/
+
+# Local runtime state
+data/
+backend/data/
+.runtime/
+.claude/
+
+# Environment variables and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.lock
+!package-lock.json
+!frontend/package-lock.json
+!backend/Cargo.lock

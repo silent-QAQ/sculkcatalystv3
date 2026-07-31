@@ -1,0 +1,9 @@
+{
+  "pack": "flow-ui-pack",
+  "version": "1.0.0",
+  "textures": {
+    "menu.primary": "textures/ui/menu-primary.png",
+    "hud.status": "textures/ui/hud-status.png"
+  },
+  "purpose": "resource-center-circulation-test"
+}

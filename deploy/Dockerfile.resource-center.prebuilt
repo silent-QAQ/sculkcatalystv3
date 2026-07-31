@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+FROM debian:bookworm-slim
+
+WORKDIR /app
+COPY backend/target/release/backend /usr/local/bin/sculk-resource
+COPY frontend/dist /app/static
+RUN mkdir -p /app/data /app/static /app/objects
+
+ENV SCULK_STATIC_DIR=/app/static
+ENV SCULK_RESOURCE_OBJECT_DIR=/app/objects
+
+EXPOSE 8789
+ENTRYPOINT ["/usr/local/bin/sculk-resource"]

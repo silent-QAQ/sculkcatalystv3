@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+[Unit]
+Description=Back up Sculk resource catalog data and objects
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/backup-sculk-resource
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/sculk-resource/backups
+ReadOnlyPaths=/opt/sculk-resource/data /opt/sculk-resource/objects

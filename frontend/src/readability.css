@@ -1,0 +1,100 @@
+/*
+ * Local console typography baseline.
+ *
+ * The legacy styles use many 6-10px declarations.  Keep the dense three-column
+ * layout intact and raise text sizes independently from the appearance zoom.
+ * This file is intentionally scoped to `.app`, so Cloud and resource-admin
+ * surfaces retain their own typography systems.
+ */
+#app > .app {
+  --type-title: 22px;
+  --type-heading: 18px;
+  --type-body: 16px;
+  --type-control: 13px;
+  --type-caption: 12px;
+  font-size: var(--type-body);
+  text-rendering: optimizeLegibility;
+}
+
+#app > .app :where(h1) {
+  font-size: var(--type-title) !important;
+  line-height: 1.25;
+}
+
+#app > .app :where(h2, h3) {
+  font-size: var(--type-heading) !important;
+  line-height: 1.35;
+}
+
+#app > .app :where(p, li, blockquote, .message-content) {
+  font-size: var(--type-body) !important;
+  line-height: 1.7;
+}
+
+#app > .app :where(b, strong) {
+  font-size: max(var(--type-control), 1em) !important;
+}
+
+#app > .app :where(button, input, select, textarea) {
+  font-size: var(--type-control) !important;
+  line-height: 1.35;
+}
+
+#app > .app :where(small, time, label, em, kbd) {
+  font-size: var(--type-caption) !important;
+  line-height: 1.5;
+}
+
+#app > .app :where(code, pre, .terminal-view > main, .config-editor) {
+  font-size: var(--type-control) !important;
+}
+
+#app > .app :where(th, td, dt, dd, footer) {
+  font-size: var(--type-caption) !important;
+  line-height: 1.5;
+}
+
+/* Text carried directly by compact containers instead of semantic elements. */
+#app > .app :where(
+  .label,
+  .safe,
+  .notice,
+  .day,
+  .message-state,
+  .fallback-tag,
+  .composer-status,
+  .terminal-empty,
+  .field-error,
+  .field-hint,
+  .install-result,
+  .settings-nav .group-label,
+  .settings-nav .no-result,
+  .s-notice,
+  .s-empty,
+  .s-error,
+  .s-test,
+  .s-row .stale,
+  .rail-state,
+  .table-state,
+  .console-empty,
+  .console-error
+) {
+  font-size: var(--type-caption) !important;
+  line-height: 1.5;
+}
+
+#app > .app .sidebar > .label {
+  font-size: 14px !important;
+  letter-spacing: 0.04em;
+}
+
+/* Preserve the compact mobile wizard: labels are intentionally icon-only. */
+@media (max-width: 700px) {
+  #app > .app .wizard-steps span {
+    font-size: 0 !important;
+  }
+
+  #app > .app .wizard-steps span i {
+    font-size: var(--type-caption) !important;
+  }
+}

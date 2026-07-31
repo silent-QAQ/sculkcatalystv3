@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sculk.mcmy.love/schemas/sculk-server-template-v1.schema.json",
+  "title": "Sculk Catalyst Server Template",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "manifest_version", "template"],
+  "properties": {
+    "format": { "const": "sculk-catalyst/server-template" },
+    "manifest_version": { "const": 1 },
+    "template": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "description", "server"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "description": { "type": "string", "maxLength": 500 },
+        "server": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "core", "minecraft_version", "memory_gb", "port"],
+          "properties": {
+            "name": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "core": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[\\p{L}\\p{N} ._+\\-]+$" },
+            "minecraft_version": { "type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[\\p{L}\\p{N} ._+\\-]+$" },
+            "memory_gb": { "type": "integer", "minimum": 2, "maximum": 64 },
+            "port": { "type": "integer", "minimum": 1024, "maximum": 65535 }
+          }
+        }
+      }
+    }
+  }
+}

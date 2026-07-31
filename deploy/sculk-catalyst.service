@@ -1,0 +1,32 @@
+[Unit]
+Description=Sculk Catalyst Minecraft server manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sculk-catalyst
+Group=sculk-catalyst
+WorkingDirectory=/opt/sculk-catalyst/backend
+Environment=SCULK_BIND_ADDRESS=127.0.0.1:8787
+Environment=SCULK_DATA_DIR=/var/lib/sculk-catalyst
+Environment=SCULK_STATE_FILE=/var/lib/sculk-catalyst/state.json
+Environment=SCULK_STATIC_DIR=/opt/sculk-catalyst/frontend/dist
+EnvironmentFile=-/etc/sculk-catalyst/environment
+ExecStart=/opt/sculk-catalyst/backend/backend
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=50s
+KillSignal=SIGTERM
+KillMode=mixed
+StateDirectory=sculk-catalyst
+StateDirectoryMode=0750
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sculk-catalyst
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

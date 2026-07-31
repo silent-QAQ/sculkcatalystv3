@@ -1,0 +1,81 @@
+{
+	admin 127.0.0.1:2020
+}
+
+resources.example.com {
+	encode zstd gzip
+
+	# 总站自动上传 Skill/配置时携带 Bearer Token。启动 Caddy 前设置
+	# SCULK_RESOURCE_API_TOKEN，并与总站后端保持一致。
+	route /api/catalog/* {
+		@authorized_catalog_write {
+			method POST PUT PATCH DELETE
+			header Authorization "Bearer {$SCULK_RESOURCE_API_TOKEN}"
+		}
+		handle @authorized_catalog_write {
+			reverse_proxy 127.0.0.1:8789
+		}
+
+		@authorized_catalog_basic {
+			method POST PUT PATCH DELETE
+			header Authorization "Basic {$SCULK_CATALOG_ADMIN_BASIC_AUTH}"
+		}
+		handle @authorized_catalog_basic {
+			reverse_proxy 127.0.0.1:8789
+		}
+
+		@catalog_write method POST PUT PATCH DELETE
+		respond @catalog_write "Resource administrator credentials are invalid." 401
+
+		reverse_proxy 127.0.0.1:8789
+	}
+
+	handle_path /objects/* {
+		root * D:/sculk-resource-objects
+		file_server
+		header Cache-Control "public, max-age=31536000, immutable"
+	}
+
+	handle /resource-admin* {
+		rewrite * /
+		reverse_proxy 127.0.0.1:8789
+	}
+
+	handle /assets/* {
+		reverse_proxy 127.0.0.1:8789
+	}
+
+	handle /favicon.svg {
+		reverse_proxy 127.0.0.1:8789
+	}
+
+	handle /icons.svg {
+		reverse_proxy 127.0.0.1:8789
+	}
+
+	handle / {
+		redir /resource-admin 308
+	}
+
+	handle /api/v1/* {
+		reverse_proxy 127.0.0.1:8789
+	}
+
+	handle /api/openapi.json {
+		reverse_proxy 127.0.0.1:8789
+	}
+
+	handle /api/health {
+		reverse_proxy 127.0.0.1:8789
+	}
+
+	respond 404
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Content-Security-Policy "default-src 'self'; img-src 'self' data: https:; style-src 'self'; script-src 'self'; connect-src 'self'"
+		-Server
+	}
+}

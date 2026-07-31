@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+[Unit]
+Description=Daily Sculk resource catalog backup
+
+[Timer]
+OnCalendar=*-*-* 03:40:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target
