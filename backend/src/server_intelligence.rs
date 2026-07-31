@@ -102,6 +102,16 @@ fn search_terms(query: &str) -> Vec<String> {
             .next()
             .unwrap_or(query)
             .trim()
+            .split_whitespace()
+            .filter(|value| {
+                !value.contains(":\\")
+                    && !value.contains("/Users/")
+                    && !value.contains("/home/")
+                    && !value.to_ascii_lowercase().contains("token")
+                    && !value.to_ascii_lowercase().contains("password")
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
             .chars()
             .take(120)
             .collect::<String>();
