@@ -36,7 +36,11 @@ pub(crate) fn sample_process_metrics(system: &mut System, pid: u32) -> Option<Pr
         memory: process.memory().div_ceil(1024 * 1024),
     })
 }
-const SUPPORTED_JAVA_MAJORS: &[u32] = &[RECOMMENDED_JAVA];
+/// 托管运行时只保留 Minecraft 服务端实际常用的三个 Java 世代。
+///
+/// 不能用“Java 版本大于等于 21 就兼容”替代精确选择：Paper 1.12.x
+/// 等旧核心在 Java 8 上最稳定，而现代核心需要 Java 17/21。
+const SUPPORTED_JAVA_MAJORS: &[u32] = &[8, 17, RECOMMENDED_JAVA];
 const JAVA_PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(45);
@@ -253,33 +257,82 @@ pub async fn collect_system_info(data_root: &Path) -> SystemInfo {
 }
 
 pub async fn detect_java(data_root: &Path) -> JavaInfo {
+    detect_java_for_major(data_root, RECOMMENDED_JAVA).await
+}
+
+/// 按服务端需要的 Java 世代检测运行时。
+///
+/// 返回值仍会保留“找到但不兼容”的 Java 信息，便于 UI 展示；调用方应
+/// 检查 `java_compatible`，而不是仅检查 `java_installed`。
+pub async fn detect_java_for_major(data_root: &Path, required_major: u32) -> JavaInfo {
     let explicit = nonempty_env_os("SCULK_JAVA_BIN").map(PathBuf::from);
-    let managed = SUPPORTED_JAVA_MAJORS
-        .iter()
-        .map(|major| managed_java_path(data_root, *major))
-        .find(|path| path.is_file());
+    let managed = is_supported_major(required_major)
+        .then(|| managed_java_path(data_root, required_major))
+        .filter(|path| path.is_file());
     let java_home = nonempty_env_os("JAVA_HOME")
         .map(PathBuf::from)
         .map(|home| home.join("bin").join(java_binary_name()));
     let path_java = std::env::var_os("PATH").and_then(find_java_on_path);
 
     let candidates = candidate_paths(explicit, managed, java_home, path_java);
+    let mut first_found = None;
     for candidate in candidates {
         let Some(executable) = resolve_executable(candidate) else {
             continue;
         };
         if let Some(info) = inspect_java_executable(&executable).await {
-            return info;
+            if first_found.is_none() {
+                first_found = Some(info.clone());
+            }
+            if info.java_major == Some(required_major) {
+                return java_info_with_compatibility(info, required_major);
+            }
         }
     }
-    JavaInfo::unavailable()
+    first_found
+        .map(|info| java_info_with_compatibility(info, required_major))
+        .unwrap_or_else(JavaInfo::unavailable)
+}
+
+fn java_info_with_compatibility(mut info: JavaInfo, required_major: u32) -> JavaInfo {
+    info.java_compatible = info.java_major == Some(required_major);
+    info
+}
+
+/// 根据 Minecraft 版本选择精确的 Java 世代。
+///
+/// 版本未知时使用现代默认值 21；这不会把旧版本误判成可运行，已知旧
+/// 版本则会触发对应的托管运行时安装。
+pub fn required_java_major(minecraft_version: &str) -> u32 {
+    let mut parts = minecraft_version
+        .trim()
+        .split('.')
+        .filter_map(|part| part.parse::<u32>().ok());
+    let Some(first) = parts.next() else {
+        return RECOMMENDED_JAVA;
+    };
+    if first != 1 {
+        return RECOMMENDED_JAVA;
+    }
+    let minor = parts.next().unwrap_or_default();
+    match minor {
+        0..=16 => 8,
+        17..=20 => {
+            if minor == 20 && parts.next().unwrap_or_default() >= 5 {
+                RECOMMENDED_JAVA
+            } else {
+                17
+            }
+        }
+        _ => RECOMMENDED_JAVA,
+    }
 }
 
 pub async fn install_java(data_root: &Path, major: u32) -> Result<JavaInfo, InstallError> {
     if !is_supported_major(major) {
         return Err(InstallError::new(
             InstallErrorKind::Validation,
-            format!("暂不支持安装 Java {major}，当前支持 Java 21"),
+            format!("暂不支持安装 Java {major}，当前支持 Java 8、17、21"),
         ));
     }
     let platform =
@@ -299,7 +352,7 @@ pub async fn install_java(data_root: &Path, major: u32) -> Result<JavaInfo, Inst
     if let Some(info) = inspect_java_executable(&target_executable).await
         && info.java_major == Some(major)
     {
-        return Ok(info);
+        return Ok(java_info_with_compatibility(info, major));
     }
 
     let runtime_parent = target
@@ -335,7 +388,7 @@ pub async fn install_java(data_root: &Path, major: u32) -> Result<JavaInfo, Inst
     if target.exists() {
         remove_dir_if_present(&backup).await;
     }
-    result
+    result.map(|info| java_info_with_compatibility(info, major))
 }
 
 async fn install_java_inner(
@@ -1234,6 +1287,25 @@ mod tests {
                 .join("bin")
                 .join(java_binary_name())
         );
+    }
+
+    #[test]
+    fn minecraft_versions_select_the_matching_java_generation() {
+        assert_eq!(required_java_major("1.12.2"), 8);
+        assert_eq!(required_java_major("1.16.5"), 8);
+        assert_eq!(required_java_major("1.17.1"), 17);
+        assert_eq!(required_java_major("1.20.4"), 17);
+        assert_eq!(required_java_major("1.20.5"), 21);
+        assert_eq!(required_java_major("1.21.4"), 21);
+        assert_eq!(required_java_major("latest"), 21);
+    }
+
+    #[test]
+    fn supported_java_majors_cover_legacy_and_modern_servers() {
+        assert!(is_supported_major(8));
+        assert!(is_supported_major(17));
+        assert!(is_supported_major(21));
+        assert!(!is_supported_major(11));
     }
 
     #[test]
