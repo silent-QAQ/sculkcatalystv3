@@ -6,7 +6,7 @@ import {
   Check, CheckCircle2, Clipboard, Clock3, Copy, Cpu, Download, Fingerprint, Laptop,
   RadioTower, RefreshCw, ShieldCheck, Trash2, TriangleAlert,
 } from 'lucide-vue-next'
-import { agentChecksumsPath, agentDownloadPath, createAgentBootstrap, cloudRequest } from './client'
+import { agentChecksumsPath, agentDownloadFilename, agentDownloadPath, createAgentBootstrap, cloudRequest } from './client'
 import type { AgentBootstrapDownload } from './client'
 import type { AgentPairingCreated, CloudAgent } from './types'
 import './agent-devices.css'
@@ -56,8 +56,8 @@ function pairCommand(executable: string, workspaceRoot: string) {
     ? `${executable} pair --cloud "${cloudOrigin.value}" --code "${pairing.value.pairing_code}" --name "mc-host" --workspace "minecraft" --workspace-root "${workspaceRoot}" --permissions "full" --capabilities "heartbeat,tasks-v1,task-checkpoints-v1,shell-v1,terminal-v1"`
     : ''
 }
-const windowsCommand = computed(() => pairCommand('.\\sculk-agent.exe', windowsWorkspaceRoot.value.trim()))
-const linuxCommand = computed(() => pairCommand('./sculk-agent', linuxWorkspaceRoot.value.trim()))
+const windowsCommand = computed(() => pairCommand(`.\\${agentDownloadFilename('windows')}`, windowsWorkspaceRoot.value.trim()))
+const linuxCommand = computed(() => pairCommand(`./${agentDownloadFilename('linux')}`, linuxWorkspaceRoot.value.trim()))
 const activeAgents = computed(() => agents.value.filter(agent => agent.status !== 'revoked'))
 const revokedAgents = computed(() => agents.value.filter(agent => agent.status === 'revoked'))
 

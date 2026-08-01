@@ -513,7 +513,7 @@ onUnmounted(() => window.clearInterval(refreshTimer))
                     <button @click="confirmation=null">返回</button><button class="confirm" :disabled="!!busy" @click="confirmTaskAction(linkedTask(message)!,confirmation.action)">确认</button>
                   </div>
                   <div v-else class="plan-actions">
-                    <span v-if="linkedTask(message)!.status==='awaiting_approval'" class="plan-approval-note"><Clock3/>等待审批团队处理（请求人不能自批）</span>
+                    <span v-if="linkedTask(message)!.status==='awaiting_approval'" class="plan-approval-note"><Clock3/>等待审批团队的其他所有者、管理员或审批人在“远程审批”页处理（申请人不得自批）</span>
                     <button v-if="['awaiting_approval','queued','leased'].includes(linkedTask(message)!.status)" :disabled="!!busy" @click="performAction(linkedTask(message)!,'cancel')"><CircleStop/>取消任务</button>
                     <button v-if="linkedTask(message)!.status==='running'&&linkedTask(message)!.operation==='shell.exec'&&!linkedTask(message)!.cancel_requested" class="stop" :disabled="!!busy" @click="requestTaskStop(linkedTask(message)!)"><CircleStop/>停止运行</button>
                     <button v-if="linkedTask(message)!.status==='succeeded'&&linkedTask(message)!.rollback_available&&linkedTask(message)!.operation!=='shell.exec'" :disabled="!!busy" @click="performAction(linkedTask(message)!,'rollback')"><RotateCcw/>创建回滚任务</button>
@@ -536,7 +536,7 @@ onUnmounted(() => window.clearInterval(refreshTimer))
         </div>
 
         <div v-if="currentConversation && planOpen" class="plan-composer">
-          <header><div><h3>创建执行计划</h3><p>计划会生成真实远程任务；高风险与 Shell 操作需要在对话中批准。</p></div><button @click="planOpen=false">关闭</button></header>
+          <header><div><h3>创建执行计划</h3><p>计划会生成真实远程任务；高风险与 Shell 操作须由其他合资格团队成员在“远程审批”页批准，申请人不得自批。</p></div><button @click="planOpen=false">关闭</button></header>
           <form @submit.prevent="createPlan">
             <label class="wide">计划说明<textarea v-model="planContent" rows="3" maxlength="2000" placeholder="说明这项操作的目标和预期结果" required/></label>
             <label>目标 Agent<select v-model="planAgentId" required><option value="" disabled>选择在线 Agent</option><option v-for="agent in taskAgents" :key="agent.id" :value="agent.id">{{agent.name}} · {{eligibility(agent)}}</option></select></label>

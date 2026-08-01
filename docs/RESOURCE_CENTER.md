@@ -65,6 +65,12 @@ GET /api/v1/download/{kind}/{project}/{version}
 
 `SCULK_STATE_FILE` 保存全部目录元数据，应定期备份其 JSON、`.bak` 和对象目录。生产环境不要直接公开未鉴权的 POST、PUT、PATCH、DELETE；示例 Caddy 配置只允许持有 `SCULK_RESOURCE_API_TOKEN` 的总站写入。
 
+### 写操作认证（fail-safe）
+
+资源目录的所有 `POST`、`PUT`、`PATCH`、`DELETE` 现在必须显式配置至少一种后端认证方式：高熵 `SCULK_CATALOG_ADMIN_TOKEN`，或同时配置 `SCULK_CATALOG_ADMIN_USERNAME` 与 `SCULK_CATALOG_ADMIN_PASSWORD`。未配置、仅配置其中一个 Basic 字段、长度不足或使用 `replace-with-*`、`change-me`、`example*` 等公开占位值时，后端拒绝全部写操作并返回 HTTP 503；读取接口不受影响。
+
+若通过 Caddy 对外发布，`SCULK_RESOURCE_API_TOKEN` 必须为非空高熵值，并与总站使用的 `SCULK_RESOURCE_API_TOKEN` 相同；建议同时把同一值设置为 `SCULK_CATALOG_ADMIN_TOKEN`，以便即使绕过代理直连 Rust 后端，写操作仍需认证。浏览器管理页则需同时配置 Basic 用户名、密码，以及 Caddy 使用的 `SCULK_CATALOG_ADMIN_BASIC_AUTH`。所有示例值均留空，必须由部署者显式填写，不能使用公开占位文本。
+
 资源服务器至少需要以下变量，其中两个 Token 必须使用相同的高熵值：
 
 ```text

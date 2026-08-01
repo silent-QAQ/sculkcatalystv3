@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use rand::{RngCore, rngs::OsRng};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(windows)]
+use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::sync::Arc as TestArc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     collections::{HashMap, VecDeque},
     fs,
@@ -28,6 +34,8 @@ const MAX_ACTIVE_SESSIONS: usize = 8;
 const MAX_PENDING_EVENTS: usize = 256;
 const MAX_PENDING_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
+const MAX_REDACTION_PENDING_BYTES: usize = 64 * 1024;
+const REDACTED_TERMINAL_FRAGMENT: &[u8] = b"[REDACTED: unterminated sensitive terminal output]";
 
 #[derive(Clone)]
 pub struct TerminalConfig {
@@ -127,6 +135,351 @@ impl PendingEvent {
     }
 }
 
+const TERMINAL_SECRET_KEYS: [&[u8]; 19] = [
+    b"authorization",
+    b"client_secret",
+    b"clientsecret",
+    b"rcon_password",
+    b"rconpassword",
+    b"access_token",
+    b"accesstoken",
+    b"refresh_token",
+    b"refreshtoken",
+    b"api_key",
+    b"apikey",
+    b"password",
+    b"token",
+    b"secret",
+    b"cookie",
+    b"session",
+    b"credential",
+    b"private_key",
+    b"privatekey",
+];
+const TERMINAL_TOKEN_PREFIXES: [&[u8]; 3] = [b"sca_", b"scs_", b"sk-sc_"];
+
+fn is_secret_boundary(byte: Option<u8>) -> bool {
+    !byte.is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn is_secret_terminator(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(byte, b'\'' | b'"' | b'`' | b',' | b';' | b')' | b']' | b'}')
+}
+
+fn ascii_starts_with(value: &[u8], start: usize, needle: &[u8]) -> bool {
+    value
+        .get(start..start.saturating_add(needle.len()))
+        .is_some_and(|slice| slice.eq_ignore_ascii_case(needle))
+}
+
+fn ascii_prefix_of(value: &[u8], start: usize, needle: &[u8]) -> bool {
+    let suffix = &value[start..];
+    suffix.len() < needle.len() && needle[..suffix.len()].eq_ignore_ascii_case(suffix)
+}
+
+fn token_end(value: &[u8], start: usize) -> usize {
+    start
+        + value[start..]
+            .iter()
+            .position(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+            .unwrap_or(value.len() - start)
+}
+
+fn secret_value_end(value: &[u8], start: usize) -> usize {
+    if value.get(start..start.saturating_add(7)) == Some(b"Bearer ") {
+        let token_start = start + 7;
+        token_start
+            + value[token_start..]
+                .iter()
+                .position(|byte| is_secret_terminator(*byte))
+                .unwrap_or(value.len() - token_start)
+    } else if matches!(value.get(start), Some(b'\'' | b'"' | b'`')) {
+        let quote = value[start];
+        value[start + 1..]
+            .iter()
+            .position(|byte| *byte == quote)
+            .map(|offset| start + 2 + offset)
+            .unwrap_or(value.len())
+    } else {
+        start
+            + value[start..]
+                .iter()
+                .position(|byte| is_secret_terminator(*byte))
+                .unwrap_or(value.len() - start)
+    }
+}
+
+fn secret_value_start(value: &[u8], key_end: usize) -> Option<usize> {
+    let mut index = key_end;
+    if matches!(value.get(index), Some(b'\'' | b'"' | b'`')) {
+        index += 1;
+    }
+    while value.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    if !matches!(value.get(index), Some(b'=' | b':')) {
+        return None;
+    }
+    index += 1;
+    while value.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    Some(index)
+}
+
+fn redact_terminal_output(value: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(value.len());
+    let mut cursor = 0;
+    let mut index = 0;
+    while index < value.len() {
+        let preceding = index
+            .checked_sub(1)
+            .and_then(|position| value.get(position))
+            .copied();
+        if is_secret_boundary(preceding) && ascii_starts_with(value, index, b"Bearer ") {
+            let value_start = index + 7;
+            let value_end = secret_value_end(value, value_start);
+            if value_end > value_start {
+                output.extend_from_slice(&value[cursor..value_start]);
+                output.extend_from_slice(b"[REDACTED]");
+                cursor = value_end;
+                index = value_end;
+                continue;
+            }
+        }
+        if is_secret_boundary(preceding) {
+            if let Some(key) = TERMINAL_SECRET_KEYS.iter().find(|key| {
+                let key_end = index + key.len();
+                ascii_starts_with(value, index, key)
+                    && is_secret_boundary(value.get(key_end).copied())
+            }) {
+                let key_end = index + key.len();
+                if let Some(value_start) = secret_value_start(value, key_end) {
+                    let value_end = secret_value_end(value, value_start);
+                    if value_end > value_start {
+                        output.extend_from_slice(&value[cursor..value_start]);
+                        output.extend_from_slice(b"[REDACTED]");
+                        cursor = value_end;
+                        index = value_end;
+                        continue;
+                    }
+                }
+            }
+            if let Some(prefix) = TERMINAL_TOKEN_PREFIXES
+                .iter()
+                .find(|prefix| ascii_starts_with(value, index, prefix))
+            {
+                let end = token_end(value, index + prefix.len());
+                if end.saturating_sub(index) >= 32 {
+                    output.extend_from_slice(&value[cursor..index]);
+                    output.extend_from_slice(b"[REDACTED]");
+                    cursor = end;
+                    index = end;
+                    continue;
+                }
+            }
+        }
+        index += 1;
+    }
+    output.extend_from_slice(&value[cursor..]);
+    output
+}
+
+fn unfinished_terminal_secret_start(value: &[u8]) -> Option<usize> {
+    for index in 0..value.len() {
+        let preceding = index
+            .checked_sub(1)
+            .and_then(|position| value.get(position))
+            .copied();
+        if !is_secret_boundary(preceding) {
+            continue;
+        }
+        if ascii_prefix_of(value, index, b"Bearer ") {
+            return Some(index);
+        }
+        if ascii_starts_with(value, index, b"Bearer ") {
+            let value_start = index + 7;
+            if value_start == value.len() || secret_value_end(value, value_start) == value.len() {
+                return Some(index);
+            }
+        }
+        for key in TERMINAL_SECRET_KEYS {
+            if ascii_prefix_of(value, index, key) {
+                return Some(index);
+            }
+            if !ascii_starts_with(value, index, key) {
+                continue;
+            }
+            let key_end = index + key.len();
+            if key_end == value.len() {
+                return Some(index);
+            }
+            if let Some(value_start) = secret_value_start(value, key_end)
+                && (value_start == value.len()
+                    || secret_value_end(value, value_start) == value.len())
+            {
+                return Some(index);
+            }
+        }
+        for prefix in TERMINAL_TOKEN_PREFIXES {
+            if ascii_prefix_of(value, index, prefix) {
+                return Some(index);
+            }
+            if ascii_starts_with(value, index, prefix)
+                && token_end(value, index + prefix.len()) == value.len()
+            {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+#[derive(Default)]
+struct TerminalOutputRedactor {
+    pending: Vec<u8>,
+}
+
+impl TerminalOutputRedactor {
+    fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.pending.extend_from_slice(bytes);
+        let Some(unfinished_start) = unfinished_terminal_secret_start(&self.pending) else {
+            return redact_terminal_output(&std::mem::take(&mut self.pending));
+        };
+        if self.pending.len() > MAX_REDACTION_PENDING_BYTES {
+            self.pending.clear();
+            return REDACTED_TERMINAL_FRAGMENT.to_vec();
+        }
+        redact_terminal_output(&self.pending.drain(..unfinished_start).collect::<Vec<_>>())
+    }
+}
+
+struct ProcessTreeGuard {
+    pid: u32,
+    terminated: bool,
+    #[cfg(windows)]
+    job: isize,
+    #[cfg(test)]
+    termination_count: Option<TestArc<AtomicUsize>>,
+}
+
+impl ProcessTreeGuard {
+    fn attach(child: &dyn Child) -> Result<Self, String> {
+        let pid = child
+            .process_id()
+            .ok_or_else(|| "PTY child process has no process id".to_string())?;
+        Ok(Self {
+            pid,
+            terminated: false,
+            #[cfg(windows)]
+            job: attach_windows_job(child)?,
+            #[cfg(test)]
+            termination_count: None,
+        })
+    }
+
+    fn terminate(&mut self) {
+        if self.terminated {
+            return;
+        }
+        #[cfg(test)]
+        if let Some(count) = &self.termination_count {
+            count.fetch_add(1, Ordering::SeqCst);
+            self.terminated = true;
+            return;
+        }
+        #[cfg(unix)]
+        terminate_unix_process_group(self.pid);
+        #[cfg(windows)]
+        terminate_windows_process_tree(self.pid, self.job);
+        self.terminated = true;
+    }
+
+    #[cfg(test)]
+    fn for_test(termination_count: TestArc<AtomicUsize>) -> Self {
+        Self {
+            pid: 1,
+            terminated: false,
+            #[cfg(windows)]
+            job: 0,
+            termination_count: Some(termination_count),
+        }
+    }
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+#[cfg(unix)]
+fn terminate_unix_process_group(pid: u32) {
+    // portable-pty creates a session for the child, making its pid the
+    // process-group leader. A negative pid reaches all shell descendants.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+fn attach_windows_job(child: &dyn Child) -> Result<isize, String> {
+    use std::{mem, ptr};
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        },
+    };
+
+    let handle = child
+        .as_raw_handle()
+        .ok_or_else(|| "PTY child process has no Windows handle".to_string())?;
+    unsafe {
+        let job = CreateJobObjectW(ptr::null(), ptr::null());
+        if job.is_null() {
+            return Err("failed to create terminal Job Object".into());
+        }
+        let mut information: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = mem::zeroed();
+        information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &information as *const _ as *const _,
+            mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) != 0;
+        let assigned = configured && AssignProcessToJobObject(job, handle) != 0;
+        if !assigned {
+            CloseHandle(job);
+            return Err("failed to assign PTY child to terminal Job Object".into());
+        }
+        Ok(job as isize)
+    }
+}
+
+#[cfg(windows)]
+fn terminate_windows_process_tree(pid: u32, job: isize) {
+    use windows_sys::Win32::{Foundation::CloseHandle, System::JobObjects::TerminateJobObject};
+
+    if job != 0 {
+        unsafe {
+            let handle = job as *mut std::ffi::c_void;
+            TerminateJobObject(handle, 1);
+            CloseHandle(handle);
+        }
+        return;
+    }
+    let _ = Command::new("taskkill.exe")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 #[derive(Serialize)]
 struct EventsRequest<'a> {
     instance_id: &'a str,
@@ -145,7 +498,8 @@ enum LocalEvent {
 struct TerminalSession {
     master: Box<dyn MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    killer: Box<dyn ChildKiller + Send + Sync>,
+    process: ProcessTreeGuard,
+    output_redactor: TerminalOutputRedactor,
     next_event_seq: u64,
     last_command_seq: i64,
     pending_events: VecDeque<PendingEvent>,
@@ -163,7 +517,7 @@ struct TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        let _ = self.killer.kill();
+        self.process.terminate();
     }
 }
 
@@ -194,16 +548,24 @@ impl TerminalSession {
         if self.locally_finished || self.failure_reported {
             return Ok(());
         }
+        let redacted = self.output_redactor.push(bytes);
+        if redacted.is_empty() {
+            return Ok(());
+        }
         if self.pending_events.len() >= MAX_PENDING_EVENTS.saturating_sub(2)
-            || self.pending_output_bytes.saturating_add(bytes.len()) > MAX_PENDING_OUTPUT_BYTES
+            || self.pending_output_bytes.saturating_add(redacted.len()) > MAX_PENDING_OUTPUT_BYTES
         {
             return Err("终端输出积压超过本地安全上限，已终止会话以防止内存无限增长".into());
         }
         let seq = self.next_seq();
         self.pending_events
-            .push_back(PendingEvent::output(seq, bytes));
-        self.pending_output_bytes += bytes.len();
+            .push_back(PendingEvent::output(seq, &redacted));
+        self.pending_output_bytes += redacted.len();
         Ok(())
+    }
+
+    fn terminate_process_tree(&mut self) {
+        self.process.terminate();
     }
 
     fn fail_locally(&mut self, message: String) {
@@ -211,7 +573,7 @@ impl TerminalSession {
             return;
         }
         self.failure_reported = true;
-        let _ = self.killer.kill();
+        self.terminate_process_tree();
         self.push_structured("error", json!({ "message": message }));
     }
 
@@ -241,6 +603,7 @@ impl TerminalSession {
         }
         if let Some(exit_code) = self.pending_exit.take() {
             self.locally_finished = true;
+            self.terminate_process_tree();
             if !self.failure_reported {
                 self.push_structured("exit", json!({ "exit_code": exit_code }));
             }
@@ -511,9 +874,7 @@ impl Manager {
             return;
         };
         session.acknowledge(command.id, command.seq);
-        if let Err(error) = session.killer.kill() {
-            session.fail_locally(format!("终止终端进程失败：{error}"));
-        }
+        session.terminate_process_tree();
     }
 
     fn detach_ack(&mut self, session_id: &str, command_id: String) {
@@ -540,10 +901,10 @@ impl Manager {
     fn handle_local_event(&mut self, event: LocalEvent) {
         match event {
             LocalEvent::Output { session_id, bytes } => {
-                if let Some(session) = self.sessions.get_mut(&session_id) {
-                    if let Err(error) = session.push_output(&bytes) {
-                        session.fail_locally(error);
-                    }
+                if let Some(session) = self.sessions.get_mut(&session_id)
+                    && let Err(error) = session.push_output(&bytes)
+                {
+                    session.fail_locally(error);
                 }
             }
             LocalEvent::ReaderClosed { session_id } => {
@@ -774,7 +1135,20 @@ fn spawn_terminal(
         .slave
         .spawn_command(command)
         .map_err(|error| format!("启动交互式 Shell 失败：{error}"))?;
-    let killer = child.clone_killer();
+    let process = match ProcessTreeGuard::attach(&*child) {
+        Ok(process) => process,
+        Err(error) => {
+            #[cfg(windows)]
+            if let Some(pid) = child.process_id() {
+                terminate_windows_process_tree(pid, 0);
+            } else {
+                let _ = child.kill();
+            }
+            #[cfg(unix)]
+            let _ = child.kill();
+            return Err(format!("unable to secure terminal process tree: {error}"));
+        }
+    };
     let reader = pty
         .master
         .try_clone_reader()
@@ -815,7 +1189,8 @@ fn spawn_terminal(
         TerminalSession {
             master: pty.master,
             writer: Arc::new(Mutex::new(writer)),
-            killer,
+            process,
+            output_redactor: TerminalOutputRedactor::default(),
             next_event_seq: 0,
             last_command_seq: 0,
             pending_events: VecDeque::new(),
@@ -983,6 +1358,47 @@ mod tests {
         let event = PendingEvent::output(1, b"hello");
         assert_eq!(event.output_len(), 5);
         assert_eq!(event.kind, "output");
+    }
+
+    #[test]
+    fn terminal_output_redacts_common_credentials_before_event_encoding() {
+        let output = redact_terminal_output(
+            br#"password=hunter2 api_key: "sk-test" Authorization: Bearer bearer-secret sca_abcdefghijklmnopqrstuvwxyz0123456789"#,
+        );
+        let output = String::from_utf8(output).unwrap();
+        for secret in [
+            "hunter2",
+            "sk-test",
+            "bearer-secret",
+            "sca_abcdefghijklmnopqrstuvwxyz0123456789",
+        ] {
+            assert!(!output.contains(secret), "leaked {secret}");
+        }
+        assert_eq!(output.matches("[REDACTED]").count(), 4);
+    }
+
+    #[test]
+    fn terminal_output_redactor_holds_split_sensitive_values_locally() {
+        let mut redactor = TerminalOutputRedactor::default();
+        assert!(redactor.push(b"password=hunt").is_empty());
+        let output = String::from_utf8(redactor.push(b"er2\nready> ")).unwrap();
+        assert!(!output.contains("hunter2"));
+        assert_eq!(output, "password=[REDACTED]\nready> ");
+    }
+
+    #[test]
+    fn process_tree_guard_uses_one_idempotent_close_path() {
+        let count = TestArc::new(AtomicUsize::new(0));
+        let mut guard = ProcessTreeGuard::for_test(count.clone());
+        guard.terminate();
+        guard.terminate();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        drop(guard);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        let drop_count = TestArc::new(AtomicUsize::new(0));
+        drop(ProcessTreeGuard::for_test(drop_count.clone()));
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

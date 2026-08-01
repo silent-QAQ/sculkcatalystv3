@@ -7,10 +7,14 @@ export const CLOUD_SESSION_EXPIRED_EVENT = 'sculk-cloud-session-expired'
 export type AgentBootstrapPlatform = 'windows' | 'linux'
 export const AGENT_RELEASE_VERSION = '20260731-running-cancel-v1'
 
-export function agentDownloadPath(platform: AgentBootstrapPlatform) {
-  const filename = platform === 'windows'
+export function agentDownloadFilename(platform: AgentBootstrapPlatform) {
+  return platform === 'windows'
     ? 'sculk-agent-windows-x86_64.exe'
     : 'sculk-agent-linux-x86_64'
+}
+
+export function agentDownloadPath(platform: AgentBootstrapPlatform) {
+  const filename = agentDownloadFilename(platform)
   return `/downloads/${filename}?v=${encodeURIComponent(AGENT_RELEASE_VERSION)}`
 }
 

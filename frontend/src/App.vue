@@ -888,6 +888,7 @@ function fileTransferUnavailable(){flashSafeNotice('请先选择一个工作区'
 function triggerFileUpload(){if(busy.value)return;if(!canTransferFiles.value){fileTransferUnavailable();return}fileUploadInput.value?.click()}
 async function uploadWorkspaceFile(event:Event){
   const input=event.target as HTMLInputElement,file=input.files?.[0]
+  input.value=''
   if(!file)return
   if(!canTransferFiles.value){fileTransferUnavailable();return}
   const id=selectedId.value,targetPath=currentPath.value
@@ -897,7 +898,7 @@ async function uploadWorkspaceFile(event:Event){
     const response=await fetch(API_BASE+'/api/servers/'+encodeURIComponent(id)+'/file/upload',{method:'POST',body:formData})
     if(!response.ok)throw new Error(await fileTransferError(response))
     if(selectedId.value!==id)return
-    input.value='';await loadFiles(targetPath);flash('文件已上传')
+    await loadFiles(targetPath);flash('文件已上传')
   }catch(error){flash('上传失败：'+String(error))}finally{busy.value=false}
 }
 async function downloadCurrentFile(path=activeFile.value,kind:'file'|'folder'='file'){

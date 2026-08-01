@@ -18,6 +18,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Duration, NaiveDate, Utc};
+use hmac::{Hmac, Mac};
 use rand::{RngCore, rngs::OsRng};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
@@ -74,12 +75,15 @@ impl CloudRuntime {
                 };
             }
         };
-        let master_secret = match env::var("SCULK_MASTER_KEY") {
-            Ok(value) if value.len() >= 24 => value,
-            _ => {
+        let master_secret = match env::var("SCULK_MASTER_KEY")
+            .ok()
+            .and_then(|value| validate_master_secret(&value).ok())
+        {
+            Some(value) => value,
+            None => {
                 return Self {
                     inner: None,
-                    message: "SCULK_MASTER_KEY 至少需要 24 个字符".into(),
+                    message: "SCULK_MASTER_KEY 必须显式设置为至少 24 个字符的非占位高熵值".into(),
                 };
             }
         };
@@ -148,6 +152,30 @@ impl CloudRuntime {
             }
         }
     }
+}
+
+fn validate_master_secret(value: &str) -> Result<String, &'static str> {
+    let value = value.trim();
+    if value.len() < 24 {
+        return Err("SCULK_MASTER_KEY 至少需要 24 个字符");
+    }
+    if is_known_placeholder_secret(value) {
+        return Err("SCULK_MASTER_KEY 不能使用公开占位值");
+    }
+    Ok(value.to_string())
+}
+
+fn is_known_placeholder_secret(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    value == "change-me"
+        || value == "changeme"
+        || value == "example"
+        || value.starts_with("replace-with")
+        || value.starts_with("replace_with")
+        || value.starts_with("change-me")
+        || value.starts_with("change_me")
+        || value.starts_with("example-")
+        || value.starts_with("example_")
 }
 
 #[derive(Serialize)]
@@ -4782,6 +4810,331 @@ fn decode_terminal_base64(value: &str, maximum: usize) -> CloudResult<Vec<u8>> {
     Ok(decoded)
 }
 
+const TERMINAL_SECRET_KEYS: &[&[u8]] = &[
+    b"password",
+    b"passwd",
+    b"api_key",
+    b"apikey",
+    b"token",
+    b"secret",
+    b"authorization",
+    b"cookie",
+    b"credential",
+    b"rcon_password",
+    b"rcon-password",
+];
+const TERMINAL_TOKEN_PREFIXES: &[&[u8]] = &[
+    b"sca_",
+    b"scs_",
+    b"sk-sc-",
+    b"ghp_",
+    b"github_pat_",
+    b"AKIA",
+];
+const TERMINAL_REDACTION_OVERFLOW: &[u8] = b"[REDACTED: terminal output omitted]";
+
+fn ascii_starts_with_ignore_case(value: &[u8], start: usize, needle: &[u8]) -> bool {
+    value
+        .get(start..start.saturating_add(needle.len()))
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
+}
+
+fn terminal_secret_boundary(value: Option<u8>) -> bool {
+    value.is_none_or(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'_' | b'-'))
+}
+
+fn terminal_secret_value_end(value: &[u8], start: usize) -> usize {
+    value[start..]
+        .iter()
+        .position(|byte| {
+            byte.is_ascii_whitespace()
+                || matches!(byte, b'\'' | b'"' | b'`' | b',' | b';' | b')' | b']' | b'}')
+        })
+        .map_or(value.len(), |offset| start + offset)
+}
+
+fn terminal_secret_value_start(value: &[u8], key_start: usize, key_end: usize) -> Option<usize> {
+    let mut cursor = key_end;
+    if matches!(value.get(cursor), Some(b'\'' | b'"' | b'`')) {
+        cursor += 1;
+    }
+    while value.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    if matches!(value.get(cursor), Some(b'=' | b':')) {
+        cursor += 1;
+        while value.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+    } else if key_start >= 2 && value[key_start - 2..key_start] == *b"--" && cursor > key_end {
+        // Support the common CLI form `--password value` without treating
+        // ordinary prose such as "password is required" as a credential.
+    } else {
+        return None;
+    }
+    if matches!(value.get(cursor), Some(b'\'' | b'"' | b'`')) {
+        cursor += 1;
+    }
+    Some(cursor)
+}
+
+fn redact_terminal_output(value: &[u8]) -> Vec<u8> {
+    let mut redacted = Vec::with_capacity(value.len());
+    let mut copied_until = 0;
+    let mut index = 0;
+    while index < value.len() {
+        let boundary =
+            terminal_secret_boundary(index.checked_sub(1).and_then(|at| value.get(at)).copied());
+        if !boundary {
+            index += 1;
+            continue;
+        }
+
+        if ascii_starts_with_ignore_case(value, index, b"bearer ") {
+            let mut value_start = index + b"bearer ".len();
+            while value.get(value_start).is_some_and(u8::is_ascii_whitespace) {
+                value_start += 1;
+            }
+            if matches!(value.get(value_start), Some(b'\'' | b'"' | b'`')) {
+                value_start += 1;
+            }
+            let value_end = terminal_secret_value_end(value, value_start);
+            if value_end > value_start {
+                redacted.extend_from_slice(&value[copied_until..value_start]);
+                redacted.extend_from_slice(b"[REDACTED]");
+                copied_until = value_end;
+                index = value_end;
+                continue;
+            }
+        }
+
+        let mut key_redacted = false;
+        for key in TERMINAL_SECRET_KEYS {
+            let key_end = index + key.len();
+            if !ascii_starts_with_ignore_case(value, index, key)
+                || !terminal_secret_boundary(value.get(key_end).copied())
+            {
+                continue;
+            }
+            let Some(value_start) = terminal_secret_value_start(value, index, key_end) else {
+                continue;
+            };
+            let value_end = terminal_secret_value_end(value, value_start);
+            if value_end > value_start {
+                redacted.extend_from_slice(&value[copied_until..value_start]);
+                redacted.extend_from_slice(b"[REDACTED]");
+                copied_until = value_end;
+                index = value_end;
+                key_redacted = true;
+                break;
+            }
+        }
+        if key_redacted {
+            continue;
+        }
+
+        if let Some(prefix) = TERMINAL_TOKEN_PREFIXES.iter().find(|prefix| {
+            value
+                .get(index..)
+                .is_some_and(|remaining| remaining.starts_with(prefix))
+        }) {
+            let token_end = value[index + prefix.len()..]
+                .iter()
+                .position(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'_' | b'-'))
+                .map_or(value.len(), |offset| index + prefix.len() + offset);
+            if token_end > index + prefix.len() {
+                redacted.extend_from_slice(&value[copied_until..index]);
+                redacted.extend_from_slice(b"[REDACTED]");
+                copied_until = token_end;
+                index = token_end;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    redacted.extend_from_slice(&value[copied_until..]);
+    if redacted.len() > 16 * 1024 {
+        TERMINAL_REDACTION_OVERFLOW.to_vec()
+    } else {
+        redacted
+    }
+}
+
+fn terminal_text_requires_redaction(value: &str) -> bool {
+    redact_terminal_output(value.as_bytes()) != value.as_bytes()
+}
+
+fn terminal_hard_delimiter(byte: u8) -> bool {
+    matches!(byte, b'\n' | b'\r' | b';' | b',' | b')' | b']' | b'}')
+}
+
+fn terminal_tail_after_hard_delimiter(value: &[u8]) -> &[u8] {
+    value
+        .iter()
+        .rposition(|byte| terminal_hard_delimiter(*byte))
+        .map_or(value, |position| &value[position + 1..])
+}
+
+fn terminal_marker_can_continue(tail: &[u8]) -> bool {
+    const MARKERS: &[&[u8]] = &[
+        b"password",
+        b"passwd",
+        b"api_key",
+        b"apikey",
+        b"token",
+        b"secret",
+        b"authorization",
+        b"cookie",
+        b"credential",
+        b"rcon_password",
+        b"rcon-password",
+        b"bearer ",
+        b"sca_",
+        b"scs_",
+        b"sk-sc-",
+        b"ghp_",
+        b"github_pat_",
+        b"akia",
+    ];
+    MARKERS.iter().any(|marker| {
+        let maximum = tail.len().min(marker.len());
+        (3..=maximum)
+            .any(|length| tail[tail.len() - length..].eq_ignore_ascii_case(&marker[..length]))
+    })
+}
+
+fn terminal_key_waits_for_value(tail: &[u8]) -> bool {
+    for index in 0..tail.len() {
+        if !terminal_secret_boundary(index.checked_sub(1).and_then(|at| tail.get(at)).copied()) {
+            continue;
+        }
+        for key in TERMINAL_SECRET_KEYS {
+            let key_end = index + key.len();
+            if !ascii_starts_with_ignore_case(tail, index, key)
+                || !terminal_secret_boundary(tail.get(key_end).copied())
+            {
+                continue;
+            }
+            if terminal_secret_value_start(tail, index, key_end) == Some(tail.len()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn terminal_redaction_continues(value: &[u8]) -> bool {
+    let tail = terminal_tail_after_hard_delimiter(value);
+    !tail.is_empty()
+        && (terminal_marker_can_continue(tail)
+            || terminal_key_waits_for_value(tail)
+            || redact_terminal_output(tail) != tail)
+}
+
+fn sanitize_terminal_output(
+    event: &mut AgentTerminalEventInput,
+    redaction_pending: bool,
+) -> CloudResult<bool> {
+    if event.kind != "output" {
+        return Ok(redaction_pending);
+    }
+    let Some(data_base64) = event.data_base64.as_deref() else {
+        return Ok(redaction_pending);
+    };
+    let decoded = decode_terminal_base64(data_base64, 16 * 1024)?;
+    let continuation = terminal_redaction_continues(&decoded);
+    use base64::Engine;
+    let output = if redaction_pending {
+        TERMINAL_REDACTION_OVERFLOW.to_vec()
+    } else {
+        redact_terminal_output(&decoded)
+    };
+    event.data_base64 = Some(base64::engine::general_purpose::STANDARD.encode(output));
+    Ok(if redaction_pending {
+        continuation || !decoded.iter().any(|byte| terminal_hard_delimiter(*byte))
+    } else {
+        continuation
+    })
+}
+
+fn terminal_input_mac(master_key: &[u8; 32], data_base64: &str) -> String {
+    use base64::Engine;
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(master_key)
+        .expect("SHA-256 HMAC accepts the fixed-length Cloud master key");
+    mac.update(data_base64.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+fn encrypt_terminal_input_payload(master_key: &[u8; 32], data_base64: &str) -> CloudResult<Value> {
+    use base64::Engine;
+    let (ciphertext, nonce) = encrypt_api_key(master_key, data_base64)?;
+    Ok(json!({
+        "format": "encrypted-v1",
+        "ciphertext_base64": base64::engine::general_purpose::STANDARD.encode(ciphertext),
+        "nonce_base64": base64::engine::general_purpose::STANDARD.encode(nonce),
+        "input_mac": terminal_input_mac(master_key, data_base64),
+    }))
+}
+
+fn decrypt_terminal_input_payload(master_key: &[u8; 32], payload: &Value) -> CloudResult<Value> {
+    if payload.get("format").and_then(Value::as_str) != Some("encrypted-v1") {
+        // A release may be upgraded while a legacy command is still leased.
+        // It is accepted only for delivery; acknowledgement immediately removes
+        // its plaintext from the database.
+        let legacy = payload
+            .get("data_base64")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CloudError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "terminal_payload_invalid",
+                    "terminal input payload cannot be decrypted",
+                )
+            })?;
+        decode_terminal_base64(legacy, 8192)?;
+        return Ok(json!({ "data_base64": legacy }));
+    }
+    use base64::Engine;
+    let ciphertext = payload
+        .get("ciphertext_base64")
+        .and_then(Value::as_str)
+        .and_then(|value| base64::engine::general_purpose::STANDARD.decode(value).ok())
+        .ok_or_else(|| {
+            CloudError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "terminal_payload_invalid",
+                "terminal input payload cannot be decrypted",
+            )
+        })?;
+    let nonce = payload
+        .get("nonce_base64")
+        .and_then(Value::as_str)
+        .and_then(|value| base64::engine::general_purpose::STANDARD.decode(value).ok())
+        .ok_or_else(|| {
+            CloudError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "terminal_payload_invalid",
+                "terminal input payload cannot be decrypted",
+            )
+        })?;
+    let data_base64 = decrypt_api_key(master_key, &ciphertext, &nonce)?;
+    decode_terminal_base64(&data_base64, 8192)?;
+    Ok(json!({ "data_base64": data_base64 }))
+}
+
+fn terminal_input_payload_matches(existing: &Value, expected: &Value) -> bool {
+    if existing == expected {
+        return true;
+    }
+    let expected_mac = expected.get("input_mac").and_then(Value::as_str);
+    let existing_mac = existing.get("input_mac").and_then(Value::as_str);
+    matches!(
+        (existing.get("format").and_then(Value::as_str), existing_mac, expected_mac),
+        (Some("encrypted-v1" | "redacted-v1"), Some(existing_mac), Some(expected_mac))
+            if existing_mac == expected_mac
+    )
+}
+
 fn validate_terminal_event(event: &AgentTerminalEventInput) -> CloudResult<usize> {
     if event.seq <= 0 {
         return Err(CloudError::bad_request(
@@ -4863,6 +5216,7 @@ fn validate_terminal_event(event: &AgentTerminalEventInput) -> CloudResult<usize
                 || message.chars().count() > 4000
                 || message.contains('\0')
                 || task_text_contains_token(message)
+                || terminal_text_requires_redaction(message)
             {
                 return Err(CloudError::bad_request("terminal error message is invalid"));
             }
@@ -5332,9 +5686,14 @@ async fn enqueue_terminal_command(
         .await
         .map_err(CloudError::database)?;
         if let Some(existing) = existing {
-            if existing.get::<String, _>("kind") != kind
-                || existing.get::<Value, _>("payload") != payload
-            {
+            let existing_kind: String = existing.get("kind");
+            let existing_payload: Value = existing.get("payload");
+            let payload_matches = if kind == "input" && existing_kind == "input" {
+                terminal_input_payload_matches(&existing_payload, &payload)
+            } else {
+                existing_payload == payload
+            };
+            if existing_kind != kind || !payload_matches {
                 return Err(CloudError::new(
                     StatusCode::CONFLICT,
                     "idempotency_conflict",
@@ -5399,7 +5758,7 @@ async fn terminal_input(
     let user = authenticate(&headers, &cloud).await?;
     decode_terminal_base64(&request.data_base64, 8192)?;
     let idempotency_key = validate_idempotency_key(request.idempotency_key)?;
-    let payload = json!({ "data_base64": request.data_base64 });
+    let payload = encrypt_terminal_input_payload(cloud.master_key.as_ref(), &request.data_base64)?;
     let mut transaction = cloud.db.begin().await.map_err(CloudError::database)?;
     enqueue_terminal_command(
         &mut transaction,
@@ -5679,6 +6038,12 @@ async fn lease_terminal_commands(
         let command_id: Uuid = row.get("id");
         let session_id: Uuid = row.get("session_id");
         let kind: String = row.get("kind");
+        let stored_payload: Value = row.get("payload");
+        let payload = if kind == "input" {
+            decrypt_terminal_input_payload(cloud.master_key.as_ref(), &stored_payload)?
+        } else {
+            stored_payload
+        };
         sqlx::query(
             "UPDATE cloud_terminal_commands
              SET lease_instance_id = $2,
@@ -5725,7 +6090,7 @@ async fn lease_terminal_commands(
             session_id,
             seq: row.get("seq"),
             kind,
-            payload: row.get("payload"),
+            payload,
         });
     }
     transaction.commit().await.map_err(CloudError::database)?;
@@ -5746,15 +6111,19 @@ struct AgentTerminalEventsResponse {
 
 fn terminal_event_matches(row: &sqlx::postgres::PgRow, event: &AgentTerminalEventInput) -> bool {
     row.get::<String, _>("kind") == event.kind
-        && row.get::<Option<String>, _>("data_base64") == event.data_base64
         && row.get::<Option<Value>, _>("data") == event.data
+        // Server-side redaction can intentionally make multiple raw output
+        // chunks map to the same safe value. The sequence is immutable, so a
+        // retried output cannot replace data and only needs a matching kind.
+        && (event.kind == "output"
+            || row.get::<Option<String>, _>("data_base64") == event.data_base64)
 }
 
 async fn create_terminal_events(
     Path(session_id): Path<Uuid>,
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<AgentTerminalEventsRequest>,
+    Json(mut request): Json<AgentTerminalEventsRequest>,
 ) -> CloudResult<Json<AgentTerminalEventsResponse>> {
     let cloud = cloud(&state)?;
     let token_hash = agent_task_token_hash(&headers)?;
@@ -5775,7 +6144,6 @@ async fn create_terminal_events(
         ));
     }
     let mut previous_seq = None;
-    let mut output_sizes = Vec::with_capacity(request.events.len());
     for event in &request.events {
         if previous_seq.is_some_and(|seq| event.seq <= seq) {
             return Err(CloudError::bad_request(
@@ -5783,14 +6151,13 @@ async fn create_terminal_events(
             ));
         }
         previous_seq = Some(event.seq);
-        output_sizes.push(validate_terminal_event(event)? as i64);
     }
 
     let mut transaction = cloud.db.begin().await.map_err(CloudError::database)?;
     let (agent_id, _) = lock_active_terminal_agent_by_token(&mut transaction, &token_hash).await?;
     let session = sqlx::query(
         "SELECT status, instance_id, COALESCE(lease_expires_at > NOW(), FALSE) AS lease_valid,
-                last_event_seq, event_count, output_bytes
+                last_event_seq, event_count, output_bytes, terminal_redaction_pending
          FROM cloud_terminal_sessions WHERE id = $1 AND agent_id = $2 FOR UPDATE",
     )
     .bind(session_id)
@@ -5807,6 +6174,16 @@ async fn create_terminal_events(
     })?;
     let mut status: String = session.get("status");
     let terminal = ["exited", "failed", "cancelled"].contains(&status.as_str());
+    let mut redaction_pending: bool = session.get("terminal_redaction_pending");
+    let mut output_sizes = Vec::with_capacity(request.events.len());
+    for event in &mut request.events {
+        // New agents redact before upload, but this server-side boundary also
+        // protects sessions served by older or compromised agents. The small
+        // state flag prevents a credential split across PTY chunks from being
+        // reconstructed in persisted event rows.
+        redaction_pending = sanitize_terminal_output(event, redaction_pending)?;
+        output_sizes.push(validate_terminal_event(event)? as i64);
+    }
 
     let acknowledgement_rows = if acknowledged_ids.is_empty() {
         Vec::new()
@@ -5901,7 +6278,11 @@ async fn create_terminal_events(
             }
             sqlx::query(
                 "UPDATE cloud_terminal_commands SET acknowledged_at = NOW(),
-                 lease_instance_id = NULL, lease_expires_at = NULL WHERE id = $1",
+                 lease_instance_id = NULL, lease_expires_at = NULL,
+                 payload = CASE WHEN kind = 'input' THEN jsonb_build_object(
+                   'format', 'redacted-v1', 'input_mac', payload -> 'input_mac'
+                 ) ELSE payload END
+                 WHERE id = $1",
             )
             .bind(row.get::<Uuid, _>("id"))
             .execute(&mut *transaction)
@@ -6018,7 +6399,8 @@ async fn create_terminal_events(
             "UPDATE cloud_terminal_sessions
              SET status = $2, exit_code = $3, error = $4, last_event_seq = $5,
                  event_count = $6, output_bytes = $7, last_seen_at = NOW(), exited_at = NOW(),
-                 instance_id = NULL, lease_expires_at = NULL, updated_at = NOW()
+                 terminal_redaction_pending = FALSE, instance_id = NULL,
+                 lease_expires_at = NULL, updated_at = NOW()
              WHERE id = $1",
         )
         .bind(session_id)
@@ -6035,10 +6417,11 @@ async fn create_terminal_events(
         sqlx::query(
             "UPDATE cloud_terminal_sessions
              SET status = $2, last_event_seq = $3, event_count = $4, output_bytes = $5,
-                 started_at = CASE WHEN $6 THEN COALESCE(started_at, NOW()) ELSE started_at END,
-                 last_seen_at = CASE WHEN $7 THEN NOW() ELSE last_seen_at END,
-                 lease_expires_at = CASE WHEN $7
-                   THEN NOW() + ($8 * INTERVAL '1 second') ELSE lease_expires_at END,
+                 terminal_redaction_pending = $6,
+                 started_at = CASE WHEN $7 THEN COALESCE(started_at, NOW()) ELSE started_at END,
+                 last_seen_at = CASE WHEN $8 THEN NOW() ELSE last_seen_at END,
+                 lease_expires_at = CASE WHEN $8
+                   THEN NOW() + ($9 * INTERVAL '1 second') ELSE lease_expires_at END,
                  updated_at = NOW() WHERE id = $1",
         )
         .bind(session_id)
@@ -6046,6 +6429,7 @@ async fn create_terminal_events(
         .bind(last_event_seq)
         .bind(event_count)
         .bind(output_bytes)
+        .bind(redaction_pending)
         .bind(started)
         .bind(renew_lease)
         .bind(TERMINAL_SESSION_LEASE_SECONDS)
@@ -8156,6 +8540,20 @@ mod tests {
     }
 
     #[test]
+    fn master_secret_requires_a_non_placeholder_value() {
+        assert!(validate_master_secret("").is_err());
+        assert!(validate_master_secret("too-short").is_err());
+        assert!(validate_master_secret("replace-with-a-long-random-production-secret").is_err());
+        assert!(validate_master_secret("replace_with_a_long_random_production_secret").is_err());
+        assert!(validate_master_secret("change-me-this-is-not-a-real-secret").is_err());
+        assert!(validate_master_secret("example-secret-that-is-long-enough").is_err());
+        assert_eq!(
+            validate_master_secret("  a-unique-production-secret-with-32-bytes  ").unwrap(),
+            "a-unique-production-secret-with-32-bytes"
+        );
+    }
+
+    #[test]
     fn hashes_tokens_without_leaking_the_original() {
         let token = "sk-sc_example";
         let hash = sha256_hex(token);
@@ -8713,6 +9111,105 @@ mod tests {
             })
             .is_err()
         );
+        assert!(
+            validate_terminal_event(&AgentTerminalEventInput {
+                seq: 5,
+                kind: "error".into(),
+                data_base64: None,
+                data: Some(json!({ "message": "password=hunter2" })),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn terminal_output_is_redacted_before_storage() {
+        use base64::Engine;
+
+        let mut output = AgentTerminalEventInput {
+            seq: 1,
+            kind: "output".into(),
+            data_base64: Some(base64::engine::general_purpose::STANDARD.encode(
+                "password=hunter2 api_key: \"sk-test\" Bearer bearer-secret sca_abcdefghijklmnopqrstuvwxyz0123456789",
+            )),
+            data: None,
+        };
+        assert!(sanitize_terminal_output(&mut output, false).unwrap());
+        let stored = String::from_utf8(
+            decode_terminal_base64(output.data_base64.as_deref().unwrap(), 16 * 1024).unwrap(),
+        )
+        .unwrap();
+        for secret in [
+            "hunter2",
+            "sk-test",
+            "bearer-secret",
+            "sca_abcdefghijklmnopqrstuvwxyz0123456789",
+        ] {
+            assert!(!stored.contains(secret), "leaked {secret}");
+        }
+        assert!(stored.contains("[REDACTED]"));
+        assert_eq!(validate_terminal_event(&output).unwrap(), stored.len());
+    }
+
+    #[test]
+    fn terminal_redaction_state_covers_split_credentials() {
+        use base64::Engine;
+
+        let mut key = AgentTerminalEventInput {
+            seq: 1,
+            kind: "output".into(),
+            data_base64: Some(base64::engine::general_purpose::STANDARD.encode("password=")),
+            data: None,
+        };
+        let pending = sanitize_terminal_output(&mut key, false).unwrap();
+        assert!(pending);
+        let mut value = AgentTerminalEventInput {
+            seq: 2,
+            kind: "output".into(),
+            data_base64: Some(base64::engine::general_purpose::STANDARD.encode("hunter2\n")),
+            data: None,
+        };
+        assert!(!sanitize_terminal_output(&mut value, pending).unwrap());
+        let persisted = [key, value]
+            .into_iter()
+            .map(|event| {
+                String::from_utf8(
+                    decode_terminal_base64(event.data_base64.as_deref().unwrap(), 16 * 1024)
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<String>();
+        assert!(!persisted.contains("hunter2"));
+    }
+
+    #[test]
+    fn terminal_input_is_encrypted_and_keeps_idempotency_without_plaintext() {
+        use base64::Engine;
+
+        let key = [9_u8; 32];
+        let input = base64::engine::general_purpose::STANDARD.encode("password=hunter2\n");
+        let first = encrypt_terminal_input_payload(&key, &input).unwrap();
+        assert!(first.get("data_base64").is_none());
+        assert_ne!(first["ciphertext_base64"], input);
+        assert_eq!(
+            decrypt_terminal_input_payload(&key, &first).unwrap()["data_base64"],
+            input
+        );
+
+        let retry = encrypt_terminal_input_payload(&key, &input).unwrap();
+        assert!(terminal_input_payload_matches(&first, &retry));
+        let different = encrypt_terminal_input_payload(
+            &key,
+            &base64::engine::general_purpose::STANDARD.encode("different"),
+        )
+        .unwrap();
+        assert!(!terminal_input_payload_matches(&first, &different));
+        let scrubbed = json!({
+            "format": "redacted-v1",
+            "input_mac": first["input_mac"].clone(),
+        });
+        assert!(terminal_input_payload_matches(&scrubbed, &retry));
     }
 
     #[test]

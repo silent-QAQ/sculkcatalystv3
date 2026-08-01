@@ -484,7 +484,7 @@ npm run build
 - `scripts/cloud-smoke-test.ps1`：Cloud API 冒烟测试。
 - `bash -n scripts/*.sh` 与 ShellCheck：Linux 启停脚本检查。
 
-GitHub Actions 工作流见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)，当前覆盖 Ubuntu/Windows 后端矩阵、Rust 格式化、check、Clippy、测试、Linux shell 检查和 Node 24 前端构建。`agent` 的检查目前是本地额外检查，不属于当前 Actions 的必跑 job。上述 PowerShell E2E 脚本也不是每次 CI 的默认步骤，需要按场景单独运行。最近一次三项 CI job 全部通过的运行记录为 [Actions run 30675684790](https://github.com/silent-QAQ/sculkcatalystv3/actions/runs/30675684790)。
+GitHub Actions 工作流见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)，当前覆盖 Ubuntu/Windows 的后端与主机 Agent 矩阵、Rust 格式化、check、Clippy、测试、Linux shell 检查和 Node 24 前端构建。隔离的 `cloud-smoke` job 会验证数据库迁移、账号与独立审批、加密中转和 Docker Compose 配置；主机 Agent 任务与持久终端的完整 PowerShell E2E 脚本仍需按场景单独运行。
 
 ## 常见问题与排错
 

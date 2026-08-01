@@ -18,10 +18,10 @@ Linux 版使用 musl 静态链接，不依赖目标主机安装特定版本的 g
 2. 在 Minecraft 主机下载对应平台的 Agent。
 3. 使用页面生成的短时配对码执行命令：
 
-Windows PowerShell：
+Windows PowerShell（下载版文件名）：
 
 ```powershell
-.\sculk-agent.exe pair --cloud "https://sculk.mcmy.love" --code "scp_..." --name "mc-host" --workspace "minecraft" --workspace-root "D:\minecraft" --permissions "full" --capabilities "heartbeat,tasks-v1,task-checkpoints-v1,shell-v1,terminal-v1"
+.\sculk-agent-windows-x86_64.exe pair --cloud "https://sculk.mcmy.love" --code "scp_..." --name "mc-host" --workspace "minecraft" --workspace-root "D:\minecraft" --permissions "full" --capabilities "heartbeat,tasks-v1,task-checkpoints-v1,shell-v1,terminal-v1"
 ```
 
 Linux：
@@ -49,10 +49,10 @@ chmod +x ./sculk-agent-linux-x86_64
 
 首次启动后，Agent 会把一次性 JSON 原子替换为长期配置并清除配对码；随后仍需在 Cloud 控制台核对指纹并确认主机。
 
-Windows：
+Windows（下载版）：
 
 ```powershell
-.\sculk-agent.exe run
+.\sculk-agent-windows-x86_64.exe run
 ```
 
 Linux：
@@ -126,6 +126,18 @@ Agent 是独立 Cargo 包，不会编译 PostgreSQL、Redis 或 Cloud 后端依�
 ```bash
 cd agent
 cargo build --release --locked
+```
+
+源码构建产物不带下载版的平台后缀：
+
+```powershell
+# Windows PowerShell
+.\target\release\sculk-agent.exe run
+```
+
+```bash
+# Linux / macOS shell
+./target/release/sculk-agent run
 ```
 
 Linux 静态版：

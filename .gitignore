@@ -43,3 +43,4 @@ Thumbs.db
 !package-lock.json
 !frontend/package-lock.json
 !backend/Cargo.lock
+!agent/Cargo.lock

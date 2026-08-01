@@ -215,11 +215,7 @@ async function logout() {
   busy.value = 'logout'
   try { await cloudRequest<void>('/api/cloud/auth/logout', { method: 'POST' }) } catch {}
   setCloudSession('')
-  profile.value = null
-  devices.value = []
-  teams.value = []
-  approvals.value = []
-  credentials.value = []
+  clearSessionView()
   busy.value = ''
   flash('已退出云账号')
 }
@@ -497,6 +493,14 @@ function clearSessionView() {
   credentials.value = []
   usage.value = null
   provider.value = null
+  createdToken.value = ''
+  copied.value = false
+  credentialForm.value = { name: '', base_url: 'https://api.openai.com/v1', api_key: '' }
+  providerForm.value = { name: '', base_url: '', api_key: '', default_model: '', enabled: true }
+  createdInvitation.value = null
+  inviteForm.value = { email: '', role: 'member' }
+  decisionComment.value = {}
+  authForm.value.password = ''
 }
 
 function handleSessionExpired() {

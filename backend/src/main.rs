@@ -15,6 +15,7 @@ mod runtime;
 mod server_intelligence;
 mod skills;
 mod task_executor;
+mod workspace_fs;
 
 use axum::{
     Json, Router,
@@ -28,11 +29,13 @@ use axum::{
     response::Response,
     routing::{delete, get, post},
 };
+use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs::{File as StdFile, OpenOptions as StdOpenOptions},
+    io::{Read as _, Write as _},
     path::{Component, Path as StdPath, PathBuf},
     process::Stdio,
     sync::{
@@ -1088,7 +1091,7 @@ async fn install_java_runtime(
         return Err((
             StatusCode::BAD_REQUEST,
             format!(
-                "暂不支持安装 Java {}，当前仅支持 Java {}",
+                "暂不支持安装 Java {}，当前支持 Java 8、17、{}",
                 request.major,
                 runtime::RECOMMENDED_JAVA
             ),
@@ -1787,13 +1790,14 @@ async fn start_server(state: AppState, id: String) -> ApiResult<ActionResponse> 
         ));
     }
     ensure_server_port_available(server.port).await?;
-    let java = runtime::detect_java(&runtime::data_root()).await;
+    let required_java = runtime::required_java_major(&server.version);
+    let java = runtime::detect_java_for_major(&runtime::data_root(), required_java).await;
     if !java.java_installed {
         return Err((
             StatusCode::CONFLICT,
             format!(
-                "未检测到可用的 Java。请设置 SCULK_JAVA_BIN，或调用 POST /api/runtime/java/install 安装 Java {}",
-                runtime::RECOMMENDED_JAVA
+                "未检测到 Minecraft {} 所需的 Java {}。请先执行初始化任务自动安装，或调用 POST /api/runtime/java/install",
+                server.version, required_java
             ),
         ));
     }
@@ -1801,11 +1805,12 @@ async fn start_server(state: AppState, id: String) -> ApiResult<ActionResponse> 
         return Err((
             StatusCode::CONFLICT,
             format!(
-                "当前 Java {} 不兼容，需要 Java {} 或更高版本。请更新 SCULK_JAVA_BIN，或安装托管 Java",
+                "当前 Java {} 不兼容 Minecraft {}，需要精确的 Java {}。请先执行初始化任务安装托管运行时",
                 java.java_major
                     .map(|major| major.to_string())
                     .unwrap_or_else(|| "版本未知".into()),
-                runtime::RECOMMENDED_JAVA
+                server.version,
+                required_java
             ),
         ));
     }
@@ -2665,55 +2670,58 @@ async fn list_files(
 ) -> ApiResult<FileListResponse> {
     let root = ensure_workspace(&state, &id).await?;
     let relative = safe_relative(query.path.as_deref().unwrap_or(""))?;
-    let directory = resolve_existing(&root, &relative).await?;
-    let metadata = fs::metadata(&directory)
-        .await
-        .map_err(|error| (StatusCode::NOT_FOUND, error.to_string()))?;
-    if !metadata.is_dir() {
-        return Err((StatusCode::BAD_REQUEST, "path is not a directory".into()));
-    }
-    let mut reader = fs::read_dir(&directory)
-        .await
-        .map_err(|error| internal(error.to_string()))?;
-    let mut entries = Vec::new();
-    while let Some(entry) = reader
-        .next_entry()
-        .await
-        .map_err(|error| internal(error.to_string()))?
-    {
-        let metadata = entry
-            .metadata()
-            .await
-            .map_err(|error| internal(error.to_string()))?;
-        let file_type = entry
-            .file_type()
-            .await
-            .map_err(|error| internal(error.to_string()))?;
-        if file_type.is_symlink() {
-            continue;
+    let mut entries = workspace_fs::within_workspace(root, {
+        let relative = relative.clone();
+        move |workspace| {
+            let metadata = if relative.as_os_str().is_empty() {
+                workspace.dir_metadata()?
+            } else {
+                reject_workspace_symlink(workspace, &relative)?;
+                workspace.metadata(&relative)?
+            };
+            if !metadata.is_dir() {
+                return Err(workspace_invalid_path("path is not a directory"));
+            }
+            let reader = if relative.as_os_str().is_empty() {
+                workspace.entries()?
+            } else {
+                workspace.read_dir(&relative)?
+            };
+            let mut entries = Vec::new();
+            for entry in reader {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() {
+                    continue;
+                }
+                let metadata = entry.metadata()?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                let entry_relative = relative.join(&name);
+                entries.push(FileEntry {
+                    name,
+                    path: path_string(&entry_relative),
+                    kind: if metadata.is_dir() {
+                        "folder".into()
+                    } else {
+                        "file".into()
+                    },
+                    size: if metadata.is_file() {
+                        metadata.len()
+                    } else {
+                        0
+                    },
+                    modified: metadata
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.into_std().duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_secs()),
+                });
+            }
+            Ok(entries)
         }
-        let name = entry.file_name().to_string_lossy().to_string();
-        let entry_relative = relative.join(&name);
-        entries.push(FileEntry {
-            name,
-            path: path_string(&entry_relative),
-            kind: if metadata.is_dir() {
-                "folder".into()
-            } else {
-                "file".into()
-            },
-            size: if metadata.is_file() {
-                metadata.len()
-            } else {
-                0
-            },
-            modified: metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|duration| duration.as_secs()),
-        });
-    }
+    })
+    .await
+    .map_err(workspace_io_error)?;
     entries.sort_by(|left, right| {
         left.kind
             .cmp(&right.kind)
@@ -2739,22 +2747,28 @@ async fn read_file(
         .ok_or((StatusCode::BAD_REQUEST, "file path is required".into()))?;
     let root = ensure_workspace(&state, &id).await?;
     let relative = safe_relative(&requested)?;
-    let target = resolve_existing(&root, &relative).await?;
-    let metadata = fs::metadata(&target)
-        .await
-        .map_err(|error| (StatusCode::NOT_FOUND, error.to_string()))?;
-    if !metadata.is_file() {
-        return Err((StatusCode::BAD_REQUEST, "path is not a file".into()));
-    }
-    if metadata.len() > 2_000_000 {
+    let bytes = workspace_fs::within_workspace(root, {
+        let relative = relative.clone();
+        move |workspace| {
+            reject_workspace_symlink(workspace, &relative)?;
+            let metadata = workspace.metadata(&relative)?;
+            if !metadata.is_file() {
+                return Err(workspace_invalid_path("path is not a file"));
+            }
+            let file = workspace.open(&relative)?;
+            let mut bytes = Vec::with_capacity(metadata.len().min(2_000_000) as usize);
+            file.take(2_000_001).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        }
+    })
+    .await
+    .map_err(workspace_io_error)?;
+    if bytes.len() > 2_000_000 {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
             "text file exceeds 2 MB".into(),
         ));
     }
-    let bytes = fs::read(&target)
-        .await
-        .map_err(|error| internal(error.to_string()))?;
     let content = String::from_utf8(bytes).map_err(|_| {
         (
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -2763,8 +2777,8 @@ async fn read_file(
     })?;
     Ok(Json(FileContentResponse {
         path: path_string(&relative),
+        size: content.len() as u64,
         content,
-        size: metadata.len(),
         readonly: !is_editable(&relative),
     }))
 }
@@ -2782,25 +2796,24 @@ async fn download_file(
     if relative.as_os_str().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "file path is required".into()));
     }
-    let target = resolve_existing(&root, &relative).await?;
-    let metadata = fs::metadata(&target)
-        .await
-        .map_err(|error| (StatusCode::NOT_FOUND, error.to_string()))?;
-    if !metadata.is_file() {
-        return Err((StatusCode::BAD_REQUEST, "path is not a file".into()));
-    }
-    if metadata.len() > MAX_FILE_TRANSFER_BYTES as u64 {
-        return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!(
-                "file exceeds the {} MiB transfer limit",
-                MAX_FILE_TRANSFER_BYTES / 1024 / 1024
-            ),
-        ));
-    }
-    let bytes = fs::read(&target)
-        .await
-        .map_err(|error| internal(error.to_string()))?;
+    let bytes = workspace_fs::within_workspace(root, {
+        let relative = relative.clone();
+        move |workspace| {
+            reject_workspace_symlink(workspace, &relative)?;
+            let metadata = workspace.metadata(&relative)?;
+            if !metadata.is_file() {
+                return Err(workspace_invalid_path("path is not a file"));
+            }
+            let file = workspace.open(&relative)?;
+            let mut bytes =
+                Vec::with_capacity(metadata.len().min(MAX_FILE_TRANSFER_BYTES as u64) as usize);
+            file.take(MAX_FILE_TRANSFER_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            Ok(bytes)
+        }
+    })
+    .await
+    .map_err(workspace_io_error)?;
     if bytes.len() > MAX_FILE_TRANSFER_BYTES {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -2900,50 +2913,44 @@ async fn upload_file(
     let filename = filename.ok_or((StatusCode::BAD_REQUEST, "file field is required".into()))?;
     let content = content.ok_or((StatusCode::BAD_REQUEST, "file field is required".into()))?;
     let root = ensure_workspace(&state, &id).await?;
-    let directory_target = resolve_existing(&root, &directory).await?;
-    if !fs::metadata(&directory_target)
-        .await
-        .map_err(|error| (StatusCode::NOT_FOUND, error.to_string()))?
-        .is_dir()
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "upload path is not a directory".into(),
-        ));
-    }
     let relative = directory.join(&filename);
     reject_protected_server_artifact(&relative)?;
 
     let operation = server_operation_lock(&state, &format!("files:{id}")).await;
     let _guard = operation.lock().await;
-    let target = resolve_for_write(&root, &relative).await?;
-    if fs::try_exists(&target)
-        .await
-        .map_err(|error| internal(error.to_string()))?
-    {
-        return Err((StatusCode::CONFLICT, "target path already exists".into()));
-    }
-
-    let parent = target
-        .parent()
-        .ok_or((StatusCode::BAD_REQUEST, "invalid upload path".into()))?;
-    let temporary = parent.join(format!(".sculk-upload-{}.part", Uuid::new_v4()));
-    if let Err(error) = fs::write(&temporary, &content).await {
-        let _ = fs::remove_file(&temporary).await;
-        return Err(internal(error.to_string()));
-    }
-    if let Err(error) = fs::rename(&temporary, &target).await {
-        let _ = fs::remove_file(&temporary).await;
-        return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
-            (StatusCode::CONFLICT, "target path already exists".into())
+    let content_size = content.len() as u64;
+    workspace_fs::within_workspace(root, move |workspace| {
+        let directory = if directory.as_os_str().is_empty() {
+            workspace.try_clone()?
         } else {
-            internal(error.to_string())
-        });
-    }
+            reject_workspace_symlink(workspace, &directory)?;
+            let metadata = workspace.metadata(&directory)?;
+            if !metadata.is_dir() {
+                return Err(workspace_invalid_path("upload path is not a directory"));
+            }
+            workspace.open_dir(&directory)?
+        };
+        let temporary = PathBuf::from(format!(".sculk-upload-{}.part", Uuid::new_v4()));
+        let publish = (|| {
+            let mut options = CapOpenOptions::new();
+            options.write(true).create_new(true);
+            let mut file = directory.open_with(&temporary, &options)?;
+            file.write_all(content.as_ref())?;
+            file.sync_all()?;
+            drop(file);
+            directory.hard_link(&temporary, &directory, &filename)
+        })();
+        // Always remove the private staging file. A cleanup failure must not
+        // turn a successfully published upload into an apparent API failure.
+        let _ = directory.remove_file(&temporary);
+        publish
+    })
+    .await
+    .map_err(workspace_io_error)?;
 
     Ok(Json(FileTransferResponse {
         path: path_string(&relative),
-        size: content.len() as u64,
+        size: content_size,
     }))
 }
 
@@ -2969,19 +2976,38 @@ async fn write_file(
     }
     let operation = server_operation_lock(&state, &format!("files:{id}")).await;
     let _guard = operation.lock().await;
-    let target = resolve_for_write(&root, &relative).await?;
-    fs::write(&target, request.content.as_bytes())
-        .await
-        .map_err(|error| internal(error.to_string()))?;
+    let content = workspace_fs::within_workspace(root, {
+        let relative = relative.clone();
+        let content = request.content;
+        move |workspace| {
+            let parent = relative.parent().unwrap_or(StdPath::new(""));
+            workspace.create_dir_all(parent)?;
+            match workspace.symlink_metadata(&relative) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "symbolic links are not allowed",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            workspace.write(&relative, content.as_bytes())?;
+            Ok(content)
+        }
+    })
+    .await
+    .map_err(workspace_io_error)?;
     if path_string(&relative) == "server.properties" {
         let mut data = state.inner.write().await;
-        data.configs.insert(id, request.content.clone());
+        data.configs.insert(id, content.clone());
         persist(&state, &data).await.map_err(internal)?
     }
     Ok(Json(FileContentResponse {
         path: path_string(&relative),
-        size: request.content.len() as u64,
-        content: request.content,
+        size: content.len() as u64,
+        content,
         readonly: false,
     }))
 }
@@ -3017,63 +3043,58 @@ async fn rename_file(
 
     let operation = server_operation_lock(&state, &format!("files:{id}")).await;
     let _guard = operation.lock().await;
-    let source = resolve_existing(&root, &relative).await?;
-    let metadata = fs::metadata(&source)
-        .await
-        .map_err(|error| (StatusCode::NOT_FOUND, error.to_string()))?;
-    let kind = if metadata.is_dir() {
-        "folder"
-    } else if metadata.is_file() {
-        "file"
-    } else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "unsupported workspace entry".into(),
-        ));
-    };
-    let target = resolve_for_write(&root, &new_relative).await?;
-    if fs::symlink_metadata(&target).await.is_ok() {
-        return Err((StatusCode::CONFLICT, "target path already exists".into()));
-    }
-
-    let replacement_config = if is_root_server_properties(&new_relative) {
-        if !metadata.is_file() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "server.properties target must be a text file".into(),
-            ));
+    let (kind, replacement_config) = workspace_fs::within_workspace(root, {
+        let relative = relative.clone();
+        let new_relative = new_relative.clone();
+        move |workspace| {
+            reject_workspace_symlink(workspace, &relative)?;
+            let metadata = workspace.metadata(&relative)?;
+            let kind = if metadata.is_dir() {
+                "folder"
+            } else if metadata.is_file() {
+                "file"
+            } else {
+                return Err(workspace_invalid_path("unsupported workspace entry"));
+            };
+            let parent = new_relative.parent().unwrap_or(StdPath::new(""));
+            workspace.create_dir_all(parent)?;
+            match workspace.symlink_metadata(&new_relative) {
+                Ok(_) => return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let replacement_config = if is_root_server_properties(&new_relative) {
+                if !metadata.is_file() {
+                    return Err(workspace_invalid_path(
+                        "server.properties target must be a text file",
+                    ));
+                }
+                let file = workspace.open(&relative)?;
+                let mut bytes = Vec::with_capacity(metadata.len().min(2_000_000) as usize);
+                file.take(2_000_001).read_to_end(&mut bytes)?;
+                if bytes.len() > 2_000_000 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                }
+                Some(String::from_utf8(bytes).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "server.properties must contain UTF-8 text",
+                    )
+                })?)
+            } else {
+                None
+            };
+            workspace.rename(&relative, workspace, &new_relative)?;
+            Ok((kind.to_string(), replacement_config))
         }
-        if metadata.len() > 2_000_000 {
-            return Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "text file exceeds 2 MB".into(),
-            ));
-        }
-        Some(
-            String::from_utf8(
-                fs::read(&source)
-                    .await
-                    .map_err(|error| internal(error.to_string()))?,
-            )
-            .map_err(|_| {
-                (
-                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    "server.properties must contain UTF-8 text".into(),
-                )
-            })?,
-        )
-    } else {
-        None
-    };
-
-    fs::rename(&source, &target)
-        .await
-        .map_err(|error| internal(error.to_string()))?;
+    })
+    .await
+    .map_err(workspace_io_error)?;
     sync_config_after_rename(&state, &id, &relative, &new_relative, replacement_config).await?;
     Ok(Json(RenamedFileResponse {
         path: path_string(&relative),
         new_path: path_string(&new_relative),
-        kind: kind.into(),
+        kind,
     }))
 }
 
@@ -3094,32 +3115,30 @@ async fn delete_file(
 
     let operation = server_operation_lock(&state, &format!("files:{id}")).await;
     let _guard = operation.lock().await;
-    let target = resolve_existing(&root, &relative).await?;
-    let metadata = fs::metadata(&target)
-        .await
-        .map_err(|error| (StatusCode::NOT_FOUND, error.to_string()))?;
-    let kind = if metadata.is_dir() {
-        if !request.recursive {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "deleting a directory requires recursive=true".into(),
-            ));
+    let recursive = request.recursive;
+    let kind = workspace_fs::within_workspace(root, {
+        let relative = relative.clone();
+        move |workspace| {
+            reject_workspace_symlink(workspace, &relative)?;
+            let metadata = workspace.metadata(&relative)?;
+            if metadata.is_dir() {
+                if !recursive {
+                    return Err(workspace_invalid_path(
+                        "deleting a directory requires recursive=true",
+                    ));
+                }
+                workspace.remove_dir_all(&relative)?;
+                Ok("folder".to_string())
+            } else if metadata.is_file() {
+                workspace.remove_file(&relative)?;
+                Ok("file".to_string())
+            } else {
+                Err(workspace_invalid_path("unsupported workspace entry"))
+            }
         }
-        fs::remove_dir_all(&target)
-            .await
-            .map_err(|error| internal(error.to_string()))?;
-        "folder"
-    } else if metadata.is_file() {
-        fs::remove_file(&target)
-            .await
-            .map_err(|error| internal(error.to_string()))?;
-        "file"
-    } else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "unsupported workspace entry".into(),
-        ));
-    };
+    })
+    .await
+    .map_err(workspace_io_error)?;
     if is_root_server_properties(&relative) {
         let mut data = state.inner.write().await;
         let is_server = data
@@ -3132,7 +3151,7 @@ async fn delete_file(
     }
     Ok(Json(DeletedFileResponse {
         path: path_string(&relative),
-        kind: kind.into(),
+        kind,
     }))
 }
 
@@ -3200,10 +3219,12 @@ async fn create_directory(
     if relative.as_os_str().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "directory path is required".into()));
     }
-    let target = resolve_for_write(&root, &relative).await?;
-    fs::create_dir_all(target)
-        .await
-        .map_err(|error| internal(error.to_string()))?;
+    workspace_fs::within_workspace(root, {
+        let relative = relative.clone();
+        move |workspace| workspace.create_dir_all(&relative)
+    })
+    .await
+    .map_err(workspace_io_error)?;
     list_files(
         Path(id),
         Query(FileQuery {
@@ -3379,170 +3400,57 @@ fn safe_download_filename(path: &StdPath) -> String {
     }
 }
 
-async fn resolve_existing(
-    root: &PathBuf,
-    relative: &PathBuf,
-) -> Result<PathBuf, (StatusCode, String)> {
-    reject_symlink_components(root, relative).await?;
-    let root_canonical = fs::canonicalize(root)
-        .await
-        .map_err(|error| internal(error.to_string()))?;
-    let target = root.join(relative);
-    let metadata = fs::symlink_metadata(&target)
-        .await
-        .map_err(|error| (StatusCode::NOT_FOUND, error.to_string()))?;
-    if metadata.file_type().is_symlink() {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "symbolic links are not allowed".into(),
-        ));
-    }
-    let canonical = fs::canonicalize(&target)
-        .await
-        .map_err(|error| (StatusCode::NOT_FOUND, error.to_string()))?;
-    if !canonical.starts_with(&root_canonical) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "path escapes server workspace".into(),
-        ));
-    }
-    Ok(canonical)
-}
-async fn resolve_for_write(
-    root: &PathBuf,
-    relative: &PathBuf,
-) -> Result<PathBuf, (StatusCode, String)> {
-    reject_symlink_components(root, relative).await?;
-    let root_canonical = fs::canonicalize(root)
-        .await
-        .map_err(|error| internal(error.to_string()))?;
-    let target = root.join(relative);
-    let parent = target
-        .parent()
-        .ok_or((StatusCode::BAD_REQUEST, "invalid path".into()))?;
-    fs::create_dir_all(parent)
-        .await
-        .map_err(|error| internal(error.to_string()))?;
-    let parent_canonical = fs::canonicalize(parent)
-        .await
-        .map_err(|error| internal(error.to_string()))?;
-    if !parent_canonical.starts_with(&root_canonical) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "path escapes server workspace".into(),
-        ));
-    }
-    if let Ok(metadata) = fs::symlink_metadata(&target).await
-        && metadata.file_type().is_symlink()
-    {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "symbolic links are not allowed".into(),
-        ));
-    }
-    Ok(target)
-}
-async fn reject_symlink_components(
-    root: &StdPath,
-    relative: &StdPath,
-) -> Result<(), (StatusCode, String)> {
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(part) = component else {
-            continue;
-        };
-        current.push(part);
-        match fs::symlink_metadata(&current).await {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err((
-                    StatusCode::FORBIDDEN,
-                    "symbolic links are not allowed".into(),
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-            Err(error) => return Err(internal(error.to_string())),
+fn workspace_io_error(error: std::io::Error) -> (StatusCode, String) {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, "workspace path was not found".into())
         }
+        std::io::ErrorKind::AlreadyExists => {
+            (StatusCode::CONFLICT, "target path already exists".into())
+        }
+        std::io::ErrorKind::PermissionDenied => (
+            StatusCode::FORBIDDEN,
+            "workspace path is not accessible or contains a symbolic link".into(),
+        ),
+        std::io::ErrorKind::InvalidInput => (StatusCode::BAD_REQUEST, error.to_string()),
+        std::io::ErrorKind::InvalidData => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "file exceeds the {} MiB transfer limit",
+                MAX_FILE_TRANSFER_BYTES / 1024 / 1024
+            ),
+        ),
+        std::io::ErrorKind::Unsupported => (StatusCode::UNSUPPORTED_MEDIA_TYPE, error.to_string()),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "workspace file operation failed".into(),
+        ),
+    }
+}
+
+fn workspace_invalid_path(message: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+}
+
+fn reject_workspace_symlink(workspace: &CapDir, path: &StdPath) -> std::io::Result<()> {
+    if workspace.symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "symbolic links are not allowed",
+        ));
     }
     Ok(())
 }
+
 fn path_string(path: &std::path::Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 fn is_editable(path: &std::path::Path) -> bool {
-    if path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            matches!(
-                name.to_ascii_lowercase().as_str(),
-                "dockerfile"
-                    | "makefile"
-                    | "cmakelists.txt"
-                    | ".gitignore"
-                    | ".dockerignore"
-                    | ".editorconfig"
-                    | ".env"
-            )
-        })
-    {
-        return true;
-    }
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "properties"
-                    | "yml"
-                    | "yaml"
-                    | "json"
-                    | "toml"
-                    | "txt"
-                    | "conf"
-                    | "cfg"
-                    | "ini"
-                    | "md"
-                    | "ps1"
-                    | "sh"
-                    | "log"
-                    | "rs"
-                    | "js"
-                    | "jsx"
-                    | "mjs"
-                    | "cjs"
-                    | "ts"
-                    | "tsx"
-                    | "vue"
-                    | "css"
-                    | "scss"
-                    | "sass"
-                    | "less"
-                    | "html"
-                    | "htm"
-                    | "xml"
-                    | "java"
-                    | "kt"
-                    | "kts"
-                    | "py"
-                    | "go"
-                    | "c"
-                    | "h"
-                    | "cc"
-                    | "cpp"
-                    | "hpp"
-                    | "cs"
-                    | "php"
-                    | "rb"
-                    | "swift"
-                    | "sql"
-                    | "graphql"
-                    | "gql"
-                    | "gradle"
-                    | "lock"
-            )
-        })
-        .unwrap_or(false)
+    // 编辑权限由安全路径解析、符号链接检查和核心产物保护负责；扩展名
+    // 只是编辑器提示，不能阻止用户创建 LICENSE、无扩展名配置或自定义脚本。
+    // 二进制文件仍不会进入文本编辑器：read_file 在 UTF-8 解码失败时会拒绝打开。
+    let _ = path;
+    true
 }
 async fn get_mirrors(State(state): State<AppState>) -> Json<Vec<MirrorInfo>> {
     Json(state.inner.read().await.mirrors.clone())
@@ -3920,16 +3828,68 @@ async fn toggle_skill(
 fn internal(error: String) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error)
 }
+
+/// 从用户或规划对话中的结构化事实提取核心与 Minecraft 版本。
+///
+/// 这只接受明确出现的核心名称和形如 `1.12.2` 的版本号，不根据“最新”“
+/// 推荐”等模糊措辞猜测下载目标。这样开服任务可以复用规划结果，同时不
+/// 会把普通聊天误变成任意命令执行。
+pub(crate) fn extract_server_plan(text: &str) -> Option<(String, String)> {
+    const CORES: &[(&str, &str)] = &[
+        ("paper", "Paper"),
+        ("purpur", "Purpur"),
+        ("spigot", "Spigot"),
+        ("folia", "Folia"),
+        ("leaves", "Leaves"),
+        ("fabric", "Fabric"),
+        ("velocity", "Velocity"),
+        ("vanilla", "Vanilla"),
+    ];
+    let lower = text.to_ascii_lowercase();
+    let core = CORES
+        .iter()
+        .find(|(needle, _)| lower.contains(needle))
+        .map(|(_, name)| (*name).to_string())?;
+    let version = text
+        .char_indices()
+        .filter_map(|(index, _)| text.get(index..).map(|tail| (index, tail)))
+        .find_map(|(_, tail)| {
+            let tail = tail.strip_prefix("1.")?;
+            let end = tail
+                .char_indices()
+                .find(|(_, character)| !character.is_ascii_digit() && *character != '.')
+                .map(|(index, _)| index)
+                .unwrap_or(tail.len());
+            let candidate = format!("1.{}", &tail[..end]);
+            let parts: Vec<_> = candidate.split('.').collect();
+            if (parts.len() == 2 || parts.len() == 3)
+                && parts[1..].iter().all(|part| !part.is_empty())
+                && parts[1..].iter().all(|part| part.parse::<u32>().is_ok())
+            {
+                Some(candidate)
+            } else {
+                None
+            }
+        })?;
+    Some((core, version))
+}
 pub(crate) fn classify_intent(message: &str) -> &'static str {
     let command = message
         .trim()
         .trim_end_matches(['。', '！', '!', '？', '?'])
         .trim();
-    if matches!(
-        command,
-        "启动服务器" | "启动这台服务器" | "请启动服务器" | "帮我启动服务器" | "请启动这台服务器"
-    ) {
-        "server_start"
+    let compact = command
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    if compact.contains("开服")
+        || compact.contains("开服务器")
+        || compact.contains("启动服务器")
+        || compact.contains("启动这台服务器")
+        || compact.contains("把服务器开起来")
+        || compact.contains("准备并启动")
+    {
+        "server_bootstrap"
     } else if matches!(
         command,
         "停止服务器"
@@ -3957,7 +3917,7 @@ pub(crate) fn classify_intent(message: &str) -> &'static str {
 pub(crate) fn task_title(intent: &str) -> &'static str {
     match intent {
         "diagnostic" => "分析服务器日志",
-        "server_start" => "启动服务器",
+        "server_start" | "server_bootstrap" => "准备并启动服务器",
         "server_stop" => "安全停止服务器",
         "vote" => "创建玩家玩法投票",
         "promotion" => "生成服务器宣传内容",
@@ -3970,7 +3930,9 @@ pub(crate) fn rule_reply(intent: &str) -> &'static str {
         "diagnostic" => {
             "我已创建只读日志诊断任务。执行器会分析最近的服务器日志并生成可下载报告，不会自动修改文件。"
         }
-        "server_start" => "我已创建服务器启动任务。执行器会等待真实就绪标记后再报告完成。",
+        "server_start" | "server_bootstrap" => {
+            "已创建真实开服任务：先从资源中心解析核心，找不到时按镜像和官方网络源回退；缺少匹配 Java 会自动安装托管运行时，然后启动服务器并等待真实就绪标记。所有阶段、日志、产物和失败补偿都会记录在任务详情中。"
+        }
         "server_stop" => "我已创建安全停服任务。执行器会等待 Java 进程真实退出后再报告完成。",
         "vote" => {
             "玩法投票草案已生成：包含玩法摘要、奖励方案、经济影响和三档实施范围，可发布到游戏内公告、Discord 与 Web 面板。"
@@ -3989,7 +3951,7 @@ pub(crate) fn rule_reply(intent: &str) -> &'static str {
 pub(crate) fn intent_risk(intent: &str) -> &'static str {
     match intent {
         "server_stop" => "high",
-        "server_start" => "medium",
+        "server_start" | "server_bootstrap" => "medium",
         _ => "low",
     }
 }
@@ -4745,14 +4707,24 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let root = std::env::temp_dir().join(format!("sculk-symlink-{}", Uuid::new_v4()));
+        let outside = std::env::temp_dir().join(format!("sculk-outside-{}", Uuid::new_v4()));
         fs::create_dir_all(root.join("real")).await.unwrap();
-        fs::write(root.join("real/file.txt"), "safe").await.unwrap();
-        symlink(root.join("real"), root.join("alias")).unwrap();
-        let error = resolve_existing(&root, &PathBuf::from("alias/file.txt"))
+        fs::create_dir_all(&outside).await.unwrap();
+        fs::write(outside.join("file.txt"), "private")
             .await
-            .unwrap_err();
-        assert_eq!(error.0, StatusCode::FORBIDDEN);
+            .unwrap();
+        symlink(&outside, root.join("alias")).unwrap();
+        let error = workspace_fs::within_workspace(root.clone(), move |workspace| {
+            let mut file = workspace.open("alias/file.txt")?;
+            let mut content = String::new();
+            file.read_to_string(&mut content)?;
+            Ok(content)
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         fs::remove_dir_all(root).await.unwrap();
+        fs::remove_dir_all(outside).await.unwrap();
     }
 
     #[test]
@@ -4831,6 +4803,10 @@ mod tests {
             "package.json",
             "Dockerfile",
             ".gitignore",
+            "LICENSE",
+            "eula",
+            "config/custom.server.script",
+            "config/没有扩展名",
         ] {
             assert!(is_editable(StdPath::new(path)), "{path} should be editable");
         }
@@ -4943,10 +4919,25 @@ mod tests {
 
     #[test]
     fn executable_chat_actions_require_an_unambiguous_command() {
-        assert_eq!(classify_intent("请启动服务器。"), "server_start");
+        assert_eq!(classify_intent("请启动服务器。"), "server_bootstrap");
+        assert_eq!(classify_intent("帮我开服"), "server_bootstrap");
+        assert_eq!(classify_intent("把服务器开起来"), "server_bootstrap");
         assert_eq!(classify_intent("帮我安全停服"), "server_stop");
         assert_eq!(classify_intent("为什么不能停止服务器？"), "general");
         assert_eq!(classify_intent("不要停止服务器"), "general");
+    }
+
+    #[test]
+    fn plan_extraction_requires_explicit_core_and_version() {
+        assert_eq!(
+            extract_server_plan("推荐 Paper 1.12.2，使用 Java 8"),
+            Some(("Paper".into(), "1.12.2".into()))
+        );
+        assert_eq!(extract_server_plan("使用最新 Paper"), None);
+        assert_eq!(
+            extract_server_plan("Purpur 1.21.4 RPG"),
+            Some(("Purpur".into(), "1.21.4".into()))
+        );
     }
 
     #[test]

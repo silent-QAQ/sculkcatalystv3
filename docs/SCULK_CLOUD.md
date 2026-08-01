@@ -8,6 +8,9 @@ Sculk Cloud 使用 PostgreSQL 保存账号、团队、审批和用量事实，�
 # 项目根目录
 docker compose -f docker-compose.cloud.yml up -d
 Copy-Item .env.cloud.example .env
+# 编辑 .env：为 SCULK_POSTGRES_PASSWORD、SCULK_REDIS_PASSWORD 和
+# SCULK_MASTER_KEY 写入不同的高熵随机值，并把前两个值同步到
+# DATABASE_URL 与 REDIS_URL。密码建议使用 URL 安全字符；否则需 URL 编码。
 
 # 终端 1
 Set-Location backend
@@ -20,7 +23,7 @@ npm run dev
 
 后端会读取当前目录或项目根目录的 `.env`，启动时自动执行 `backend/migrations`。打开 `http://127.0.0.1:5173`，在“设置 > Sculk Cloud”注册首个账号。数据库中的首个账号自动成为云管理员，可以配置 API 中转上游。
 
-生产环境必须替换 `SCULK_MASTER_KEY` 和 PostgreSQL 密码，并限制 PostgreSQL、Redis 只允许内网访问。对外服务时设置 `SCULK_BIND_ADDRESS=0.0.0.0:8787` 与精确的 `SCULK_ALLOWED_ORIGINS`，并在 Rust API 前配置 HTTPS 反向代理。若启用 Agent 一键启动包，必须将 `SCULK_CLOUD_PUBLIC_URL` 设置为 Agent 可访问的 HTTPS 公网根地址；只有 `localhost` 或回环地址的开发环境允许使用 HTTP。
+`docker-compose.cloud.yml` 仅把 PostgreSQL 和 Redis 发布到 `127.0.0.1`，并要求显式设置 `SCULK_POSTGRES_PASSWORD`、`SCULK_REDIS_PASSWORD`。`SCULK_MASTER_KEY` 同样是必填项：后端会拒绝空值以及 `replace-with-*`、`change-me`、`example*` 等公开占位值。生产环境应使用与开发环境不同的高熵值，并限制 API 仅经 HTTPS 反向代理对外访问。对外服务时设置 `SCULK_BIND_ADDRESS=0.0.0.0:8787` 与精确的 `SCULK_ALLOWED_ORIGINS`。若启用 Agent 一键启动包，必须将 `SCULK_CLOUD_PUBLIC_URL` 设置为 Agent 可访问的 HTTPS 公网根地址；只有 `localhost` 或回环地址的开发环境允许使用 HTTP。
 
 ## 账号与同步
 
@@ -55,7 +58,7 @@ Sculk Agent 由 Minecraft 主机主动连接 Cloud，不要求主机拥有可入
 - 用户可以在 Cloud 控制台确认或撤销 Agent；撤销后心跳凭据立即失效。
 - 已认证的 `POST /api/cloud/agent-bootstrap` 会返回可嵌入下载包的 JSON：一次性配对码、可信 Cloud 地址、主机与工作区元数据，以及当前账号明确批准的完整 Agent 默认能力和权限。响应不包含账号密码、会话或 Agent 凭据。
 - 在线状态由 90 秒内的真实心跳推导，不由前端模拟。
-- Agent 会通过出站心跳报告真实的 `commands_available` 状态，并轮询任务与终端命令租约。低风险只读任务可以直接执行；写入、Shell 和终端启动必须经过关联团队审批。`log.tail` 限制在日志目录并对常见密钥/Token 脱敏，Windows Shell 使用 Job Object，Unix Shell 使用进程组清理子进程。
+- Agent 会通过出站心跳报告真实的 `commands_available` 状态，并轮询任务与终端命令租约。低风险只读任务可以直接执行；写入、Shell 和终端启动必须经过关联团队审批。终端输入会在数据库中加密保存，Agent 确认投递后立即移除可恢复内容；终端输出会在持久化前脱敏，跨分块的疑似凭据会以安全占位内容替代。`log.tail` 限制在日志目录并对常见密钥/Token 脱敏，Windows Shell 使用 Job Object，Unix Shell 使用进程组清理子进程。
 
 迁移会对旧数据采取 fail-closed 策略：没有可验证审批关联的旧高风险任务和未启动终端会话不会继续排队等待；已经运行的旧会话保留用于显式终止和租约回收。旧高风险任务若仍处于租约中，租约过期后会标记为失败而不会重新排队。新建的每次重试、回滚或终端会话都必须生成新的审批记录。
 

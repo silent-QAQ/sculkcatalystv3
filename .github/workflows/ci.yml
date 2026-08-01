@@ -34,6 +34,82 @@ jobs:
           bash -n scripts/*.sh
           shellcheck scripts/*.sh
 
+  agent:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --manifest-path agent/Cargo.toml -- --check
+      - name: Check agent
+        run: cargo check --manifest-path agent/Cargo.toml --all-targets --locked
+      - name: Lint agent
+        run: cargo clippy --manifest-path agent/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Test agent
+        run: cargo test --manifest-path agent/Cargo.toml --all-targets --locked
+
+  cloud-smoke:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: sculk_cloud
+          POSTGRES_USER: sculk
+          POSTGRES_PASSWORD: sculk_ci_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sculk -d sculk_cloud"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      DATABASE_URL: postgres://sculk:sculk_ci_password@127.0.0.1:5432/sculk_cloud
+      REDIS_URL: redis://127.0.0.1:6379/
+      SCULK_MASTER_KEY: ci-only-master-key-with-at-least-24-characters
+      SCULK_BIND_ADDRESS: 127.0.0.1:8788
+      SCULK_CLOUD_PUBLIC_URL: http://127.0.0.1:8788
+      SCULK_STATE_FILE: data/state-ci-cloud.json
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+      - name: Validate Cloud dependency configuration
+        run: SCULK_POSTGRES_PASSWORD=sculk_ci_password SCULK_REDIS_PASSWORD=sculk_ci_redis_password docker compose -f docker-compose.cloud.yml config --quiet
+      - name: Start isolated relay mock
+        run: python3 scripts/cloud-relay-mock.py --port 9944 > "$RUNNER_TEMP/cloud-relay.log" 2>&1 &
+      - name: Start Cloud backend and wait for migrations
+        run: |
+          cargo run --manifest-path backend/Cargo.toml --locked > "$RUNNER_TEMP/cloud-backend.log" 2>&1 &
+          for attempt in {1..360}; do
+            if curl --fail --silent --show-error http://127.0.0.1:8788/api/cloud/status | grep -q '"available":true'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/cloud-backend.log"
+          exit 1
+      - name: Exercise Cloud database, approval, and relay flow
+        shell: pwsh
+        run: ./scripts/cloud-smoke-test.ps1 -BaseUrl http://127.0.0.1:8788 -RelayBaseUrl http://127.0.0.1:9944
+      - name: Show Cloud backend log on failure
+        if: failure()
+        run: cat "$RUNNER_TEMP/cloud-backend.log"
+
   frontend:
     runs-on: ubuntu-latest
     steps:

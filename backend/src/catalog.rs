@@ -434,11 +434,23 @@ pub(crate) async fn require_catalog_admin(request: Request<Body>, next: Next) ->
     if !is_catalog_write {
         return next.run(request).await;
     }
-    let bearer = catalog_admin_token();
-    let basic = catalog_admin_basic_credentials();
-    if bearer.is_none() && basic.is_none() {
-        return next.run(request).await;
-    }
+    let credentials = match catalog_admin_credentials() {
+        Ok(credentials) => credentials,
+        Err(CatalogAdminConfigError::MissingCredentials) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"resource catalog write authentication is not configured"})),
+            )
+                .into_response();
+        }
+        Err(CatalogAdminConfigError::InvalidCredentials) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"resource catalog write authentication configuration is invalid"})),
+            )
+                .into_response();
+        }
+    };
     let supplied = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -446,8 +458,9 @@ pub(crate) async fn require_catalog_admin(request: Request<Body>, next: Next) ->
         .unwrap_or_default();
     if !authorization_matches(
         supplied,
-        bearer.as_deref(),
-        basic
+        credentials.bearer.as_deref(),
+        credentials
+            .basic
             .as_ref()
             .map(|(username, password)| (username.as_str(), password.as_str())),
     ) {
@@ -463,7 +476,7 @@ pub(crate) async fn require_catalog_admin(request: Request<Body>, next: Next) ->
 async fn verify_admin() -> Json<AdminVerifyResponse> {
     Json(AdminVerifyResponse {
         authorized: true,
-        protected: catalog_admin_token().is_some() || catalog_admin_basic_credentials().is_some(),
+        protected: true,
         upload_max_bytes: upload_limit_bytes(),
     })
 }
@@ -549,28 +562,78 @@ async fn upload_resource(
     }))
 }
 
-fn catalog_admin_token() -> Option<String> {
-    std::env::var("SCULK_CATALOG_ADMIN_TOKEN")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| value.len() >= 16)
+struct CatalogAdminCredentials {
+    bearer: Option<String>,
+    basic: Option<(String, String)>,
 }
 
-fn catalog_admin_basic_credentials() -> Option<(String, String)> {
-    let username = std::env::var("SCULK_CATALOG_ADMIN_USERNAME")
-        .ok()?
-        .trim()
-        .to_string();
-    let password = std::env::var("SCULK_CATALOG_ADMIN_PASSWORD").ok()?;
-    if username.is_empty()
-        || username.len() > 128
-        || username.contains(':')
-        || password.len() < 8
-        || password.len() > 256
-    {
-        return None;
+#[derive(Debug)]
+enum CatalogAdminConfigError {
+    MissingCredentials,
+    InvalidCredentials,
+}
+
+fn catalog_admin_credentials() -> Result<CatalogAdminCredentials, CatalogAdminConfigError> {
+    let bearer = std::env::var("SCULK_CATALOG_ADMIN_TOKEN").ok();
+    let username = std::env::var("SCULK_CATALOG_ADMIN_USERNAME").ok();
+    let password = std::env::var("SCULK_CATALOG_ADMIN_PASSWORD").ok();
+    catalog_admin_credentials_from_values(
+        bearer.as_deref(),
+        username.as_deref(),
+        password.as_deref(),
+    )
+}
+
+fn catalog_admin_credentials_from_values(
+    bearer: Option<&str>,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<CatalogAdminCredentials, CatalogAdminConfigError> {
+    let bearer = match optional_config_value(bearer) {
+        Some(value) if valid_catalog_secret(value, 16, 256) => Some(value.to_string()),
+        Some(_) => return Err(CatalogAdminConfigError::InvalidCredentials),
+        None => None,
+    };
+    let basic = match (
+        optional_config_value(username),
+        optional_config_value(password),
+    ) {
+        (None, None) => None,
+        (Some(username), Some(password))
+            if username.len() <= 128
+                && !username.contains(':')
+                && !is_known_placeholder_secret(username)
+                && valid_catalog_secret(password, 8, 256) =>
+        {
+            Some((username.to_string(), password.to_string()))
+        }
+        _ => return Err(CatalogAdminConfigError::InvalidCredentials),
+    };
+    if bearer.is_none() && basic.is_none() {
+        return Err(CatalogAdminConfigError::MissingCredentials);
     }
-    Some((username, password))
+    Ok(CatalogAdminCredentials { bearer, basic })
+}
+
+fn optional_config_value(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn valid_catalog_secret(value: &str, minimum: usize, maximum: usize) -> bool {
+    value.len() >= minimum && value.len() <= maximum && !is_known_placeholder_secret(value)
+}
+
+fn is_known_placeholder_secret(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    value == "change-me"
+        || value == "changeme"
+        || value == "example"
+        || value.starts_with("replace-with")
+        || value.starts_with("replace_with")
+        || value.starts_with("change-me")
+        || value.starts_with("change_me")
+        || value.starts_with("example-")
+        || value.starts_with("example_")
 }
 
 fn authorization_matches(
@@ -3186,6 +3249,62 @@ mod tests {
             Some("0123456789abcdef"),
             Some(("admin", "test-password")),
         ));
+    }
+
+    #[test]
+    fn catalog_write_authentication_is_explicit_and_rejects_public_placeholders() {
+        assert!(matches!(
+            catalog_admin_credentials_from_values(None, None, None),
+            Err(CatalogAdminConfigError::MissingCredentials)
+        ));
+        assert!(matches!(
+            catalog_admin_credentials_from_values(
+                Some("replace-with-a-long-random-resource-write-token"),
+                None,
+                None,
+            ),
+            Err(CatalogAdminConfigError::InvalidCredentials)
+        ));
+        assert!(matches!(
+            catalog_admin_credentials_from_values(Some("change_me"), None, None),
+            Err(CatalogAdminConfigError::InvalidCredentials)
+        ));
+        assert!(matches!(
+            catalog_admin_credentials_from_values(None, Some("admin"), None),
+            Err(CatalogAdminConfigError::InvalidCredentials)
+        ));
+        assert!(matches!(
+            catalog_admin_credentials_from_values(
+                None,
+                Some("example-admin"),
+                Some("a-strong-admin-password"),
+            ),
+            Err(CatalogAdminConfigError::InvalidCredentials)
+        ));
+
+        let bearer = catalog_admin_credentials_from_values(
+            Some("catalog-write-token-with-enough-entropy"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            bearer.bearer.as_deref(),
+            Some("catalog-write-token-with-enough-entropy")
+        );
+        assert!(bearer.basic.is_none());
+
+        let basic = catalog_admin_credentials_from_values(
+            None,
+            Some("catalog-admin"),
+            Some("a-strong-admin-password"),
+        )
+        .unwrap();
+        assert!(basic.bearer.is_none());
+        assert_eq!(
+            basic.basic.as_ref().map(|(username, _)| username.as_str()),
+            Some("catalog-admin")
+        );
     }
 
     #[test]

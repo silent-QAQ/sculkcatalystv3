@@ -6,9 +6,9 @@ services:
     environment:
       POSTGRES_DB: sculk_cloud
       POSTGRES_USER: sculk
-      POSTGRES_PASSWORD: sculk_dev_password
+      POSTGRES_PASSWORD: ${SCULK_POSTGRES_PASSWORD:?Set SCULK_POSTGRES_PASSWORD in .env before starting Cloud dependencies}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - sculk_pg_data:/var/lib/postgresql/data
     healthcheck:
@@ -19,13 +19,15 @@ services:
 
   redis:
     image: redis:7.4-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+    environment:
+      REDIS_PASSWORD: ${SCULK_REDIS_PASSWORD:?Set SCULK_REDIS_PASSWORD in .env before starting Cloud dependencies}
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$${REDIS_PASSWORD}\""]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - sculk_redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping"]
       interval: 5s
       timeout: 3s
       retries: 10
