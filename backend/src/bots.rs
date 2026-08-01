@@ -157,6 +157,7 @@ struct BotWebhookResponse {
     matched: bool,
     replied: bool,
     intent_score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reply: Option<String>,
     delivery: String,
     reason: Option<String>,
@@ -443,6 +444,17 @@ async fn bot_webhook(
             reason: Some("忽略机器人自身消息，避免循环回复".into()),
         }));
     }
+    if id == QQ_BOT_ID && event.message_type == "group" && !group_message_mentions_bot(&payload) {
+        return Ok(Json(BotWebhookResponse {
+            accepted: true,
+            matched: false,
+            replied: false,
+            intent_score: 0.0,
+            reply: None,
+            delivery: "ignored_not_mentioned".into(),
+            reason: Some("群聊消息需要先 @机器人 才会触发回复".into()),
+        }));
+    }
     let intent_score = detect_play_intent(&event.content);
     if !matches_reply_policy(&config, &event.content) {
         return Ok(Json(BotWebhookResponse {
@@ -500,6 +512,7 @@ async fn bot_webhook(
             Ok(status) => (status == "sent", status, None),
             Err(error) => (false, "failed".into(), Some(error)),
         };
+    let generated_reply = (id != QQ_BOT_ID).then(|| decision.reply.clone());
     let mut data = state.inner.write().await;
     data.bots.events.push(BotEvent {
         id: uuid::Uuid::new_v4().to_string(),
@@ -524,7 +537,7 @@ async fn bot_webhook(
         matched: true,
         replied,
         intent_score: decision.intent_score,
-        reply: Some(decision.reply),
+        reply: generated_reply,
         delivery,
         reason,
     }))
@@ -599,6 +612,39 @@ fn normalize_event(bot_id: &str, payload: &Value) -> Result<IncomingEvent, Strin
             .and_then(Value::as_bool)
             .unwrap_or(false),
     })
+}
+
+fn group_message_mentions_bot(payload: &Value) -> bool {
+    let Some(self_id) = value_string(payload, "self_id") else {
+        return false;
+    };
+    if payload
+        .get("message")
+        .and_then(Value::as_array)
+        .is_some_and(|segments| {
+            segments.iter().any(|segment| {
+                segment.get("type").and_then(Value::as_str) == Some("at")
+                    && segment
+                        .get("data")
+                        .and_then(|data| value_string(data, "qq"))
+                        .is_some_and(|qq| qq == self_id)
+            })
+        })
+    {
+        return true;
+    }
+    let marker = format!("qq={self_id}");
+    payload
+        .get("raw_message")
+        .and_then(Value::as_str)
+        .map(|raw| {
+            raw.split("[CQ:at,")
+                .skip(1)
+                .filter_map(|part| part.split(']').next())
+                .flat_map(|attributes| attributes.split(','))
+                .any(|attribute| attribute.trim() == marker)
+        })
+        .unwrap_or(false)
 }
 
 fn matches_reply_policy(config: &BotConfig, content: &str) -> bool {
@@ -988,7 +1034,6 @@ async fn test_napcat() -> Result<(), String> {
     napcat_post(&napcat_api_url(), "get_login_info", json!({}))
         .await
         .map(|_| ())
-        .map_err(|error| error)
 }
 
 async fn test_video_endpoint(
@@ -1231,6 +1276,31 @@ mod tests {
         assert_eq!(event.author_id.as_deref(), Some("456"));
         assert_eq!(event.content, "想进服务器一起玩");
         assert!(!event.from_bot);
+    }
+
+    #[test]
+    fn group_trigger_requires_an_at_mention_of_self() {
+        let without_mention = serde_json::json!({
+            "post_type": "message",
+            "message_type": "group",
+            "group_id": 123,
+            "user_id": 456,
+            "self_id": 999,
+            "message": [{"type":"text","data":{"text":"服务器怎么玩"}}]
+        });
+        let with_mention = serde_json::json!({
+            "post_type": "message",
+            "message_type": "group",
+            "group_id": 123,
+            "user_id": 456,
+            "self_id": 999,
+            "message": [
+                {"type":"at","data":{"qq":"999"}},
+                {"type":"text","data":{"text":"服务器怎么玩"}}
+            ]
+        });
+        assert!(!group_message_mentions_bot(&without_mention));
+        assert!(group_message_mentions_bot(&with_mention));
     }
 
     #[test]

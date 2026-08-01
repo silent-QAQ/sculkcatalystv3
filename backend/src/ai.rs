@@ -2373,7 +2373,7 @@ mod tests {
     fn error_redaction_removes_credentials_and_limits_output() {
         let secret = "sk-secret-value".to_string();
         let text = format!("request failed with {secret} {}", "x".repeat(2_000));
-        let redacted = redact_secrets(text, &[secret.clone()]);
+        let redacted = redact_secrets(text, std::slice::from_ref(&secret));
         assert!(!redacted.contains(&secret));
         assert!(redacted.contains("[REDACTED]"));
         assert!(redacted.chars().count() <= 1_001);

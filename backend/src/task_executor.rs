@@ -279,11 +279,11 @@ async fn run_task(state: AppState, id: Uuid, cancellation: Arc<AtomicBool>) {
         return;
     };
 
-    if matches!(task.kind.as_str(), "server_start" | "server_stop") {
-        if let Err(error) = prepare_compensation(&state, id, &previous_status).await {
-            finish_failed(&state, id, &error, None).await;
-            return;
-        }
+    if matches!(task.kind.as_str(), "server_start" | "server_stop")
+        && let Err(error) = prepare_compensation(&state, id, &previous_status).await
+    {
+        finish_failed(&state, id, &error, None).await;
+        return;
     }
     let outcome = match task.kind.as_str() {
         "diagnostic" => execute_diagnostic(&state, &task, &cancellation).await,

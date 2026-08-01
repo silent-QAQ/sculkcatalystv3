@@ -101,7 +101,6 @@ fn search_terms(query: &str) -> Vec<String> {
             .lines()
             .next()
             .unwrap_or(query)
-            .trim()
             .split_whitespace()
             .filter(|value| {
                 !value.contains(":\\")
@@ -298,18 +297,18 @@ async fn search_internet(terms: &[String]) -> Vec<String> {
         url.query_pairs_mut()
             .append_pair("query", term)
             .append_pair("limit", "5");
-        if let Ok(payload) = fetch_json(client.get(url)).await {
-            if let Some(items) = payload.get("hits").and_then(Value::as_array) {
-                for item in items {
-                    if let Some(title) = item.get("title").and_then(Value::as_str) {
-                        let slug = item
-                            .get("slug")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown");
-                        results.push(format!(
-                            "- Modrinth：{title} ({slug})，项目页：https://modrinth.com/"
-                        ));
-                    }
+        if let Ok(payload) = fetch_json(client.get(url)).await
+            && let Some(items) = payload.get("hits").and_then(Value::as_array)
+        {
+            for item in items {
+                if let Some(title) = item.get("title").and_then(Value::as_str) {
+                    let slug = item
+                        .get("slug")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    results.push(format!(
+                        "- Modrinth：{title} ({slug})，项目页：https://modrinth.com/"
+                    ));
                 }
             }
         }
@@ -319,18 +318,18 @@ async fn search_internet(terms: &[String]) -> Vec<String> {
         url.query_pairs_mut()
             .append_pair("q", &format!("{term} Minecraft"))
             .append_pair("per_page", "5");
-        if let Ok(payload) = fetch_json(client.get(url)).await {
-            if let Some(items) = payload.get("items").and_then(Value::as_array) {
-                for item in items {
-                    let Some(name) = item.get("full_name").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    let html = item
-                        .get("html_url")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    results.push(format!("- GitHub：{name}，项目页：{html}"));
-                }
+        if let Ok(payload) = fetch_json(client.get(url)).await
+            && let Some(items) = payload.get("items").and_then(Value::as_array)
+        {
+            for item in items {
+                let Some(name) = item.get("full_name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let html = item
+                    .get("html_url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                results.push(format!("- GitHub：{name}，项目页：{html}"));
             }
         }
     }
