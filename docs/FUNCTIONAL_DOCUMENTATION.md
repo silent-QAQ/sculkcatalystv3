@@ -1,7 +1,7 @@
 # Sculk Catalyst V3 功能文档
 
 > 文档版本：V3.0 功能说明  
-> 更新时间：2026-07-29  
+> 更新时间：2026-08-01
 > 产品阶段：可交互 MVP / 技术验证原型  
 > 适用范围：本地开服工作台、资源中心、可选 Sculk Cloud 服务
 
@@ -437,7 +437,7 @@ POST /api/chat/stream 请求可包含：
 
 可通过 GET /api/automation 查看任务、待批准数量和运行数量；通过 POST /api/automation/tasks 创建任务。
 
-当前界面内置入口包括智能诊断、创建备份、经济调控和部署类任务。任务 API 已提供批准和取消，但实际工具执行器、回滚和跨重启恢复仍未完整接入。
+当前界面内置入口包括智能诊断、创建备份、经济调控和部署类任务。这个本地 JSON 自动化模块仍不是通用工具执行器；Cloud Agent 的远程任务是独立链路，拥有自己的 PostgreSQL 任务、租约、事件和审批模型。
 
 ### 7.2 三档审核模式
 
@@ -451,7 +451,18 @@ POST /api/chat/stream 请求可包含：
 
 ### 7.3 当前执行边界
 
-审批状态本身已经落地，但模型回复不会自动变成文件、终端、停服或经济操作。下一阶段仍需要接入带权限声明、审计、幂等、回滚和人工确认门的真实工具执行器。
+本地审批状态本身已经落地，但模型回复不会自动变成本地文件、终端、停服或经济操作。Cloud Agent 远程操作则必须经过服务端任务权限和租约校验；下一阶段仍需要为本地自动化接入带权限声明、审计、幂等、回滚和人工确认门的通用工具执行器。
+
+### 7.4 Cloud Agent 任务审批
+
+Cloud Agent 使用独立的风险与权限模型：
+
+- `read + low` 的只读任务可以直接进入队列。
+- `write + high` 和 `full + critical` 任务必须指定所属团队，并在创建任务时生成唯一的关联审批记录。
+- 请求人不能处理自己的审批；只有该团队的 `owner`、`admin` 或 `approver` 可以通过或拒绝。
+- 通用审批决定会在同一事务中更新审批和任务：通过后任务进入 `queued`，拒绝后任务进入 `cancelled`；租约查询还会再次核对审批 ID、团队、请求人、决定人和决定人的当前团队角色。
+- 重试、从检查点恢复和回滚都会创建新的任务与新的审批，旧任务的批准不会沿用。
+- 持久终端创建后先等待审批；只有审批通过后，Agent 才能领取 `start` 命令。
 
 ---
 
@@ -467,12 +478,16 @@ POST /api/chat/stream 请求可包含：
 - 新建目录。
 - server.properties 快捷打开。
 - 文件大小、修改时间、文件夹/文件类型和只读标识。
+- 独立上传与下载：上传字段支持相对路径和文件内容，单文件上限 256 MiB；上传先写入随机临时文件，再原子移动到目标。
+- 上传默认不覆盖既有文件；服务器根目录的 `server.jar`、`server.jar.part` 和 `server.jar.backup` 始终受保护。
 
 API：
 
 - GET /api/servers/{id}/files?path=...
 - GET /api/servers/{id}/file?path=...
 - PUT /api/servers/{id}/file
+- POST /api/servers/{id}/file/upload（multipart 上传）
+- GET /api/servers/{id}/file/download?path=...
 - POST /api/servers/{id}/directory
 
 编辑器允许的扩展名包括 properties、YAML、JSON、TOML、INI、CFG、TXT、Markdown、PowerShell、Shell 和日志文件。单文件读写上限约 2 MB；二进制文件不进入文本编辑器。
@@ -485,7 +500,7 @@ API：
 - 拒绝 .. 穿越。
 - 拒绝符号链接。
 - 解析后的目标必须位于 data/servers/{id} 内。
-- 拒绝覆盖 server.jar 等不可编辑二进制文件。
+- 拒绝覆盖、删除或改名 `server.jar`、`server.jar.part` 和 `server.jar.backup` 等根目录核心保护文件；普通文本编辑仍有约 2 MB 上限，传输接口单独受 256 MiB 上限控制。
 - 新建目录和写文件都会重新检查父目录路径。
 
 ### 8.3 终端命令
@@ -827,7 +842,17 @@ Cloud 工作区支持同步 UI 设置、快捷提示词和 Skill 链接，并拒
 
 ### 14.4 团队与审批
 
-支持团队创建、成员查看、邀请和接受邀请；支持创建远程审批、列出审批和提交通过/拒绝决定。当前 Cloud 审批数据可用，但尚未自动接管本地 automation 任务的执行器。
+支持团队创建、成员查看、邀请和接受邀请。Cloud Agent 的 high/critical 任务与持久终端会在同一事务中创建唯一团队审批，并通过 `agent_task_id` 或 `terminal_session_id` 建立外键关联；审批通过后才进入可租约状态，拒绝或取消会同步关闭资源。请求人不能自批，只有团队 `owner`、`admin` 或 `approver` 可以决定。重试、恢复和回滚均创建新的资源与审批，不继承旧决定；这套机制不等同于本地 JSON `automation` 任务的通用执行器。
+
+#### 14.4.1 主机 Agent 与远程终端
+
+Agent 通过出站 HTTPS 心跳领取任务和终端命令：
+
+- 任务租约带有短期 token 和过期时间；有有效审批的任务或低风险任务过期后可以回到队列，旧版本缺少可验证审批的高风险租约过期后会进入明确失败状态，不会形成不可执行的排队任务。
+- `log.tail` 仅允许日志目录和崩溃报告目录，拒绝环境变量、数据库和凭据类文件名，并对常见密钥与 Bearer Token 脱敏。
+- Shell 在 Windows 使用 Job Object，在 Unix 使用独立进程组；取消会等待 Agent 回报进程树终止，不能把请求发送成功误报为进程已经停止。
+- 终端的 `start` 命令只有在关联审批通过、决定人仍是团队审批角色且决定人不是请求人时才可租约。
+- 云部署接口仍是预留能力，不会因为 Agent 在线而自动创建或调度云资源。
 
 ### 14.5 API Token 与 OpenAI 兼容中转
 
@@ -946,6 +971,8 @@ POST   /api/chat/stream
 GET    /api/servers/{id}/files
 GET    /api/servers/{id}/file
 PUT    /api/servers/{id}/file
+POST   /api/servers/{id}/file/upload
+GET    /api/servers/{id}/file/download
 POST   /api/servers/{id}/directory
 GET    /api/download/mirrors
 POST   /api/download/preview
@@ -1053,6 +1080,15 @@ POST   /api/cloud/teams/{id}/invitations
 POST   /api/cloud/invitations/accept
 GET|POST /api/cloud/approvals
 POST   /api/cloud/approvals/{id}/decision
+GET|POST /api/cloud/agent-tasks
+GET    /api/cloud/agent-tasks/{id}
+POST   /api/cloud/agent-tasks/{id}/cancel|retry|rollback
+GET|POST /api/cloud/terminal-sessions
+POST   /api/cloud/terminal-sessions/{id}/input|resize|terminate
+GET    /api/cloud/terminal-sessions/{id}/events
+GET|POST /api/cloud/conversations
+GET    /api/cloud/conversations/{id}
+POST   /api/cloud/conversations/{id}/plans
 GET|POST /api/cloud/tokens
 DELETE /api/cloud/tokens/{id}
 GET    /api/cloud/usage
@@ -1189,7 +1225,7 @@ SCULK_CATALOG_ADMIN_BASIC_AUTH=账号:密码的 Base64 编码
 4. AI provider 的 URL 目前只校验 HTTP(S)，未完成 SSRF、回环地址和私网地址限制。
 5. ACP Agent 的 command 是任意本机命令配置，必须限制配置来源和文件权限。
 6. 同时未配置管理账号密码和 `SCULK_CATALOG_ADMIN_TOKEN` 时，目录写操作会放行；资源站生产部署必须至少启用一种服务端凭证。
-7. 任务审核状态已实现，但未完成不可绕过的真实工具执行审批门。
+7. 本地 JSON 自动化仍不是通用工具执行器；Cloud Agent 的 high/critical 任务和持久终端已经有服务端强制审批门，校验团队、审批关联、独立决定人和当前角色。
 8. 审计日志当前可写入本地 JSON，尚不是不可篡改审计。
 
 ### 18.2 当前功能缺口
@@ -1206,12 +1242,12 @@ SCULK_CATALOG_ADMIN_BASIC_AUTH=账号:密码的 Base64 编码
 
 - 插件只支持目录检索、版本筛选和稳定下载，未自动安装到 plugins/。
 - 尚无插件依赖、冲突、权限风险和兼容矩阵验证。
-- 资源目录仍使用单一 JSON，没有分页、事务、历史版本审计和对象回收。
+- 资源目录仍使用单一 JSON，没有分页、事务、历史版本审计和对象回收；浏览器对象上传与静态 Range/ETag 已提供，但 Rust 主 API 不代理大文件。
 - 稳定下载通过 307 跳转，不由 Rust API 代理大文件。
 
 #### AI 与自动化
 
-- 尚未实现文件、终端、服务器启停、插件安装等真实工具调用。
+- 本地 AI 对话尚未直接调用文件、终端、服务器启停或插件安装工具；Cloud Agent 的远程任务和持久终端属于独立已实现链路。
 - 意图分类和任务创建仍采用关键词规则，模型回复不改变任务判定。
 - 尚无跨对话知识库、摘要记忆、Token 统计、计费和本地限流。
 - 自动修复、配置生成、经济修改和正式部署尚无完整回滚链。
@@ -1220,7 +1256,7 @@ SCULK_CATALOG_ADMIN_BASIC_AUTH=账号:密码的 Base64 编码
 
 - 云部署接口尚未创建实际资源。
 - 外部 MCP、Discord 和监控连接主要是演示端点。
-- Cloud 远程审批尚未自动绑定本地自动化执行器。
+- Cloud 远程审批已经自动绑定 Cloud Agent 任务和持久终端；它仍不会自动接管本地 JSON `automation` 任务。
 - 多用户隔离、完整 RBAC、多租户和密钥轮换尚未完成。
 
 ### 18.3 许可提醒
@@ -1307,9 +1343,10 @@ SCULK_CATALOG_ADMIN_BASIC_AUTH=账号:密码的 Base64 编码
 
 在当前工作区执行的基础验证结果：
 
-- Rust：cargo check 通过；存在 2 条 unused_must_use 编译警告，不影响当前构建完成。
-- 前端：使用工作区 Node.js 运行时执行 vue-tsc -b 和 Vite production build，通过并生成 frontend/dist。
-- 前端构建产物包含主工作台和资源管理入口，可由后端静态目录服务托管。
+- 后端：`cargo fmt -- --check`、`cargo test --all-targets --locked`、`cargo clippy --all-targets --locked -- -D warnings -A clippy::too_many_arguments` 通过；Windows MSVC target 的 `cargo check --all-targets --locked` 通过。
+- Agent：`cargo fmt -- --check`、`cargo test --all-targets --locked` 通过。
+- 前端：工作区 Node.js 执行 `vue-tsc -b` 和 Vite production build 通过，并生成主工作台与资源管理入口。
+- 脚本与迁移：PowerShell E2E 脚本通过语法解析；Cloud 迁移为顺序执行的 PostgreSQL migration，并对新审批约束执行 `VALIDATE CONSTRAINT`。
 
 ### 20.2 建议优先级
 

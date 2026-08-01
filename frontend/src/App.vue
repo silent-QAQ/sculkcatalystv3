@@ -71,6 +71,10 @@ const visibleServers = computed(() => servers.value.filter(item => workspaceKind
 const server = computed(() => servers.value.find(item => item.id === selectedId.value) ?? visibleServers.value[0] ?? emptyServer)
 const isProject = computed(() => !!selectedId.value && workspaceKind(server.value) === 'project')
 const serverMemoryLimit = computed(() => server.value.memory_gb ?? 8)
+function formatRuntimeMemory(value:number){
+  if(value>=1024)return `${(value/1024).toFixed(1)} GiB`
+  return `${value} MiB`
+}
 const bootstrapTask = computed(() => tasks.value
   .filter(task => task.server_id===selectedId.value&&['server_provision','bootstrap'].includes(task.kind))
   .reduce<TaskInfo|undefined>((latest,task)=>{
@@ -148,11 +152,13 @@ const deleteServerFiles = ref(false)
 const deleteServerStep = ref<1|2>(1)
 const deleteServerConfirmation = ref('')
 const fileEntries=ref<FileEntry[]>([]),currentPath=ref(''),parentPath=ref<string|null>(null),fileContent=ref(''),fileReadonly=ref(false),showNewFolder=ref(false),newFolderName=ref(''),showNewFile=ref(false),newFileName=ref('')
+const fileUploadInput=ref<HTMLInputElement|null>(null)
 const fileContextMenu=ref<{entry:FileEntry|null;x:number;y:number}|null>(null)
 const fileActionDialog=ref<{kind:'rename'|'delete';entry:FileEntry}|null>(null)
 const fileActionValue=ref(''),fileActionBusy=ref(false)
 const fileSelection=ref<{start:number;end:number}|null>(null)
 const hasFileSelection=computed(()=>!!fileSelection.value&&fileSelection.value.end>fileSelection.value.start)
+const canTransferFiles=computed(()=>!!selectedId.value&&(isProject.value||workspaceKind(server.value)==='server'))
 const selectedTasks = computed(() => tasks.value.filter(task=>task.server_id===selectedId.value))
 const terminal = ref<string[]>([])
 const GIB = 1024 ** 3
@@ -869,6 +875,45 @@ function connectLogStream(){
 async function loadFiles(path=''){const id=selectedId.value;if(!id){fileEntries.value=[];currentPath.value='';parentPath.value=null;return}try{const data=await api('/api/servers/'+id+'/files?path='+encodeURIComponent(path));if(selectedId.value!==id)return;fileEntries.value=data.entries;currentPath.value=data.path;parentPath.value=data.parent}catch(error){flash('目录读取失败：'+String(error))}}
 async function openFile(path:string){const id=selectedId.value;if(!id)return;try{const data=await api('/api/servers/'+id+'/file?path='+encodeURIComponent(path));if(selectedId.value!==id)return;activeFile.value=data.path;fileContent.value=data.content;fileReadonly.value=data.readonly;fileSelection.value=null}catch(error){flash('文件读取失败：'+String(error))}}
 async function openEntry(entry:FileEntry){if(entry.kind==='folder'){activeFile.value='';fileContent.value='';fileSelection.value=null;await loadFiles(entry.path)}else await openFile(entry.path)}
+async function fileTransferError(response:Response){
+  const body=await response.text()
+  if(!body)return `请求失败（HTTP ${response.status}）`
+  try{
+    const payload=JSON.parse(body) as Record<string,unknown>
+    for(const key of ['message','detail','error'])if(typeof payload[key]==='string'&&payload[key].trim())return payload[key] as string
+  }catch{}
+  return body
+}
+function fileTransferUnavailable(){flashSafeNotice('请先选择一个工作区')}
+function triggerFileUpload(){if(busy.value)return;if(!canTransferFiles.value){fileTransferUnavailable();return}fileUploadInput.value?.click()}
+async function uploadWorkspaceFile(event:Event){
+  const input=event.target as HTMLInputElement,file=input.files?.[0]
+  if(!file)return
+  if(!canTransferFiles.value){fileTransferUnavailable();return}
+  const id=selectedId.value,targetPath=currentPath.value
+  busy.value=true
+  try{
+    const formData=new FormData();formData.append('file',file);formData.append('path',targetPath)
+    const response=await fetch(API_BASE+'/api/servers/'+encodeURIComponent(id)+'/file/upload',{method:'POST',body:formData})
+    if(!response.ok)throw new Error(await fileTransferError(response))
+    if(selectedId.value!==id)return
+    input.value='';await loadFiles(targetPath);flash('文件已上传')
+  }catch(error){flash('上传失败：'+String(error))}finally{busy.value=false}
+}
+async function downloadCurrentFile(path=activeFile.value,kind:'file'|'folder'='file'){
+  if(busy.value)return
+  if(!canTransferFiles.value){fileTransferUnavailable();return}
+  if(kind==='folder'){flashSafeNotice('目录不能下载，请选择文件');return}
+  if(!path){flashSafeNotice('请先选择要下载的文件');return}
+  const id=selectedId.value;busy.value=true
+  try{
+    const response=await fetch(API_BASE+'/api/servers/'+encodeURIComponent(id)+'/file/download?path='+encodeURIComponent(path))
+    if(!response.ok)throw new Error(await fileTransferError(response))
+    const url=URL.createObjectURL(await response.blob()),link=document.createElement('a')
+    link.href=url;link.download=path.split('/').at(-1)||'download';document.body.append(link);link.click();link.remove();window.setTimeout(()=>URL.revokeObjectURL(url),0)
+    flash('文件下载已开始')
+  }catch(error){flash('下载失败：'+String(error))}finally{busy.value=false}
+}
 async function saveCurrentFile(){if(!selectedId.value||!activeFile.value||fileReadonly.value)return;busy.value=true;try{await api('/api/servers/'+selectedId.value+'/file',{method:'PUT',body:JSON.stringify({path:activeFile.value,content:fileContent.value})});flash(activeFile.value+' 已保存')}catch(error){flash('保存失败：'+String(error))}finally{busy.value=false}}
 async function createFolder(){const name=newFolderName.value.trim();if(!selectedId.value||!name)return;const path=[currentPath.value,name].filter(Boolean).join('/');try{await api('/api/servers/'+selectedId.value+'/directory',{method:'POST',body:JSON.stringify({path})});newFolderName.value='';showNewFolder.value=false;await loadFiles(currentPath.value);flash('目录已创建')}catch(error){flash('创建失败：'+String(error))}}
 async function createFile(){const name=newFileName.value.trim();if(!selectedId.value||!name)return;const path=[currentPath.value,name].filter(Boolean).join('/');try{await api('/api/servers/'+selectedId.value+'/file',{method:'PUT',body:JSON.stringify({path,content:''})});newFileName.value='';showNewFile.value=false;await loadFiles(currentPath.value);await openFile(path);flash('文件已创建')}catch(error){flash('创建文件失败：'+String(error))}}
@@ -882,6 +927,7 @@ async function createFromContext(kind:'file'|'folder',entry?:FileEntry){
   nextTick(()=>document.querySelector<HTMLInputElement>('.new-folder input')?.focus())
 }
 function addContextEntryToConversation(){const entry=fileContextMenu.value?.entry;fileContextMenu.value=null;if(entry)void addEntryToConversation(entry)}
+function downloadContextFile(){const entry=fileContextMenu.value?.entry;fileContextMenu.value=null;if(entry)void downloadCurrentFile(entry.path,entry.kind)}
 function copyContextPath(){const path=fileContextMenu.value?.entry?.path??currentPath.value;fileContextMenu.value=null;void copyFilePath(path)}
 function openFileAction(kind:'rename'|'delete',entry:FileEntry){fileContextMenu.value=null;fileActionDialog.value={kind,entry};fileActionValue.value=kind==='rename'?entry.name:''}
 async function copyFilePath(path=currentPath.value){try{await writeClipboard(path||'.');flashSafeNotice('相对路径已复制')}catch{flash('复制路径失败')}}
@@ -1129,7 +1175,7 @@ onUnmounted(()=>{document.removeEventListener('click',closeMenus);if(refreshTime
         <section v-else-if="server.status==='planning'" class="planning-workspace"><span><BrainCircuit/></span><small>PLANNING WORKSPACE</small><h2>服务器尚在规划阶段</h2><p>这里还没有核心、配置或文件。继续在左侧当前对话中描述玩法、预计人数与版本偏好，Sculk Agent 会先给出可审阅方案。</p><button @click="send('请根据我的需求推荐合适的服务端核心，并说明取舍')"><Sparkles/>开始核心选型</button></section>
         <section v-else class="server-hero"><div><span class="big-icon"><Server/></span><p><b>{{server.name}} <em :class="[server.status,serverOperationState]">{{serverStatusLabel}}</em></b><small>{{server.core}} {{server.version}} · {{systemState==='ready'?(systemInfo?.java_version||'未安装 Java'):'Java 状态未知'}} · 内存 {{serverMemoryLimit}} GB · 端口 {{server.port}}</small></p></div><aside><button :class="{active:mirrorPanel}" :disabled="serverTransitioning" @click="openMirrorPanel"><Download/>核心</button><button :disabled="serverOperationState==='provisioning'" @click="openProperties"><Settings/>配置</button><button v-if="server.status==='online'" :disabled="busy||serverTransitioning||!serverCoreReady||!javaReady||provisionActive" @click="restartServer"><RotateCw/>重启</button><button :disabled="serverControlDisabled" :class="server.status==='online'?'stop':'start'" @click="toggleServer"><LoaderCircle v-if="serverTransitioning" class="spin"/><CircleStop v-else-if="server.status==='online'"/><Play v-else/>{{serverOperationLabel|| (server.status==='online'?'停止服务器':'启动服务器')}}</button></aside></section>
         <section v-if="!isProject&&server.status!=='planning'&&(server.last_error||(server.status!=='online'&&serverStartBlocker))" class="server-blocker" :class="{error:!!server.last_error}"><AlertTriangle/><p><b>{{provisionFailed?'首次初始化未完成':server.last_error?'上次运行未正常完成':'当前还不能启动'}}</b><small>{{provisionFailed&&serverCoreReady?`${serverStartBlocker}${server.last_error?'：'+server.last_error:''}`:server.last_error||serverStartBlocker}}</small></p><button v-if="server.last_error&&!provisionFailed" @click="tab='terminal'"><SquareTerminal/>查看终端</button></section>
-        <section v-if="!isProject&&server.status!=='planning'" class="metrics"><div><span class="cyan"><Users/></span><p><small>在线玩家</small><b>{{server.players}}</b><em>后端运行状态</em></p></div><div><span class="purple"><Cpu/></span><p><small>CPU 使用率</small><b>{{server.cpu}}%</b><em>后端采样值</em></p></div><div><span class="green"><Database/></span><p><small>内存</small><b>{{server.memory}}%</b><em>上限 {{serverMemoryLimit}} GB</em></p></div><div><span class="orange"><Activity/></span><p><small>监听端口</small><b>{{server.port}}</b><em>{{server.status==='online'?'服务器运行中':'服务器未运行'}}</em></p></div></section>
+        <section v-if="!isProject&&server.status!=='planning'" class="metrics"><div><span class="cyan"><Users/></span><p><small>在线玩家</small><b>{{server.players}}</b><em>后端运行状态</em></p></div><div><span class="purple"><Cpu/></span><p><small>CPU 使用率</small><b>{{server.cpu}}%</b><em>后端采样值</em></p></div><div><span class="green"><Database/></span><p><small>进程内存</small><b>{{formatRuntimeMemory(server.memory)}}</b><em>RSS · 上限 {{serverMemoryLimit}} GB</em></p></div><div><span class="orange"><Activity/></span><p><small>监听端口</small><b>{{server.port}}</b><em>{{server.status==='online'?'服务器运行中':'服务器未运行'}}</em></p></div></section>
         <section v-if="!isProject&&server.status!=='planning'&&bootstrapTask" class="card bootstrap-card provision-card" :class="bootstrapTask.status">
           <header><p><small>首次初始化</small><b>{{server.core}} {{server.version}} · 下载、校验并安装核心</b></p><span>{{bootstrapTask.progress}}%</span></header>
           <div class="bootstrap-progress"><i :style="{width:bootstrapTask.progress+'%'}"/></div>
@@ -1157,14 +1203,14 @@ onUnmounted(()=>{document.removeEventListener('click',closeMenus);if(refreshTime
       </div>
       <div v-else-if="tab==='files'" class="files-view">
         <aside @contextmenu="openFileContextMenu($event,null)">
-          <header><span>{{currentPath||(isProject?'项目文件':'服务器文件')}}</span><button title="刷新文件树" @click="loadFiles(currentPath)"><RefreshCw/></button><button title="新建文件" @click="showNewFile=!showNewFile;showNewFolder=false"><FileCode2/></button><button title="新建目录" @click="showNewFolder=!showNewFolder;showNewFile=false"><Folder/></button></header>
+           <header><span>{{currentPath||(isProject?'项目文件':'服务器文件')}}</span><button title="刷新文件树" @click="loadFiles(currentPath)"><RefreshCw/></button><button :disabled="busy||!canTransferFiles" title="上传文件到当前目录" @click="triggerFileUpload"><FileUp/></button><input ref="fileUploadInput" type="file" style="display:none" @change="uploadWorkspaceFile"/><button title="新建文件" @click="showNewFile=!showNewFile;showNewFolder=false"><FileCode2/></button><button title="新建目录" @click="showNewFolder=!showNewFolder;showNewFile=false"><Folder/></button></header>
           <form v-if="showNewFile" class="new-folder" @submit.prevent="createFile"><input v-model="newFileName" autofocus placeholder="新文件名，例如 index.ts"/><button>创建</button></form><form v-if="showNewFolder" class="new-folder" @submit.prevent="createFolder"><input v-model="newFolderName" autofocus placeholder="新目录名称"/><button>创建</button></form>
           <button v-if="parentPath!==null" @click="loadFiles(parentPath||'')"><Folder/><span>..</span></button>
           <button v-for="entry in fileEntries" :key="entry.path" :class="{active:activeFile===entry.path}" @click="openEntry(entry)" @contextmenu="openFileContextMenu($event,entry)"><Folder v-if="entry.kind==='folder'"/><FileCode2 v-else/><span>{{entry.name}}</span><small v-if="entry.kind==='file'">{{entry.size<1024?entry.size+' B':Math.ceil(entry.size/1024)+' KB'}}</small></button>
         </aside>
-        <section><header><FileCode2/>{{activeFile||'未选择文件'}}</header><textarea v-if="activeFile" ref="fileEditor" v-model="fileContent" class="config-editor" :readonly="fileReadonly" spellcheck="false" @select="captureFileSelection" @click="captureFileSelection" @keyup="captureFileSelection"/><div v-else class="empty"><Files/><b>{{currentPath||(isProject?'项目工作区':'服务器工作区')}}</b><small>{{isProject?'新建文件，或选择已有文本文件进行编辑':'选择文本文件进行安全编辑'}}</small></div><footer><span>UTF-8　LF　{{fileReadonly?'只读文件':'路径保护已开启'}}</span><nav><button v-if="activeFile" @click="addEntryToConversation()"><MessageSquareText/>{{hasFileSelection?'添加选中内容':'添加文件到对话'}}</button><button v-if="activeFile&&!fileReadonly" :disabled="busy" @click="saveCurrentFile">保存文件</button></nav></footer></section>
+        <section><header><FileCode2/>{{activeFile||'未选择文件'}}</header><textarea v-if="activeFile" ref="fileEditor" v-model="fileContent" class="config-editor" :readonly="fileReadonly" spellcheck="false" @select="captureFileSelection" @click="captureFileSelection" @keyup="captureFileSelection"/><div v-else class="empty"><Files/><b>{{currentPath||(isProject?'项目工作区':'服务器工作区')}}</b><small>{{isProject?'新建文件，或选择已有文本文件进行编辑':'选择文本文件进行安全编辑'}}</small></div><footer><span>UTF-8　LF　{{fileReadonly?'只读文件':'路径保护已开启'}}</span><nav><button v-if="activeFile" :disabled="busy||!canTransferFiles" @click="downloadCurrentFile()"><Download/>下载当前文件</button><button v-if="activeFile" @click="addEntryToConversation()"><MessageSquareText/>{{hasFileSelection?'添加选中内容':'添加文件到对话'}}</button><button v-if="activeFile&&!fileReadonly" :disabled="busy" @click="saveCurrentFile">保存文件</button></nav></footer></section>
         <div v-if="fileContextMenu" class="file-context-menu" :style="{left:fileContextMenu.x+'px',top:fileContextMenu.y+'px'}" @click.stop>
-          <template v-if="fileContextMenu.entry"><button @click="openContextEntry"><Folder v-if="fileContextMenu.entry.kind==='folder'"/><FileCode2 v-else/>打开</button><button v-if="fileContextMenu.entry.kind==='folder'" @click="createFromContext('file',fileContextMenu.entry)"><FileCode2/>在此新建文件</button><button v-if="fileContextMenu.entry.kind==='folder'" @click="createFromContext('folder',fileContextMenu.entry)"><Folder/>新建子目录</button><button v-if="fileContextMenu.entry.kind==='file'" @click="addContextEntryToConversation"><MessageSquareText/>添加到对话</button><button @click="copyContextPath"><Copy/>复制相对路径</button><i/><button @click="openFileAction('rename',fileContextMenu.entry)"><Pencil/>重命名</button><button class="danger" @click="openFileAction('delete',fileContextMenu.entry)"><Trash2/>删除</button></template>
+          <template v-if="fileContextMenu.entry"><button @click="openContextEntry"><Folder v-if="fileContextMenu.entry.kind==='folder'"/><FileCode2 v-else/>打开</button><button :disabled="fileContextMenu.entry.kind==='folder'||busy||!canTransferFiles" @click="downloadContextFile"><Download/>下载文件</button><button v-if="fileContextMenu.entry.kind==='folder'" @click="createFromContext('file',fileContextMenu.entry)"><FileCode2/>在此新建文件</button><button v-if="fileContextMenu.entry.kind==='folder'" @click="createFromContext('folder',fileContextMenu.entry)"><Folder/>新建子目录</button><button v-if="fileContextMenu.entry.kind==='file'" @click="addContextEntryToConversation"><MessageSquareText/>添加到对话</button><button @click="copyContextPath"><Copy/>复制相对路径</button><i/><button @click="openFileAction('rename',fileContextMenu.entry)"><Pencil/>重命名</button><button class="danger" @click="openFileAction('delete',fileContextMenu.entry)"><Trash2/>删除</button></template>
           <template v-else><button @click="createFromContext('file')"><FileCode2/>新建文件</button><button @click="createFromContext('folder')"><Folder/>新建目录</button><button @click="fileContextMenu=null;loadFiles(currentPath)"><RefreshCw/>刷新</button><button @click="copyContextPath"><Copy/>复制当前路径</button></template>
         </div>
       </div>

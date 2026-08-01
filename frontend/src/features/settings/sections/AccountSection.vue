@@ -104,6 +104,16 @@ function flash(text: string, kind: 'ok' | 'error' = 'ok') {
 }
 
 function errorText(error: unknown) {
+  if (error instanceof CloudApiError) {
+    const known: Record<string, string> = {
+      approval_self_forbidden: '审批请求人不能处理自己的审批。',
+      team_approval_required: '只有团队所有者、管理员或审批人可以处理审批。',
+      approval_closed: '该审批已经被其他成员处理。',
+      agent_task_team_required: '高风险任务需要选择审批团队。',
+      terminal_team_required: '持久终端需要选择审批团队。',
+    }
+    return known[error.code] || error.message
+  }
   return error instanceof Error ? error.message : String(error)
 }
 
@@ -138,6 +148,7 @@ function roleLabel(role: string) {
 
 function canDecide(teamId: string) {
   return ['owner', 'admin', 'approver'].includes(teams.value.find(item => item.id === teamId)?.role || '')
+    && !!profile.value?.id
 }
 
 async function initialize() {
@@ -649,7 +660,7 @@ onUnmounted(() => window.removeEventListener(CLOUD_SESSION_EXPIRED_EVENT, handle
 
       <section v-else-if="tab==='approvals'" class="cloud-view approvals-view">
         <article class="cloud-panel approval-create"><header><div><h3>发起远程审批</h3><p>{{ activeTeam ? activeTeam.name : '请先创建或加入团队' }}</p></div><ShieldCheck/></header><form @submit.prevent="createApproval"><label>操作标题<input v-model="approvalForm.title" maxlength="120" placeholder="例如：重启正式服并应用新配置" required/></label><label>变更摘要<textarea v-model="approvalForm.summary" rows="3" placeholder="包含影响范围与回滚方式"/></label><label>风险等级<select v-model="approvalForm.risk"><option value="low">低风险</option><option value="medium">中风险</option><option value="high">高风险</option></select></label><button class="cloud-primary compact" :disabled="!activeTeamId||busy==='approval'"><ShieldCheck/>提交审批</button></form></article>
-        <div class="approval-list"><article v-for="item in approvals" :key="item.id" class="approval-item" :class="item.status"><header><span :class="`risk ${item.risk}`">{{ {low:'低',medium:'中',high:'高'}[item.risk] }}风险</span><em>{{ item.team_name }}</em><time>{{ formatDate(item.created_at) }}</time></header><h3>{{ item.title }}</h3><p>{{ item.summary || '无补充摘要' }}</p><footer><span><CheckCircle2 v-if="item.status==='approved'"/><XCircle v-else-if="item.status==='rejected'"/><CircleDashed v-else/>{{ {pending:'等待审批',approved:'已通过',rejected:'已拒绝',cancelled:'已取消'}[item.status] }} · {{ item.requester_name }}</span><template v-if="item.status==='pending' && canDecide(item.team_id)"><input v-model="decisionComment[item.id]" placeholder="审批意见（可选）"/><button class="reject" :disabled="busy===`approval:${item.id}`" @click="decideApproval(item.id,'rejected')"><XCircle/>拒绝</button><button class="approve" :disabled="busy===`approval:${item.id}`" @click="decideApproval(item.id,'approved')"><CheckCircle2/>通过</button></template></footer></article><div v-if="!approvals.length" class="cloud-empty"><ShieldCheck/>当前账号没有审批记录</div></div>
+        <div class="approval-list"><article v-for="item in approvals" :key="item.id" class="approval-item" :class="item.status"><header><span :class="`risk ${item.risk}`">{{ {low:'低',medium:'中',high:'高'}[item.risk] }}风险</span><em>{{ item.team_name }}</em><time>{{ formatDate(item.created_at) }}</time></header><h3>{{ item.title }}</h3><p>{{ item.summary || '无补充摘要' }}</p><small class="approval-link" v-if="item.agent_task_id">关联 Agent 任务：{{ item.agent_task_id }}</small><small class="approval-link" v-else-if="item.terminal_session_id">关联终端会话：{{ item.terminal_session_id }}</small><footer><span><CheckCircle2 v-if="item.status==='approved'"/><XCircle v-else-if="item.status==='rejected'"/><CircleDashed v-else/>{{ {pending:'等待审批',approved:'已通过',rejected:'已拒绝',cancelled:'已取消'}[item.status] }} · 请求人 {{ item.requester_name }}<template v-if="item.decided_by_name"> · 决策人 {{ item.decided_by_name }} · {{ formatDate(item.decided_at) }}</template></span><template v-if="item.status==='pending' && canDecide(item.team_id) && item.requested_by !== profile?.id"><input v-model="decisionComment[item.id]" placeholder="审批意见（可选）"/><button class="reject" :disabled="busy===`approval:${item.id}`" @click="decideApproval(item.id,'rejected')"><XCircle/>拒绝</button><button class="approve" :disabled="busy===`approval:${item.id}`" @click="decideApproval(item.id,'approved')"><CheckCircle2/>通过</button></template><small v-else-if="item.status==='pending' && item.requested_by === profile?.id" class="approval-self-note">请求人不能自批，请等待其他团队审批人处理</small></footer></article><div v-if="!approvals.length" class="cloud-empty"><ShieldCheck/>当前账号没有审批记录</div></div>
       </section>
 
       <section v-else class="cloud-view deployment-view">

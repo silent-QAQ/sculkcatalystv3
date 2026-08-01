@@ -106,6 +106,8 @@ export interface AgentTaskView {
   lineage_id: string
   attempt_no: number
   agent_id: string
+  team_id?: string | null
+  approval_id?: string | null
   operation: AgentTaskOperation
   required_permission: 'read' | 'write' | 'process' | 'full'
   risk: 'low' | 'high' | 'critical'
@@ -142,6 +144,8 @@ export interface AgentTaskView {
 export interface CloudTerminalSession {
   id: string
   agent_id: string
+  team_id?: string | null
+  approval_id?: string | null
   title?: string | null
   cwd?: string | null
   cols: number
@@ -268,6 +272,8 @@ export interface Invitation {
 export interface CloudApproval {
   id: string
   team_id: string
+  agent_task_id?: string | null
+  terminal_session_id?: string | null
   team_name: string
   requested_by: string
   requester_name: string
@@ -277,6 +283,7 @@ export interface CloudApproval {
   status: 'pending' | 'approved' | 'rejected' | 'cancelled'
   payload: Record<string, unknown>
   decision_comment: string
+  decided_by?: string | null
   decided_by_name?: string | null
   decided_at?: string | null
   created_at: string

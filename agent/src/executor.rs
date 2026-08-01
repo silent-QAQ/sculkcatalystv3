@@ -311,6 +311,7 @@ fn log_tail(root: &Path, input: Value) -> Result<ExecutionResult, String> {
         return Err("日志任务范围超过限制".into());
     }
     let relative = clean_relative(&input.path, false)?;
+    validate_log_relative(&relative)?;
     let target = resolve_existing(root, &relative)?;
     let metadata = fs::metadata(&target).map_err(|error| format!("无法读取日志：{error}"))?;
     if !metadata.is_file() {
@@ -329,7 +330,7 @@ fn log_tail(root: &Path, input: Value) -> Result<ExecutionResult, String> {
     if lines.len() > input.lines {
         lines.drain(..lines.len() - input.lines);
     }
-    let content = lines.join("\n");
+    let content = redact_log_content(&lines.join("\n"));
     let hash = sha256_hex(content.as_bytes());
     Ok(ExecutionResult {
         output: json!({ "path": input.path.clone(), "content": content.clone(), "truncated": start > 0 }),
@@ -342,6 +343,183 @@ fn log_tail(root: &Path, input: Value) -> Result<ExecutionResult, String> {
             sha256: Some(hash),
         }],
     })
+}
+
+fn validate_log_relative(relative: &Path) -> Result<(), String> {
+    let components: Vec<_> = relative.components().collect();
+    let directory = components
+        .first()
+        .and_then(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if components.len() < 2
+        || !["logs", "crash-reports"]
+            .iter()
+            .any(|allowed| directory.eq_ignore_ascii_case(allowed))
+        || components.iter().any(|component| {
+            let Component::Normal(value) = component else {
+                return true;
+            };
+            let value = value.to_string_lossy().to_ascii_lowercase();
+            value == ".env"
+                || value.starts_with(".env.")
+                || matches!(
+                    value.as_str(),
+                    "database" | "db" | "database.sql" | "db.sql"
+                )
+                || [".db", ".sqlite", ".sqlite3", ".mdb", ".sql"]
+                    .iter()
+                    .any(|suffix| value.ends_with(suffix))
+        })
+    {
+        return Err("log.tail only permits files under logs/ or crash-reports/".into());
+    }
+    Ok(())
+}
+
+fn is_key_boundary(byte: Option<u8>) -> bool {
+    !byte.is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn redact_log_content(value: &str) -> String {
+    const SECRET_KEYS: [&str; 19] = [
+        "authorization",
+        "client_secret",
+        "clientsecret",
+        "rcon_password",
+        "rconpassword",
+        "access_token",
+        "accesstoken",
+        "refresh_token",
+        "refreshtoken",
+        "api_key",
+        "apikey",
+        "password",
+        "token",
+        "secret",
+        "cookie",
+        "session",
+        "credential",
+        "private_key",
+        "privatekey",
+    ];
+    let bytes = value.as_bytes();
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let bearer = bytes[index..].len() >= 7
+            && bytes[index..index + 7].eq_ignore_ascii_case(b"Bearer ")
+            && is_key_boundary(
+                index
+                    .checked_sub(1)
+                    .and_then(|position| bytes.get(position))
+                    .copied(),
+            );
+        if bearer {
+            let value_start = index + 7;
+            let value_end = value_start
+                + bytes[value_start..]
+                    .iter()
+                    .position(|byte| {
+                        byte.is_ascii_whitespace()
+                            || matches!(
+                                byte,
+                                b'\'' | b'"' | b'`' | b',' | b';' | b')' | b']' | b'}'
+                            )
+                    })
+                    .unwrap_or(bytes.len() - value_start);
+            if value_end > value_start {
+                output.push_str(&value[cursor..value_start]);
+                output.push_str("[REDACTED]");
+                cursor = value_end;
+                index = value_end;
+                continue;
+            }
+        }
+
+        let matched_key = SECRET_KEYS.iter().find_map(|key| {
+            let end = index + key.len();
+            (end <= bytes.len()
+                && bytes[index..end].eq_ignore_ascii_case(key.as_bytes())
+                && is_key_boundary(
+                    index
+                        .checked_sub(1)
+                        .and_then(|position| bytes.get(position))
+                        .copied(),
+                )
+                && is_key_boundary(bytes.get(end).copied()))
+            .then_some(*key)
+        });
+        let Some(key) = matched_key else {
+            index += 1;
+            continue;
+        };
+        let key_end = index + key.len();
+        let mut separator_start = key_end;
+        if matches!(bytes.get(separator_start), Some(b'\'' | b'"' | b'`')) {
+            separator_start += 1;
+        }
+        let mut value_start = separator_start;
+        while bytes.get(value_start).is_some_and(u8::is_ascii_whitespace) {
+            value_start += 1;
+        }
+        if !matches!(bytes.get(value_start), Some(b'=' | b':')) {
+            index = key_end;
+            continue;
+        }
+        value_start += 1;
+        while bytes.get(value_start).is_some_and(u8::is_ascii_whitespace) {
+            value_start += 1;
+        }
+        if value_start >= bytes.len() {
+            break;
+        }
+        let value_end = if bytes[value_start..].len() >= 7
+            && bytes[value_start..value_start + 7].eq_ignore_ascii_case(b"Bearer ")
+        {
+            let token_start = value_start + 7;
+            token_start
+                + bytes[token_start..]
+                    .iter()
+                    .position(|byte| {
+                        byte.is_ascii_whitespace()
+                            || matches!(
+                                byte,
+                                b'\'' | b'"' | b'`' | b',' | b';' | b')' | b']' | b'}'
+                            )
+                    })
+                    .unwrap_or(bytes.len() - token_start)
+        } else if matches!(bytes[value_start], b'\'' | b'"' | b'`') {
+            let quote = bytes[value_start];
+            bytes[value_start + 1..]
+                .iter()
+                .position(|byte| *byte == quote)
+                .map(|offset| value_start + 2 + offset)
+                .unwrap_or(bytes.len())
+        } else {
+            value_start
+                + bytes[value_start..]
+                    .iter()
+                    .position(|byte| {
+                        byte.is_ascii_whitespace()
+                            || matches!(byte, b',' | b';' | b')' | b']' | b'}')
+                    })
+                    .unwrap_or(bytes.len() - value_start)
+        };
+        if value_end > value_start {
+            output.push_str(&value[cursor..value_start]);
+            output.push_str("[REDACTED]");
+            cursor = value_end;
+            index = value_end;
+        } else {
+            index = value_start + 1;
+        }
+    }
+    output.push_str(&value[cursor..]);
+    output
 }
 
 fn create_directory(
@@ -688,6 +866,39 @@ mod tests {
         assert!(clean_relative("../secret", false).is_err());
         assert!(clean_relative("/etc/passwd", false).is_err());
         assert!(clean_relative("logs/latest.log", false).is_ok());
+        assert!(validate_log_relative(Path::new("logs/latest.log")).is_ok());
+        assert!(validate_log_relative(Path::new("crash-reports/crash.log")).is_ok());
+        for path in [
+            ".env",
+            "database.db",
+            "logs/.env",
+            "logs/world.sqlite3",
+            "server.properties",
+        ] {
+            assert!(
+                validate_log_relative(Path::new(path)).is_err(),
+                "accepted {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn redacts_common_credentials_from_log_content() {
+        let content = redact_log_content(
+            r#"password=hunter2 api_key: "sk-test" token=abc123
+Authorization: Bearer bearer-secret secret='hidden value'"#,
+        );
+        assert!(!content.contains("hunter2"));
+        assert!(!content.contains("sk-test"));
+        assert!(!content.contains("abc123"));
+        assert!(!content.contains("bearer-secret"));
+        assert!(!content.contains("hidden value"));
+        assert_eq!(content.matches("[REDACTED]").count(), 5);
+
+        let json = redact_log_content(r#"{"password":"json-secret","api_key":"json-key"}"#);
+        assert!(!json.contains("json-secret"));
+        assert!(!json.contains("json-key"));
+        assert_eq!(json.matches("[REDACTED]").count(), 2);
     }
 
     #[test]

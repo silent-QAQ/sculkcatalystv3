@@ -30,7 +30,7 @@ Sculk Catalyst V3 是一个 AI 驱动的 Minecraft 服务器工作台。它把�
 
 最后审计：2026-08-01。
 
-本轮项目审计已关闭以下问题：资源搜索输入可能带入本地路径、Token 或密码等敏感词；Rust 1.88 下后端 Clippy 与跨平台 CI 不一致；Cloud、Agent、资源中心的启动入口和配置说明不完整。对应代码修复和验证已合入 `main`，但这不代表项目已经具备公网生产环境所需的登录、RBAC、沙箱和高可用能力。
+本轮项目审计已关闭以下问题：资源搜索输入可能带入本地路径、Token 或密码等敏感词；Rust 1.88 下后端 Clippy 与跨平台 CI 不一致；Cloud、Agent、资源中心的启动入口和配置说明不完整；服务器文件传输、Windows 进程树清理、真实 CPU/RSS 指标、Agent 日志脱敏以及高风险任务/终端审批链路缺少闭环。对应代码和文档已在本地完成验证；推送后的 GitHub Actions 仍需以新运行结果为准。这不代表项目已经具备公网生产环境所需的登录、RBAC、沙箱和高可用能力。
 
 | 审计项 | 处理结果 | 验证依据 |
 | --- | --- | --- |
@@ -38,6 +38,9 @@ Sculk Catalyst V3 是一个 AI 驱动的 Minecraft 服务器工作台。它把�
 | Rust 1.88 Clippy | 已修复：后端 Clippy 规则与 CI 命令已对齐 | [`.github/workflows/ci.yml`](.github/workflows/ci.yml)，提交 `1da86f2` |
 | 跨平台 CI | 已验证：Ubuntu 后端、Windows 后端、前端构建均通过 | [Actions run 30675684790](https://github.com/silent-QAQ/sculkcatalystv3/actions/runs/30675684790) |
 | README 操作闭环 | 已补齐：运行模式、Cloud/Agent、资源中心、配置、API、排错和备份说明 | [README 当前版本](https://github.com/silent-QAQ/sculkcatalystv3/blob/main/README.md) |
+| 服务器文件传输 | 已修复：上传/下载限制在安全工作区，单文件上限 256 MiB，禁止覆盖既有文件和 `server.jar*` 保护文件 | [`backend/src/main.rs`](backend/src/main.rs)，后端文件传输测试 |
+| 进程树与运行指标 | 已修复：Windows Job Object、Unix 进程组、真实 CPU 与 RSS MiB 采样，并按进程代际写回 | [`backend/src/process_platform.rs`](backend/src/process_platform.rs)、[`backend/src/runtime.rs`](backend/src/runtime.rs) |
+| Cloud/Agent 审批闭环 | 已修复：任务/终端与团队审批建立外键关联，禁止请求人自批，租约发放前复核当前审批人角色，旧无关联高风险任务和终端启动 fail-closed | [`backend/src/cloud.rs`](backend/src/cloud.rs)、`backend/migrations/20260801000*.sql` |
 
 仍属于产品功能缺口的内容，以本节下方“主要缺口”和“已知限制与安全边界”为准，不会因为审计项关闭而被标记为已实现。
 
@@ -46,13 +49,14 @@ Sculk Catalyst V3 是一个 AI 驱动的 Minecraft 服务器工作台。它把�
 | 本地工作台 | 已实现 MVP | 多服务器导航、项目模式、对话树、服务器控制、任务和设置中心 | 桌面端打包、系统托盘和自动升级 |
 | 开服向导 | 已实现 MVP | 普通创建、智能规划、Java/端口/磁盘检查、核心选择和工作区生成 | 远程路径创建、完整核心兼容矩阵 |
 | 首次初始化 | 已实现 MVP | 持久化 `server_provision` 任务、核心下载与校验、Java 检查、取消、重试和后端重启后重新入队 | 字节级跨重启续传、限速和模板版本管理 |
-| 服务器进程 | 部分实现 | 真实 Java 子进程、就绪检测、优雅停止、超时强杀、原子重启、Unix 进程组清理 | 后端重启后不会重新接管已有 Java；Windows 本地工作区仍需继续加固；真实资源指标和崩溃自动恢复 |
+| 服务器进程 | 部分实现 | 真实 Java 子进程、就绪检测、优雅停止、超时强杀、原子重启、Windows Job Object、Unix 进程组、真实 CPU/RSS 指标 | 后端重启后不会重新接管已有 Java；崩溃自动恢复和历史进程重连 |
 | 实时终端 | 已实现 | WebSocket 日志、运行中的 stdin 转发、未运行时明确拒绝、断线回退轮询 | 命令历史、补全、多会话终端 |
 | AI 对话 | 部分实现 | OpenAI 格式提供商、模型同步、SSE 流式回复、情景模型、ACP Agent、审核模式 | 模型尚未直接调用文件/终端/服务器工具，暂无完整上下文压缩和用量计费 |
-| 自动化任务 | 部分实现 | 风险等级、审批、取消、进度和审计状态 | 通用工具执行器、依赖图、回滚和完整恢复 |
+| 文件管理 | 已实现 MVP | 安全目录浏览、文本编辑、上传/下载、256 MiB 单文件上限、原子写入和受保护核心文件 | 移动、复制、差异对比、批量传输 |
+| 自动化任务 | 部分实现 | 风险等级、团队审批、取消、进度、审计状态、检查点、重试和结构化回滚 | 依赖图、更多工具权限和跨节点恢复 |
 | 资源中心 | 已实现，可独立部署 | 七类资源目录、版本管理、上传、大小与 SHA-256、稳定下载、Range/ETag 静态对象、OpenAPI | 多管理员 RBAC、分页、对象回收和更完整的限流审计 |
 | Sculk Cloud | 部分实现 | 账号、团队、设备、设置同步、审批、Token、用量、数据库迁移 | 云资源创建/调度接口仍返回 `501 deployment_planned` |
-| 主机 Agent | 部分实现 | 出站配对、指纹确认、心跳、任务租约、Shell、持久终端、checkpoint、取消和重试 | 更细粒度文件/日志/进程权限、租约恢复、审批联动和断线审计 |
+| 主机 Agent | 部分实现 | 出站配对、指纹确认、心跳、任务租约、团队审批、Shell、持久终端、checkpoint、取消、重试、回滚、日志路径限制与脱敏 | 更细粒度文件/日志/进程权限、租约恢复和断线审计 |
 | 社区与运营 | 部分实现 | 玩家/反馈/投票/经济模块入口和本地持久化 | RCON/Query/管理插件接入、真实玩家和 TPS 数据 |
 | Skills / MCP / 机器人 | 部分实现 | Minecraft 插件 Skill 编译期加载、参考注入、迁移；QQ/NapCat 与评论 webhook 适配器 | 通用 Skill 沙箱、签名、依赖升级、真实 MCP 客户端和更多平台适配 |
 
@@ -67,7 +71,8 @@ Sculk Catalyst V3 是一个 AI 驱动的 Minecraft 服务器工作台。它把�
 - 普通创建会生成独立服务器目录、`server.properties`、`eula.txt`、启动脚本、`plugins` 和 `logs`。
 - 智能创建只建立规划项目与“开服规划”对话，不会假装已经下载核心或生成服务器文件。
 - 支持启动、停止、重启、状态查询、实时日志、终端命令和文本配置编辑。
-- 文件管理器限制在服务器工作区内，拒绝绝对路径、路径穿越、符号链接和二进制核心覆盖。
+- 文件管理器限制在服务器工作区内，拒绝绝对路径、路径穿越和符号链接；文本编辑上限约 2 MB。
+- 文件上传/下载单文件上限 256 MiB，上传采用临时文件 + 原子重命名，默认不覆盖既有文件，并保护根目录 `server.jar`、`server.jar.part` 和 `server.jar.backup`。
 
 ### 初始化、下载和 Java
 
@@ -108,6 +113,7 @@ Sculk Catalyst V3 是一个 AI 驱动的 Minecraft 服务器工作台。它把�
 - 主机 Agent 采用出站连接，不要求在开发机或 Minecraft 主机开放入站端口。
 - Agent 支持短码配对、指纹确认、心跳、任务租约、结构化工作区操作、Shell、持久终端、检查点、取消、停止、恢复、重试和回滚任务。
 - Windows Shell 使用 Job Object，Unix Shell 使用独立进程组清理进程树。
+- Cloud Agent 的 high/critical 任务和持久终端必须绑定团队审批；请求人不能自批，重试/回滚会生成新的审批；`log.tail` 只读日志目录并对常见密钥和 Bearer Token 脱敏。
 - Agent 的 `full` Shell 权限不是沙箱；命令最终受运行 Agent 的操作系统账号权限约束，Cloud 审批也不等价于文件系统隔离。
 
 ### 机器人与外部集成
@@ -473,8 +479,8 @@ npm run build
 仓库内还提供：
 
 - `scripts/test-local-server-provision.ps1`：隔离验证核心下载、初始化、取消、重试和后端重启恢复。
-- `scripts/test-cloud-agent-tasks.ps1`：验证 Agent 任务、审批、Shell、checkpoint、恢复、重试和回滚。
-- `scripts/test-cloud-terminal-conversations.ps1`：验证 Cloud 终端与对话流程。
+- `scripts/test-cloud-agent-tasks.ps1`：验证 Agent 任务、独立团队审批、Shell、checkpoint、恢复、重试和回滚；高风险场景需要传入 `-ApprovalTeamId` 与独立的 `-ApproverToken`。
+- `scripts/test-cloud-terminal-conversations.ps1`：验证 Cloud 终端、对话、独立团队审批和输入幂等；高风险场景需要传入 `-ApprovalTeamId` 与独立的 `-ApproverToken`。
 - `scripts/cloud-smoke-test.ps1`：Cloud API 冒烟测试。
 - `bash -n scripts/*.sh` 与 ShellCheck：Linux 启停脚本检查。
 
@@ -540,6 +546,7 @@ Cloud 的 `data/state-cloud.json` 与本地状态分开；资源中心对象目�
 - 本项目默认面向本机或受信任的内网管理环境；后端默认绑定回环地址，不代表已经具备公网安全模型。
 - 本地 JSON 状态会保存服务器、对话、任务和资源目录；本地 AI API Key 在当前版本以明文保存在 `state.json` 及其备份中，应严格限制文件权限。
 - Cloud 的上游凭据使用 `SCULK_MASTER_KEY` 加密，但生产环境仍需保护数据库、Redis、会话密钥和反向代理。
+- Cloud Agent 审批是服务端任务执行门：高风险任务和终端启动必须有同团队、非请求人决定的有效审批；旧无关联高风险排队项在迁移时取消。审批不替代操作系统账户、容器或文件系统沙箱。
 - 资源中心有浏览器管理认证和自动化 Bearer Token，但当前没有完整的多管理员 RBAC、限流、对象回收和不可篡改审计；不要直接暴露未加固的写接口。
 - Agent 的 `full` Shell 不提供工作区沙箱。审批能限制任务流程，不能替代操作系统权限、容器隔离或专用低权限账号。
 - 玩家在线状态、CPU、内存、TPS、经济和反馈部分仍使用本地状态或演示数据；当前没有 RCON、Query 或管理插件的真实同步链路。

@@ -11,11 +11,31 @@ use std::{
     sync::OnceLock,
     time::Duration,
 };
-use sysinfo::System;
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::{fs, io::AsyncWriteExt, process::Command, task, time::timeout};
 use uuid::Uuid;
 
 pub const RECOMMENDED_JAVA: u32 = 21;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProcessMetrics {
+    pub(crate) cpu: u8,
+    pub(crate) memory: u64,
+}
+
+pub(crate) fn sample_process_metrics(system: &mut System, pid: u32) -> Option<ProcessMetrics> {
+    let pid = Pid::from_u32(pid);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().with_cpu().with_memory(),
+    );
+    let process = system.process(pid)?;
+    Some(ProcessMetrics {
+        cpu: process.cpu_usage().clamp(0.0, 100.0).round() as u8,
+        memory: process.memory().div_ceil(1024 * 1024),
+    })
+}
 const SUPPORTED_JAVA_MAJORS: &[u32] = &[RECOMMENDED_JAVA];
 const JAVA_PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);

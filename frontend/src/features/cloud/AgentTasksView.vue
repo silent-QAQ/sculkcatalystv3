@@ -3,12 +3,12 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
-  Activity, Archive, CheckCircle2, ChevronRight, CircleStop, Clock3, FileText,
+  Activity, Archive, ChevronRight, CircleStop, Clock3, FileText,
   Folder, List, Play, RefreshCw, RotateCcw, ShieldAlert, SquareTerminal, TriangleAlert,
 } from 'lucide-vue-next'
 import { CloudApiError, cloudRequest } from './client'
 import type {
-  AgentTaskOperation, AgentTaskStatus, AgentTaskView, CloudAgent,
+  AgentTaskOperation, AgentTaskStatus, AgentTaskView, CloudAgent, CloudTeam,
 } from './types'
 import './agent-tasks.css'
 
@@ -20,7 +20,7 @@ interface OperationSpec {
   risk: 'low' | 'high' | 'critical'
 }
 
-type ConfirmAction = 'approve' | 'rollback' | 'resume' | 'restart' | 'stop'
+type ConfirmAction = 'rollback' | 'resume' | 'restart' | 'stop'
 
 const operations: OperationSpec[] = [
   { value: 'shell.exec', label: '执行 Shell 命令', description: '使用 Agent 所属系统账户执行命令', permission: 'full', risk: 'critical' },
@@ -33,8 +33,10 @@ const operations: OperationSpec[] = [
 
 const tasks = ref<AgentTaskView[]>([])
 const agents = ref<CloudAgent[]>([])
+const teams = ref<CloudTeam[]>([])
 const selectedTaskId = ref('')
 const selectedAgentId = ref('')
+const selectedTeamId = ref('')
 const operation = ref<OperationSpec['value']>('shell.exec')
 const busy = ref('')
 const error = ref('')
@@ -63,10 +65,16 @@ const activeTaskCount = computed(() => tasks.value.filter(task =>
 const awaitingApprovalCount = computed(() => tasks.value.filter(task => task.status === 'awaiting_approval').length)
 const selectedAgentReady = computed(() => selectedAgent.value ? agentSupports(selectedAgent.value, currentOperation.value) : false)
 const shellReady = computed(() => operation.value !== 'shell.exec' || shellForm.value.confirmed)
-const canSubmit = computed(() => !!selectedAgent.value && selectedAgentReady.value && shellReady.value && !busy.value)
+const requiresTeamApproval = computed(() => currentOperation.value.risk !== 'low')
+const canSubmit = computed(() => !!selectedAgent.value && selectedAgentReady.value && shellReady.value
+  && (!requiresTeamApproval.value || !!selectedTeamId.value) && !busy.value)
 
 watch(taskAgents, items => {
   if (!items.some(agent => agent.id === selectedAgentId.value)) selectedAgentId.value = items[0]?.id || ''
+}, { immediate: true })
+watch(teams, items => {
+  if (selectedTeamId.value && items.some(team => team.id === selectedTeamId.value)) return
+  selectedTeamId.value = items.length === 1 ? items[0].id : ''
 }, { immediate: true })
 watch(operation, next => {
   confirmation.value = null
@@ -135,7 +143,7 @@ function taskSource(task: AgentTaskView) {
 
 function confirmationTitle(action: ConfirmAction) {
   return ({
-    approve: '确认批准这项任务？', rollback: '确认创建回滚任务？',
+    rollback: '确认创建回滚任务？',
     resume: '确认从检查点恢复？', restart: '确认从头重新执行？', stop: '确认停止运行中的 Shell？',
   } as const)[action]
 }
@@ -145,7 +153,7 @@ function confirmationDescription(task: AgentTaskView, action: ConfirmAction) {
   if (action === 'resume') return '新任务会从最近的可恢复检查点继续，并跳过检查点前已完成的步骤，避免重复已记录的副作用；风险操作仍需批准。'
   if (action === 'restart') return '新任务会从第一步重新执行，可能重复此前已经产生的副作用；风险操作仍需批准。'
   if (task.operation === 'shell.exec') return '该 Shell 命令将以 Agent 系统账户权限执行，且执行后不可回滚。'
-  return action === 'rollback' ? '回滚会创建一条新的高风险任务，并再次等待批准。' : '批准后 Agent 可以领取并执行该操作。'
+  return '回滚会创建一条新的高风险任务，并再次等待团队批准。'
 }
 
 function agentName(id: string) {
@@ -196,6 +204,13 @@ function readableError(value: unknown) {
     agent_not_active: '该 Agent 尚未确认或已被撤销。',
     agent_capability_missing: '该 Agent 没有执行此操作所需的能力。',
     agent_permission_missing: '该 Agent 没有执行此操作所需的权限。',
+    agent_task_team_required: '高风险任务需要选择审批团队；请先创建或加入团队。',
+    team_access_denied: '当前账号不是所选团队成员。',
+    agent_task_approval_pending: '任务正在等待团队审批，请到“审批”页由其他合资格成员处理。',
+    agent_task_approval_rejected: '该任务的团队审批已拒绝或取消。',
+    agent_task_approval_invalid: '任务与审批关联无效，请重新创建任务。',
+    agent_task_approval_missing: '任务缺少有效审批关联，请重新创建任务。',
+    approval_self_forbidden: '审批请求人不能处理自己的审批。',
     agent_task_not_awaiting_approval: '任务状态已变化，无法再次批准。',
     agent_task_running: '任务已经开始执行，当前不能从云端取消。',
     agent_task_not_cancellable: '当前任务状态不允许取消。',
@@ -214,12 +229,14 @@ async function loadData(quiet = false) {
   refreshInFlight.value = true
   if (!quiet) busy.value = 'refresh'
   try {
-    const [nextAgents, nextTasks] = await Promise.all([
+    const [nextAgents, nextTasks, nextTeams] = await Promise.all([
       cloudRequest<CloudAgent[]>('/api/cloud/agents'),
       cloudRequest<AgentTaskView[]>('/api/cloud/agent-tasks'),
+      cloudRequest<CloudTeam[]>('/api/cloud/teams'),
     ])
     agents.value = nextAgents
     tasks.value = nextTasks
+    teams.value = nextTeams
     if (!selectedTaskId.value || !nextTasks.some(task => task.id === selectedTaskId.value)) {
       selectedTaskId.value = nextTasks[0]?.id || ''
     }
@@ -267,6 +284,7 @@ async function createTask() {
       method: 'POST',
       body: JSON.stringify({
         agent_id: selectedAgent.value.id,
+        ...(requiresTeamApproval.value ? { team_id: selectedTeamId.value } : {}),
         operation: operation.value,
         input: buildInput(),
         idempotency_key: idempotencyKey.value,
@@ -291,7 +309,7 @@ function updateTask(task: AgentTaskView) {
 }
 
 async function performAction(task: AgentTaskView, action: ConfirmAction | 'cancel') {
-  if ((action === 'approve' || action === 'rollback')
+  if (action === 'rollback'
     && (confirmation.value?.taskId !== task.id || confirmation.value.action !== action)) {
     confirmation.value = { taskId: task.id, action }
     return
@@ -381,6 +399,12 @@ onUnmounted(() => window.clearInterval(refreshTimer))
             <option v-for="item in operations" :key="item.value" :value="item.value">{{item.label}} · {{riskLabel(item.risk)}}</option>
           </select>
         </label>
+        <label v-if="requiresTeamApproval">审批团队
+          <select v-model="selectedTeamId" required>
+            <option value="" disabled>{{teams.length ? '选择审批团队' : '尚未加入团队'}}</option>
+            <option v-for="team in teams" :key="team.id" :value="team.id">{{team.name}} · {{team.role}}</option>
+          </select>
+        </label>
         <div class="task-operation-note"><ShieldAlert/><span><b>{{currentOperation.description}}</b><small>需要 {{permissionLabel(currentOperation.permission)}}权限 · {{riskLabel(currentOperation.risk)}}</small></span></div>
 
         <template v-if="operation==='shell.exec'">
@@ -412,7 +436,7 @@ onUnmounted(() => window.clearInterval(refreshTimer))
         <div v-if="selectedAgent && !selectedAgentReady" class="agent-ineligible wide"><TriangleAlert/>{{agentEligibility(selectedAgent)}}，请选择其他 Agent 或重新配对并授予所需能力。</div>
         <button class="cloud-primary task-submit wide" :disabled="!canSubmit">
           <RefreshCw v-if="busy==='create'" class="s-spin"/><SquareTerminal v-else/>
-          {{operation==='shell.exec'?'创建 Shell 任务并等待批准':currentOperation.risk==='low'?'创建并加入队列':'创建任务并等待批准'}}
+          {{operation==='shell.exec'?'创建 Shell 任务并等待团队批准':currentOperation.risk==='low'?'创建并加入队列':'创建任务并等待团队批准'}}
         </button>
       </form>
     </article>
@@ -439,7 +463,7 @@ onUnmounted(() => window.clearInterval(refreshTimer))
           <button @click="confirmation=null">返回</button><button class="confirm" :disabled="!!busy" @click="confirmTaskAction(selectedTask,confirmation.action)">确认</button>
         </div>
         <div v-else class="task-detail-actions">
-          <button v-if="selectedTask.status==='awaiting_approval'" class="approve" :disabled="!!busy" @click="performAction(selectedTask,'approve')"><CheckCircle2/>批准执行</button>
+          <span v-if="selectedTask.status==='awaiting_approval'" class="task-approval-note"><Clock3/>等待审批团队处理（请求人不能自批）</span>
           <button v-if="['awaiting_approval','queued','leased'].includes(selectedTask.status)" :disabled="!!busy" @click="performAction(selectedTask,'cancel')"><CircleStop/>取消任务</button>
           <button v-if="selectedTask.status==='running'&&selectedTask.operation==='shell.exec'&&!selectedTask.cancel_requested" class="stop" :disabled="!!busy" @click="requestTaskStop(selectedTask)"><CircleStop/>停止运行</button>
           <button v-if="selectedTask.status==='succeeded'&&selectedTask.rollback_available&&selectedTask.operation!=='shell.exec'" :disabled="!!busy" @click="performAction(selectedTask,'rollback')"><RotateCcw/>创建回滚任务</button>
@@ -460,6 +484,8 @@ onUnmounted(() => window.clearInterval(refreshTimer))
           <div><dt>完成时间</dt><dd>{{formatDate(selectedTask.completed_at)}}</dd></div>
           <div v-if="selectedTask.cancel_requested_at"><dt>停止请求</dt><dd>{{formatDate(selectedTask.cancel_requested_at)}}</dd></div>
           <div v-if="selectedTask.cancel_acknowledged_at"><dt>Agent 已确认</dt><dd>{{formatDate(selectedTask.cancel_acknowledged_at)}}</dd></div>
+          <div v-if="selectedTask?.team_id"><dt>审批团队</dt><dd>{{teams.find(team => team.id === selectedTask?.team_id)?.name || selectedTask?.team_id}}</dd></div>
+          <div v-if="selectedTask.approval_id"><dt>审批记录</dt><dd class="task-mono">{{selectedTask.approval_id}}</dd></div>
         </dl>
 
         <section class="task-checkpoint-summary">

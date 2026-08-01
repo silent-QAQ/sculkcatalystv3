@@ -6,11 +6,11 @@ import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
 import {
-  CheckCircle2, CircleStop, Clock3, MonitorUp, Plus, RefreshCw, ShieldAlert,
+  CircleStop, Clock3, MonitorUp, Plus, RefreshCw, ShieldAlert,
   SquareTerminal, TriangleAlert, Wifi, WifiOff,
 } from 'lucide-vue-next'
 import { CloudApiError, cloudRequest } from './client'
-import type { CloudAgent, CloudTerminalEvent, CloudTerminalSession } from './types'
+import type { CloudAgent, CloudTeam, CloudTerminalEvent, CloudTerminalSession } from './types'
 import './terminal-sessions.css'
 
 interface TerminalEventsResponse {
@@ -20,13 +20,13 @@ interface TerminalEventsResponse {
 
 const sessions = ref<CloudTerminalSession[]>([])
 const agents = ref<CloudAgent[]>([])
+const teams = ref<CloudTeam[]>([])
 const selectedSessionId = ref('')
 const terminalHost = ref<HTMLElement | null>(null)
-const createForm = ref({ agent_id: '', title: '', cwd: '' })
+const createForm = ref({ agent_id: '', team_id: '', title: '', cwd: '' })
 const busy = ref('')
 const error = ref('')
 const refreshWarning = ref('')
-const approvalConfirmed = ref(false)
 const lastSeq = ref(0)
 const replaying = ref(false)
 
@@ -54,15 +54,17 @@ const terminalAgents = computed(() => agents.value.filter(agent =>
 ))
 const selectedSession = computed(() => sessions.value.find(item => item.id === selectedSessionId.value) || null)
 const canType = computed(() => selectedSession.value?.status === 'running')
-const canApprove = computed(() => isAwaitingApproval(selectedSession.value?.status))
 const canTerminate = computed(() => !!selectedSession.value && !isTerminalStatus(selectedSession.value.status))
 
 watch(terminalAgents, items => {
   if (!items.some(agent => agent.id === createForm.value.agent_id)) createForm.value.agent_id = items[0]?.id || ''
 }, { immediate: true })
+watch(teams, items => {
+  if (createForm.value.team_id && items.some(team => team.id === createForm.value.team_id)) return
+  createForm.value.team_id = items.length === 1 ? items[0].id : ''
+}, { immediate: true })
 
 watch(selectedSessionId, () => {
-  approvalConfirmed.value = false
   beginReplay()
 })
 
@@ -105,6 +107,12 @@ function readableError(value: unknown) {
     agent_permission_missing: '目标 Agent 没有完整执行权限。',
     terminal_not_awaiting_approval: '会话状态已变化，无法再次批准。',
     terminal_state_conflict: '终端尚未运行或已经结束。',
+    terminal_team_required: '持久终端需要选择审批团队；请先创建或加入团队。',
+    team_access_denied: '当前账号不是所选团队成员。',
+    terminal_approval_pending: '终端正在等待团队审批，请到“审批”页由其他合资格成员处理。',
+    terminal_approval_invalid: '终端与审批关联无效，请重新创建会话。',
+    terminal_approval_missing: '终端缺少有效审批关联，请重新创建会话。',
+    approval_self_forbidden: '审批请求人不能处理自己的审批。',
   }
   return known[value.code] || value.message || `请求失败（HTTP ${value.status}）`
 }
@@ -124,13 +132,15 @@ async function loadSessions(quiet = false) {
   sessionListInFlight = true
   if (!quiet) busy.value = 'refresh'
   try {
-    const [sessionResponse, nextAgents] = await Promise.all([
+    const [sessionResponse, nextAgents, nextTeams] = await Promise.all([
       cloudRequest<CloudTerminalSession[] | { sessions: CloudTerminalSession[] }>('/api/cloud/terminal-sessions'),
       cloudRequest<CloudAgent[]>('/api/cloud/agents'),
+      cloudRequest<CloudTeam[]>('/api/cloud/teams'),
     ])
     const nextSessions = normalizeSessions(sessionResponse)
     sessions.value = nextSessions
     agents.value = nextAgents
+    teams.value = nextTeams
     if (!selectedSessionId.value || !nextSessions.some(item => item.id === selectedSessionId.value)) {
       selectedSessionId.value = nextSessions[0]?.id || ''
     }
@@ -155,6 +165,7 @@ async function createSession() {
       method: 'POST',
       body: JSON.stringify({
         agent_id: createForm.value.agent_id,
+        team_id: createForm.value.team_id || undefined,
         ...(createForm.value.title.trim() ? { title: createForm.value.title.trim() } : {}),
         ...(createForm.value.cwd.trim() ? { cwd: createForm.value.cwd.trim() } : {}),
         cols: clampCols(terminal?.cols || 100),
@@ -163,28 +174,9 @@ async function createSession() {
     })
     upsertSession(session)
     selectedSessionId.value = session.id
-    approvalConfirmed.value = false
     createForm.value.title = ''
   } catch (value) {
     error.value = readableError(value)
-  } finally {
-    busy.value = ''
-  }
-}
-
-async function approveSession() {
-  const session = selectedSession.value
-  if (!session || !approvalConfirmed.value || busy.value) return
-  busy.value = `approve:${session.id}`
-  error.value = ''
-  try {
-    const updated = await cloudRequest<CloudTerminalSession | void>(`/api/cloud/terminal-sessions/${session.id}/approve`, { method: 'POST' })
-    if (updated) upsertSession(updated)
-    else await loadSessions(true)
-    approvalConfirmed.value = false
-  } catch (value) {
-    error.value = readableError(value)
-    await loadSessions(true)
   } finally {
     busy.value = ''
   }
@@ -394,12 +386,13 @@ onUnmounted(() => {
     <div v-if="refreshWarning" class="terminal-notice warning"><WifiOff/>{{refreshWarning}}</div>
 
     <article class="cloud-panel terminal-create">
-      <header><div><h3>新建终端会话</h3><p>会话创建后必须由你手动批准，Agent 才会启动系统 Shell。</p></div><Plus/></header>
+      <header><div><h3>新建终端会话</h3><p>会话创建后必须由团队其他合资格成员批准，Agent 才会启动系统 Shell。</p></div><Plus/></header>
       <form @submit.prevent="createSession">
         <label>目标 Agent<select v-model="createForm.agent_id" required><option value="" disabled>{{terminalAgents.length?'选择在线 Agent':'暂无支持终端的在线 Agent'}}</option><option v-for="agent in terminalAgents" :key="agent.id" :value="agent.id">{{agent.name}} · {{agent.workspace_label}}</option></select></label>
+        <label>审批团队<select v-model="createForm.team_id" required><option value="" disabled>{{teams.length?'选择审批团队':'尚未加入团队'}}</option><option v-for="team in teams" :key="team.id" :value="team.id">{{team.name}} · {{team.role}}</option></select></label>
         <label>会话名称（可选）<input v-model="createForm.title" maxlength="80" placeholder="例如：服务端维护"/></label>
         <label>初始目录（可选）<input v-model="createForm.cwd" maxlength="1024" placeholder="留空使用 Agent 工作目录"/></label>
-        <button class="cloud-primary" :disabled="!createForm.agent_id||!!busy"><RefreshCw v-if="busy==='create'" class="s-spin"/><Plus v-else/>创建并等待批准</button>
+        <button class="cloud-primary" :disabled="!createForm.agent_id||!createForm.team_id||!!busy"><RefreshCw v-if="busy==='create'" class="s-spin"/><Plus v-else/>创建并等待团队批准</button>
       </form>
       <div class="terminal-risk"><ShieldAlert/><p><b>终端拥有完整的系统账户权限</b><small>终端可访问 Agent 进程所属账户能够访问的文件、程序和网络资源。Agent 进程退出时，终端会话也会结束。</small></p></div>
     </article>
@@ -422,10 +415,8 @@ onUnmounted(() => {
         </header>
         <header v-else><div><h3>远程终端</h3><p>选择已有会话或新建会话</p></div></header>
 
-        <div v-if="selectedSession && canApprove" class="terminal-approval">
-          <ShieldAlert/><p><b>批准后将启动完整权限 Shell</b><small>命令会以 Agent 进程所属系统账户执行。请仅在你信任该主机和当前工作环境时批准。</small></p>
-          <label><input v-model="approvalConfirmed" type="checkbox"/>我已确认权限范围</label>
-          <button class="cloud-primary" :disabled="!approvalConfirmed||!!busy" @click="approveSession"><CheckCircle2/>批准并连接</button>
+        <div v-if="selectedSession && isAwaitingApproval(selectedSession.status)" class="terminal-approval">
+          <ShieldAlert/><p><b>等待审批团队决定</b><small>这是完整系统账户权限的持久终端。请由其他团队所有者、管理员或审批人在“远程审批”页处理；请求人不能自批。</small></p>
         </div>
         <div class="terminal-toolbar" v-if="selectedSession">
           <span v-if="replaying"><RefreshCw class="s-spin"/>正在恢复历史输出</span>

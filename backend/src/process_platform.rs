@@ -1,6 +1,107 @@
 use std::io;
 use tokio::process::{Child, Command};
 
+#[cfg(windows)]
+use std::mem::size_of;
+
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE},
+    System::{
+        JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, TerminateJobObject,
+        },
+        Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE},
+    },
+};
+
+#[derive(Debug)]
+pub(crate) struct ProcessGuard {
+    #[cfg(windows)]
+    job: HANDLE,
+}
+
+#[cfg(windows)]
+// Windows kernel handles are process-wide and can be closed from the actor thread.
+unsafe impl Send for ProcessGuard {}
+
+#[cfg(windows)]
+unsafe impl Sync for ProcessGuard {}
+
+#[cfg(windows)]
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        if !self.job.is_null() {
+            unsafe {
+                CloseHandle(self.job);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {}
+}
+
+pub(crate) fn create_process_guard() -> io::Result<ProcessGuard> {
+    #[cfg(windows)]
+    {
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            unsafe {
+                CloseHandle(job);
+            }
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ProcessGuard { job })
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(ProcessGuard {})
+    }
+}
+
+pub(crate) fn bind_process_to_guard(guard: &ProcessGuard, pid: u32) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+        if process.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let assigned = unsafe { AssignProcessToJobObject(guard.job, process) };
+        unsafe {
+            CloseHandle(process);
+        }
+        if assigned == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (guard, pid);
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 pub(crate) fn configure_managed_command(command: &mut Command) -> io::Result<()> {
     command.process_group(0);
@@ -29,8 +130,22 @@ pub(crate) fn configure_managed_command(_command: &mut Command) -> io::Result<()
     Ok(())
 }
 
+#[cfg(windows)]
+fn terminate_job(guard: &ProcessGuard) -> io::Result<()> {
+    let result = unsafe { TerminateJobObject(guard.job, 1) };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
-pub(crate) fn start_kill_tree(child: &mut Child, pid: u32) -> io::Result<()> {
+pub(crate) fn start_kill_tree(
+    child: &mut Child,
+    pid: u32,
+    _guard: Option<&ProcessGuard>,
+) -> io::Result<()> {
     match signal_process_group(pid, libc::SIGKILL) {
         Ok(()) => Ok(()),
         Err(error) if error.raw_os_error() == Some(libc::ESRCH) => child.start_kill(),
@@ -39,7 +154,15 @@ pub(crate) fn start_kill_tree(child: &mut Child, pid: u32) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn start_kill_tree(child: &mut Child, _pid: u32) -> io::Result<()> {
+pub(crate) fn start_kill_tree(
+    child: &mut Child,
+    _pid: u32,
+    guard: Option<&ProcessGuard>,
+) -> io::Result<()> {
+    #[cfg(windows)]
+    if let Some(guard) = guard {
+        return terminate_job(guard);
+    }
     child.start_kill()
 }
 
@@ -97,7 +220,7 @@ mod tests {
             .unwrap();
         let descendant = descendant_line.trim().parse::<i32>().unwrap();
 
-        start_kill_tree(&mut child, pid).unwrap();
+        start_kill_tree(&mut child, pid, None).unwrap();
         child.wait().await.unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(3);

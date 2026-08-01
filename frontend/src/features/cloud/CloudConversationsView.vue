@@ -3,14 +3,14 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
-  Activity, Archive, Bot, CheckCircle2, ChevronRight, CircleStop, Clock3, FileText,
+  Activity, Archive, Bot, ChevronRight, CircleStop, Clock3, FileText,
   Folder, MessageSquareText, Plus, RefreshCw, RotateCcw, Send, ShieldAlert,
   SquareTerminal, TriangleAlert, UserRound,
 } from 'lucide-vue-next'
 import { CloudApiError, cloudRequest } from './client'
 import type {
   AgentTaskOperation, AgentTaskStatus, AgentTaskView, CloudAgent, CloudConversation,
-  CloudConversationMessage,
+  CloudConversationMessage, CloudTeam,
 } from './types'
 import './cloud-conversations.css'
 
@@ -26,7 +26,7 @@ interface ConversationDetail {
   messages: CloudConversationMessage[]
 }
 
-type ConfirmAction = 'approve' | 'rollback' | 'resume' | 'restart' | 'stop'
+type ConfirmAction = 'rollback' | 'resume' | 'restart' | 'stop'
 
 const operations: OperationSpec[] = [
   { value: 'shell.exec', label: '执行 Shell 命令', permission: 'full', risk: 'critical' },
@@ -41,6 +41,8 @@ const conversations = ref<CloudConversation[]>([])
 const messages = ref<CloudConversationMessage[]>([])
 const tasks = ref<AgentTaskView[]>([])
 const agents = ref<CloudAgent[]>([])
+const teams = ref<CloudTeam[]>([])
+const selectedTeamId = ref('')
 const selectedConversationId = ref('')
 const createForm = ref({ title: '', agent_id: '' })
 const messageContent = ref('')
@@ -69,14 +71,20 @@ const taskAgents = computed(() => agents.value.filter(agent =>
 const currentOperation = computed(() => operations.find(item => item.value === operation.value) || operations[0])
 const planAgent = computed(() => taskAgents.value.find(agent => agent.id === planAgentId.value) || null)
 const planAgentReady = computed(() => !!planAgent.value && agentSupports(planAgent.value, currentOperation.value))
+const requiresTeamApproval = computed(() => currentOperation.value.risk !== 'low')
 const canCreatePlan = computed(() => !!planContent.value.trim() && planAgentReady.value
-  && (operation.value !== 'shell.exec' || shellForm.value.confirmed) && !busy.value)
+  && (operation.value !== 'shell.exec' || shellForm.value.confirmed)
+  && (!requiresTeamApproval.value || !!selectedTeamId.value) && !busy.value)
 
 watch(taskAgents, items => {
   if (!items.some(agent => agent.id === planAgentId.value)) {
     const preferred = currentConversation.value?.agent_id
     planAgentId.value = items.find(agent => agent.id === preferred)?.id || items[0]?.id || ''
   }
+}, { immediate: true })
+watch(teams, items => {
+  if (selectedTeamId.value && items.some(team => team.id === selectedTeamId.value)) return
+  selectedTeamId.value = items.length === 1 ? items[0].id : ''
 }, { immediate: true })
 
 watch(selectedConversationId, id => {
@@ -152,7 +160,7 @@ function checkpointKindLabel(kind: 'progress' | 'result') {
 
 function confirmationTitle(action: ConfirmAction) {
   return ({
-    approve: '确认批准这项任务？', rollback: '确认创建回滚任务？',
+    rollback: '确认创建回滚任务？',
     resume: '确认从检查点恢复？', restart: '确认从头重新执行？', stop: '确认停止运行中的 Shell？',
   } as const)[action]
 }
@@ -162,7 +170,7 @@ function confirmationDescription(task: AgentTaskView, action: ConfirmAction) {
   if (action === 'resume') return '新任务会跳过检查点前已完成的步骤，避免重复已记录的副作用；风险操作仍需批准。'
   if (action === 'restart') return '新任务会从第一步重新执行，可能重复此前已经产生的副作用；风险操作仍需批准。'
   if (task.operation === 'shell.exec') return 'Shell 命令将以 Agent 系统账户权限执行，执行后不可回滚。'
-  return action === 'rollback' ? '回滚会创建一项新的高风险任务，并再次等待批准。' : '批准后 Agent 可以领取并执行这项操作。'
+  return '回滚会创建一项新的高风险任务，并再次等待团队批准。'
 }
 
 function agentName(id: string) {
@@ -189,6 +197,13 @@ function readableError(value: unknown) {
     agent_not_active: '目标 Agent 尚未确认或已被撤销。',
     agent_capability_missing: '目标 Agent 不支持这项操作。',
     agent_permission_missing: '目标 Agent 缺少执行这项操作所需的权限。',
+    agent_task_team_required: '高风险任务需要选择审批团队；请先创建或加入团队。',
+    team_access_denied: '当前账号不是所选团队成员。',
+    agent_task_approval_pending: '任务正在等待团队审批，请到“审批”页由其他合资格成员处理。',
+    agent_task_approval_rejected: '该任务的团队审批已拒绝或取消。',
+    agent_task_approval_invalid: '任务与审批关联无效，请重新创建任务。',
+    agent_task_approval_missing: '任务缺少有效审批关联，请重新创建任务。',
+    approval_self_forbidden: '审批请求人不能处理自己的审批。',
     agent_task_not_awaiting_approval: '任务状态已经变化，无法再次批准。',
     agent_task_running: '任务已经开始执行，当前不能从云端取消。',
     agent_task_not_cancellable: '当前任务状态不允许取消。',
@@ -242,15 +257,17 @@ async function loadData(quiet = false) {
   if (!quiet) busy.value = 'refresh'
   try {
     refreshWarning.value = ''
-    const [conversationResponse, nextAgents, nextTasks] = await Promise.all([
+    const [conversationResponse, nextAgents, nextTasks, nextTeams] = await Promise.all([
       cloudRequest<CloudConversation[] | { conversations: CloudConversation[] }>('/api/cloud/conversations'),
       cloudRequest<CloudAgent[]>('/api/cloud/agents'),
       cloudRequest<AgentTaskView[]>('/api/cloud/agent-tasks'),
+      cloudRequest<CloudTeam[]>('/api/cloud/teams'),
     ])
     const nextConversations = normalizeConversationList(conversationResponse)
     conversations.value = nextConversations
     agents.value = nextAgents
     tasks.value = nextTasks
+    teams.value = nextTeams
     if (!selectedConversationId.value || !nextConversations.some(item => item.id === selectedConversationId.value)) {
       selectedConversationId.value = nextConversations[0]?.id || ''
     } else if (selectedConversationId.value) {
@@ -354,6 +371,7 @@ async function createPlan() {
       method: 'POST',
       body: JSON.stringify({
         content: planContent.value.trim(), agent_id: planAgent.value.id,
+        ...(requiresTeamApproval.value ? { team_id: selectedTeamId.value } : {}),
         operation: operation.value, input, idempotency_key: pendingPlanRequest.idempotencyKey,
       }),
     })
@@ -377,8 +395,8 @@ function linkedTask(message: CloudConversationMessage) {
   return message.linked_task_id ? tasks.value.find(task => task.id === message.linked_task_id) || null : null
 }
 
-async function performAction(task: AgentTaskView, action: 'approve' | 'cancel' | 'rollback') {
-  if ((action === 'approve' || action === 'rollback')
+async function performAction(task: AgentTaskView, action: 'cancel' | 'rollback') {
+  if (action === 'rollback'
     && (confirmation.value?.taskId !== task.id || confirmation.value.action !== action)) {
     confirmation.value = { taskId: task.id, action }
     return
@@ -488,14 +506,14 @@ onUnmounted(() => window.clearInterval(refreshTimer))
               <section v-if="message.kind==='plan'" class="conversation-plan-card">
                 <template v-if="linkedTask(message)">
                   <header><span><SquareTerminal/>{{operationLabel(linkedTask(message)!.operation)}}</span><em :class="[linkedTask(message)!.status,{stopping:isTaskStopping(linkedTask(message)!)}]">{{taskStatusLabel(linkedTask(message)!)}}</em></header>
-                  <div class="plan-meta"><span>{{agentName(linkedTask(message)!.agent_id)}}</span><span>{{riskLabel(linkedTask(message)!.risk)}}</span><span>{{permissionLabel(linkedTask(message)!.required_permission)}}权限</span><span>第 {{linkedTask(message)!.attempt_no}} 次</span><span>{{executionModeLabel(linkedTask(message)!.execution_mode)}}</span><span v-if="linkedTask(message)!.cancel_requested_at">停止请求 {{formatDate(linkedTask(message)!.cancel_requested_at)}}</span></div>
+                  <div class="plan-meta"><span>{{agentName(linkedTask(message)!.agent_id)}}</span><span>{{riskLabel(linkedTask(message)!.risk)}}</span><span>{{permissionLabel(linkedTask(message)!.required_permission)}}权限</span><span>第 {{linkedTask(message)!.attempt_no}} 次</span><span>{{executionModeLabel(linkedTask(message)!.execution_mode)}}</span><span v-if="linkedTask(message)!.team_id">审批团队已绑定</span><span v-if="linkedTask(message)!.cancel_requested_at">停止请求 {{formatDate(linkedTask(message)!.cancel_requested_at)}}</span></div>
                   <div v-if="linkedTask(message)!.latest_checkpoint" class="plan-checkpoint"><Clock3/><p><b>最近检查点 · #{{linkedTask(message)!.latest_checkpoint!.seq}}</b><small>{{checkpointKindLabel(linkedTask(message)!.latest_checkpoint!.kind)}} · {{formatDate(linkedTask(message)!.latest_checkpoint!.created_at)}} · {{linkedTask(message)!.latest_checkpoint!.resumable?'可用于恢复':'仅供记录'}}</small></p></div>
                   <div v-if="confirmation?.taskId===linkedTask(message)!.id" class="plan-confirm">
                     <ShieldAlert/><p><b>{{confirmationTitle(confirmation.action)}}</b><small>{{confirmationDescription(linkedTask(message)!,confirmation.action)}}</small></p>
                     <button @click="confirmation=null">返回</button><button class="confirm" :disabled="!!busy" @click="confirmTaskAction(linkedTask(message)!,confirmation.action)">确认</button>
                   </div>
                   <div v-else class="plan-actions">
-                    <button v-if="linkedTask(message)!.status==='awaiting_approval'" class="approve" :disabled="!!busy" @click="performAction(linkedTask(message)!,'approve')"><CheckCircle2/>批准执行</button>
+                    <span v-if="linkedTask(message)!.status==='awaiting_approval'" class="plan-approval-note"><Clock3/>等待审批团队处理（请求人不能自批）</span>
                     <button v-if="['awaiting_approval','queued','leased'].includes(linkedTask(message)!.status)" :disabled="!!busy" @click="performAction(linkedTask(message)!,'cancel')"><CircleStop/>取消任务</button>
                     <button v-if="linkedTask(message)!.status==='running'&&linkedTask(message)!.operation==='shell.exec'&&!linkedTask(message)!.cancel_requested" class="stop" :disabled="!!busy" @click="requestTaskStop(linkedTask(message)!)"><CircleStop/>停止运行</button>
                     <button v-if="linkedTask(message)!.status==='succeeded'&&linkedTask(message)!.rollback_available&&linkedTask(message)!.operation!=='shell.exec'" :disabled="!!busy" @click="performAction(linkedTask(message)!,'rollback')"><RotateCcw/>创建回滚任务</button>
@@ -523,6 +541,7 @@ onUnmounted(() => window.clearInterval(refreshTimer))
             <label class="wide">计划说明<textarea v-model="planContent" rows="3" maxlength="2000" placeholder="说明这项操作的目标和预期结果" required/></label>
             <label>目标 Agent<select v-model="planAgentId" required><option value="" disabled>选择在线 Agent</option><option v-for="agent in taskAgents" :key="agent.id" :value="agent.id">{{agent.name}} · {{eligibility(agent)}}</option></select></label>
             <label>操作<select v-model="operation"><option v-for="item in operations" :key="item.value" :value="item.value">{{item.label}} · {{riskLabel(item.risk)}}</option></select></label>
+            <label v-if="requiresTeamApproval">审批团队<select v-model="selectedTeamId" required><option value="" disabled>{{teams.length?'选择审批团队':'尚未加入团队'}}</option><option v-for="team in teams" :key="team.id" :value="team.id">{{team.name}} · {{team.role}}</option></select></label>
             <div class="plan-operation wide"><ShieldAlert/><span>需要{{permissionLabel(currentOperation.permission)}}权限 · {{riskLabel(currentOperation.risk)}}</span></div>
             <template v-if="operation==='shell.exec'">
               <label class="wide">Shell 命令<textarea v-model="shellForm.command" rows="4" maxlength="32768" spellcheck="false" required/></label>

@@ -6,7 +6,9 @@ param(
     [string]$PostgresExecutable = 'D:\PostgreSQL\18\bin\psql.exe',
     [ValidateSet('windows', 'wsl')][string]$AgentPlatform = 'windows',
     [string]$WslDistribution = 'Ubuntu-24.04',
-    [string]$LinuxAgentExecutable = '/mnt/d/projects/sculkcatalystv3/agent/target/x86_64-unknown-linux-musl/release/sculk-agent'
+    [string]$LinuxAgentExecutable = '/mnt/d/projects/sculkcatalystv3/agent/target/x86_64-unknown-linux-musl/release/sculk-agent',
+    [string]$ApprovalTeamId,
+    [string]$ApproverToken
 )
 
 $ErrorActionPreference = 'Stop'
@@ -121,6 +123,23 @@ function Wait-TerminalSession {
     throw "Terminal $SessionId did not reach $($Statuses -join ',') with output '$OutputPattern'."
 }
 
+function Approve-LinkedResource {
+    param(
+        [Parameter(Mandatory)][string]$ApprovalId,
+        [Parameter(Mandatory)][string]$ResourceId,
+        [Parameter(Mandatory)][string]$ResourceField
+    )
+    if ([string]::IsNullOrWhiteSpace($ApprovalTeamId) -or [string]::IsNullOrWhiteSpace($ApproverToken)) {
+        throw 'High-risk conversation and terminal tests require -ApprovalTeamId and an independent -ApproverToken.'
+    }
+    $approval = Invoke-CloudApi -Method POST -Path "/api/cloud/approvals/$ApprovalId/decision" `
+        -Token $ApproverToken -Body @{ decision = 'approved'; comment = 'Terminal E2E independent approval' }
+    $linkedId = [string]$approval.PSObject.Properties[$ResourceField].Value
+    if ($approval.status -ne 'approved' -or $linkedId -ne $ResourceId) {
+        throw "Approval $ApprovalId did not approve $ResourceField $ResourceId."
+    }
+}
+
 function Remove-TestAccount {
     $envFile = Join-Path $root '.env'
     foreach ($line in Get-Content -LiteralPath $envFile) {
@@ -135,32 +154,67 @@ function Remove-TestAccount {
     $safeEmail = $email.Replace("'", "''")
     $cleanupSql = @"
 BEGIN;
+CREATE TEMP TABLE cleanup_terminal_session_ids ON COMMIT DROP AS
+SELECT id FROM cloud_terminal_sessions
+WHERE user_id IN (SELECT id FROM cloud_users WHERE email = '$safeEmail');
 DELETE FROM cloud_terminal_events WHERE session_id IN (
-    SELECT id FROM cloud_terminal_sessions
-    WHERE user_id IN (SELECT id FROM cloud_users WHERE email = '$safeEmail')
+    SELECT id FROM cleanup_terminal_session_ids
 );
 DELETE FROM cloud_terminal_commands WHERE session_id IN (
-    SELECT id FROM cloud_terminal_sessions
-    WHERE user_id IN (SELECT id FROM cloud_users WHERE email = '$safeEmail')
+    SELECT id FROM cleanup_terminal_session_ids
 );
 DELETE FROM cloud_terminal_sessions
-WHERE user_id IN (SELECT id FROM cloud_users WHERE email = '$safeEmail');
+WHERE id IN (SELECT id FROM cleanup_terminal_session_ids);
 DELETE FROM cloud_conversation_messages WHERE conversation_id IN (
     SELECT id FROM cloud_conversations
     WHERE user_id IN (SELECT id FROM cloud_users WHERE email = '$safeEmail')
 );
 DELETE FROM cloud_conversations
 WHERE user_id IN (SELECT id FROM cloud_users WHERE email = '$safeEmail');
+CREATE TEMP TABLE cleanup_agent_task_ids ON COMMIT DROP AS
+SELECT id FROM cloud_agent_tasks
+WHERE user_id IN (SELECT id FROM cloud_users WHERE email = '$safeEmail');
 DELETE FROM cloud_agent_task_events WHERE task_id IN (
-    SELECT id FROM cloud_agent_tasks
-    WHERE user_id IN (SELECT id FROM cloud_users WHERE email = '$safeEmail')
+    SELECT id FROM cleanup_agent_task_ids
 );
 DELETE FROM cloud_agent_task_checkpoints WHERE task_id IN (
-    SELECT id FROM cloud_agent_tasks
-    WHERE user_id IN (SELECT id FROM cloud_users WHERE email = '$safeEmail')
+    SELECT id FROM cleanup_agent_task_ids
 );
-DELETE FROM cloud_agent_tasks
-WHERE user_id IN (SELECT id FROM cloud_users WHERE email = '$safeEmail');
+DO `$cleanup$`
+DECLARE
+    deleted_count INTEGER;
+BEGIN
+    LOOP
+        DELETE FROM cloud_agent_tasks AS task
+        WHERE task.id IN (SELECT id FROM cleanup_agent_task_ids)
+          AND NOT EXISTS (
+              SELECT 1
+              FROM cloud_agent_tasks AS child
+              WHERE child.id <> task.id
+                AND (
+                    child.source_task_id = task.id
+                    OR child.lineage_id = task.id
+                    OR child.retry_of_task_id = task.id
+                    OR child.rollback_source_task_id = task.id
+                )
+          );
+        GET DIAGNOSTICS deleted_count = ROW_COUNT;
+        EXIT WHEN deleted_count = 0;
+    END LOOP;
+END
+`$cleanup$`;
+DELETE FROM cloud_approvals AS approval
+WHERE approval.requested_by IN (SELECT id FROM cloud_users WHERE email = '$safeEmail')
+  AND (
+      approval.agent_task_id IN (SELECT id FROM cleanup_agent_task_ids)
+      OR approval.terminal_session_id IN (SELECT id FROM cleanup_terminal_session_ids)
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM cloud_agent_tasks task WHERE task.id = approval.agent_task_id
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM cloud_terminal_sessions session WHERE session.id = approval.terminal_session_id
+  );
 DELETE FROM cloud_users WHERE email = '$safeEmail';
 COMMIT;
 "@
@@ -206,6 +260,9 @@ try {
             -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
     }
     $active = Wait-AgentOnline -AgentId $claimed.id
+    if ([string]::IsNullOrWhiteSpace($ApprovalTeamId) -or [string]::IsNullOrWhiteSpace($ApproverToken)) {
+        throw 'High-risk conversation and terminal tests require -ApprovalTeamId and an independent -ApproverToken.'
+    }
     $idleWorkingSet = $null
     $idlePrivateBytes = $null
     if ($AgentPlatform -eq 'windows') {
@@ -224,6 +281,7 @@ try {
         -Token $script:session.access_token -Body @{
             content = '执行一条经过批准的测试命令'
             agent_id = $claimed.id
+            team_id = $ApprovalTeamId
             operation = 'shell.exec'
             input = @{ command = $planCommand; timeout_seconds = 30 }
             idempotency_key = "conversation-$stamp"
@@ -232,7 +290,7 @@ try {
     if (-not $planMessage.linked_task_id) { throw 'Plan message was not directly linked to a task.' }
     $linkedTask = Invoke-CloudApi -Method GET -Path "/api/cloud/agent-tasks/$($planMessage.linked_task_id)" -Token $script:session.access_token
     if ($linkedTask.status -ne 'awaiting_approval') { throw 'Conversation task did not wait for approval.' }
-    Invoke-CloudApi -Method POST -Path "/api/cloud/agent-tasks/$($linkedTask.id)/approve" -Token $script:session.access_token | Out-Null
+    Approve-LinkedResource -ApprovalId $linkedTask.approval_id -ResourceId $linkedTask.id -ResourceField 'agent_task_id'
     $linkedTask = Wait-AgentTask -TaskId $linkedTask.id -Statuses @('succeeded')
     if ($linkedTask.output.stdout -notmatch 'conversation-task-ok') { throw 'Conversation task output is incomplete.' }
     if (-not $linkedTask.can_resume) { throw 'Conversation task did not publish a resumable checkpoint.' }
@@ -242,7 +300,7 @@ try {
             idempotency_key = "conversation-resume-$stamp"
         }
     if ($conversationRetry.status -ne 'awaiting_approval') { throw 'Conversation recovery did not require approval.' }
-    Invoke-CloudApi -Method POST -Path "/api/cloud/agent-tasks/$($conversationRetry.id)/approve" -Token $script:session.access_token | Out-Null
+    Approve-LinkedResource -ApprovalId $conversationRetry.approval_id -ResourceId $conversationRetry.id -ResourceField 'agent_task_id'
     $conversationRetry = Wait-AgentTask -TaskId $conversationRetry.id -Statuses @('succeeded')
     $conversationDetail = Invoke-CloudApi -Method GET -Path "/api/cloud/conversations/$($conversation.id)" -Token $script:session.access_token
     $retryMessage = @($conversationDetail.messages) | Where-Object { $_.linked_task_id -eq $conversationRetry.id } | Select-Object -First 1
@@ -251,13 +309,14 @@ try {
     $terminal = Invoke-CloudApi -Method POST -Path '/api/cloud/terminal-sessions' `
         -Token $script:session.access_token -Body @{
             agent_id = $claimed.id
+            team_id = $ApprovalTeamId
             title = 'E2E terminal'
             cwd = if ($AgentPlatform -eq 'windows') { $workspace } else { $linuxWorkspace }
             cols = 80
             rows = 24
-        }
+    }
     if ($terminal.status -ne 'awaiting_approval') { throw 'Terminal did not wait for approval.' }
-    $terminal = Invoke-CloudApi -Method POST -Path "/api/cloud/terminal-sessions/$($terminal.id)/approve" -Token $script:session.access_token
+    Approve-LinkedResource -ApprovalId $terminal.approval_id -ResourceId $terminal.id -ResourceField 'terminal_session_id'
     $running = Wait-TerminalSession -SessionId $terminal.id -Statuses @('running')
 
     $terminalInput = if ($AgentPlatform -eq 'windows') {
@@ -298,7 +357,7 @@ try {
 
     $cancelled = Invoke-CloudApi -Method POST -Path '/api/cloud/terminal-sessions' `
         -Token $script:session.access_token -Body @{
-            agent_id = $claimed.id; title = 'Cancel before approval'; cols = 80; rows = 24
+            agent_id = $claimed.id; team_id = $ApprovalTeamId; title = 'Cancel before approval'; cols = 80; rows = 24
         }
     $cancelled = Invoke-CloudApi -Method POST -Path "/api/cloud/terminal-sessions/$($cancelled.id)/terminate" -Token $script:session.access_token
     if ($cancelled.status -ne 'cancelled') { throw 'Unapproved terminal was not cancelled.' }

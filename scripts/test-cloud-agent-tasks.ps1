@@ -6,7 +6,9 @@ param(
     [string]$PostgresExecutable = 'D:\PostgreSQL\18\bin\psql.exe',
     [ValidateSet('windows', 'wsl')][string]$AgentPlatform = 'windows',
     [string]$WslDistribution = 'Ubuntu-24.04',
-    [string]$LinuxAgentExecutable = '/mnt/d/projects/sculkcatalystv3/agent/target/x86_64-unknown-linux-musl/release/sculk-agent'
+    [string]$LinuxAgentExecutable = '/mnt/d/projects/sculkcatalystv3/agent/target/x86_64-unknown-linux-musl/release/sculk-agent',
+    [string]$ApprovalTeamId,
+    [string]$ApproverToken
 )
 
 $ErrorActionPreference = 'Stop'
@@ -74,6 +76,23 @@ function Wait-AgentTask {
     throw "Task $TaskId remained ${foundStatus} instead of reaching $($Statuses -join ',')"
 }
 
+function Approve-AgentTask {
+    param(
+        [Parameter(Mandatory)]$Task
+    )
+    if ([string]::IsNullOrWhiteSpace($ApprovalTeamId) -or [string]::IsNullOrWhiteSpace($ApproverToken)) {
+        throw 'High-risk Agent task tests require -ApprovalTeamId and an independent -ApproverToken.'
+    }
+    if (-not $Task.approval_id) {
+        throw "Task $($Task.id) did not expose a linked approval."
+    }
+    $approval = Invoke-CloudApi -Method POST -Path "/api/cloud/approvals/$($Task.approval_id)/decision" `
+        -Token $ApproverToken -Body @{ decision = 'approved'; comment = 'Agent E2E independent approval' }
+    if ($approval.status -ne 'approved' -or $approval.agent_task_id -ne $Task.id) {
+        throw "Approval $($Task.approval_id) did not approve task $($Task.id)."
+    }
+}
+
 function Wait-WorkspacePath {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -129,18 +148,44 @@ function Remove-TestAccount {
     $safeEmail = $email.Replace("'", "''")
     $cleanupSql = @"
 BEGIN;
-DELETE FROM cloud_agent_task_events
-WHERE task_id IN (
-    SELECT id FROM cloud_agent_tasks
-    WHERE user_id IN (SELECT id FROM cloud_users WHERE email = '$safeEmail')
-);
-DELETE FROM cloud_agent_task_checkpoints
-WHERE task_id IN (
-    SELECT id FROM cloud_agent_tasks
-    WHERE user_id IN (SELECT id FROM cloud_users WHERE email = '$safeEmail')
-);
-DELETE FROM cloud_agent_tasks
+CREATE TEMP TABLE cleanup_agent_task_ids ON COMMIT DROP AS
+SELECT id FROM cloud_agent_tasks
 WHERE user_id IN (SELECT id FROM cloud_users WHERE email = '$safeEmail');
+DELETE FROM cloud_conversation_messages
+WHERE linked_task_id IN (SELECT id FROM cleanup_agent_task_ids);
+DELETE FROM cloud_agent_task_events
+WHERE task_id IN (SELECT id FROM cleanup_agent_task_ids);
+DELETE FROM cloud_agent_task_checkpoints
+WHERE task_id IN (SELECT id FROM cleanup_agent_task_ids);
+DO `$cleanup$`
+DECLARE
+    deleted_count INTEGER;
+BEGIN
+    LOOP
+        DELETE FROM cloud_agent_tasks AS task
+        WHERE task.id IN (SELECT id FROM cleanup_agent_task_ids)
+          AND NOT EXISTS (
+              SELECT 1
+              FROM cloud_agent_tasks AS child
+              WHERE child.id <> task.id
+                AND (
+                    child.source_task_id = task.id
+                    OR child.lineage_id = task.id
+                    OR child.retry_of_task_id = task.id
+                    OR child.rollback_source_task_id = task.id
+                )
+          );
+        GET DIAGNOSTICS deleted_count = ROW_COUNT;
+        EXIT WHEN deleted_count = 0;
+    END LOOP;
+END
+`$cleanup$`;
+DELETE FROM cloud_approvals AS approval
+WHERE approval.requested_by IN (SELECT id FROM cloud_users WHERE email = '$safeEmail')
+  AND approval.agent_task_id IN (SELECT id FROM cleanup_agent_task_ids)
+  AND NOT EXISTS (
+      SELECT 1 FROM cloud_agent_tasks task WHERE task.id = approval.agent_task_id
+  );
 DELETE FROM cloud_users WHERE email = '$safeEmail';
 COMMIT;
 "@
@@ -235,6 +280,9 @@ try {
     if ($inspect.output.workspace_label -ne 'e2e') {
         throw 'host.inspect output is incomplete.'
     }
+    if ([string]::IsNullOrWhiteSpace($ApprovalTeamId) -or [string]::IsNullOrWhiteSpace($ApproverToken)) {
+        throw 'High-risk Agent task tests require -ApprovalTeamId and an independent -ApproverToken.'
+    }
 
     $shellCommand = if ($AgentPlatform -eq 'windows') { @'
 New-Item -ItemType Directory -Force -Path 'server' | Out-Null; [IO.File]::WriteAllText((Join-Path (Get-Location) 'server\server.properties'), "motd=Before`nmax-players=20`n"); [IO.File]::AppendAllText((Join-Path (Get-Location) 'checkpoint-marker.txt'), "once`n"); Write-Output 'shell-ok'
@@ -245,6 +293,7 @@ mkdir -p server && printf 'motd=Before\nmax-players=20\n' > server/server.proper
     }
     $shell = Invoke-CloudApi -Method POST -Path '/api/cloud/agent-tasks' -Token $script:session.access_token -Body @{
         agent_id = $claimed.id
+        team_id = $ApprovalTeamId
         operation = 'shell.exec'
         input = @{ command = $shellCommand; timeout_seconds = 60 }
         idempotency_key = "shell-$stamp"
@@ -252,7 +301,7 @@ mkdir -p server && printf 'motd=Before\nmax-players=20\n' > server/server.proper
     if ($shell.status -ne 'awaiting_approval') {
         throw 'Shell task did not require approval.'
     }
-    Invoke-CloudApi -Method POST -Path "/api/cloud/agent-tasks/$($shell.id)/approve" -Token $script:session.access_token | Out-Null
+    Approve-AgentTask -Task $shell
     $shell = Wait-AgentTask -TaskId $shell.id -Statuses @('succeeded')
     if ($shell.output.stdout -notmatch 'shell-ok') {
         throw 'Shell stdout was not captured.'
@@ -278,7 +327,7 @@ mkdir -p server && printf 'motd=Before\nmax-players=20\n' > server/server.proper
     if ($resumed.status -ne 'awaiting_approval' -or $resumed.execution_mode -ne 'resume') {
         throw 'Checkpoint recovery did not create a new approval-gated resume attempt.'
     }
-    Invoke-CloudApi -Method POST -Path "/api/cloud/agent-tasks/$($resumed.id)/approve" -Token $script:session.access_token | Out-Null
+    Approve-AgentTask -Task $resumed
     $resumed = Wait-AgentTask -TaskId $resumed.id -Statuses @('succeeded')
     $markerLines = @(Get-Content -LiteralPath $markerPath)
     if ($markerLines.Count -ne 1) {
@@ -297,7 +346,7 @@ mkdir -p server && printf 'motd=Before\nmax-players=20\n' > server/server.proper
     if ($restarted.status -ne 'awaiting_approval' -or $restarted.execution_mode -ne 'restart') {
         throw 'Restart did not create a new approval-gated attempt.'
     }
-    Invoke-CloudApi -Method POST -Path "/api/cloud/agent-tasks/$($restarted.id)/approve" -Token $script:session.access_token | Out-Null
+    Approve-AgentTask -Task $restarted
     $restarted = Wait-AgentTask -TaskId $restarted.id -Statuses @('succeeded')
     $markerLines = @(Get-Content -LiteralPath $markerPath)
     if ($markerLines.Count -ne 2) {
@@ -318,11 +367,12 @@ sleep 60 & child=$!; printf '%s' "$child" > cancel-child.pid; wait "$child"; pri
     }
     $cancelled = Invoke-CloudApi -Method POST -Path '/api/cloud/agent-tasks' -Token $script:session.access_token -Body @{
         agent_id = $claimed.id
+        team_id = $ApprovalTeamId
         operation = 'shell.exec'
         input = @{ command = $cancelCommand; timeout_seconds = 90 }
         idempotency_key = "cancel-$stamp"
     }
-    Invoke-CloudApi -Method POST -Path "/api/cloud/agent-tasks/$($cancelled.id)/approve" -Token $script:session.access_token | Out-Null
+    Approve-AgentTask -Task $cancelled
     $cancelled = Wait-AgentTask -TaskId $cancelled.id -Statuses @('running')
     Wait-WorkspacePath -Path $cancelPidPath
     $cancelChildPid = [int]((Get-Content -LiteralPath $cancelPidPath -Raw).Trim())
@@ -347,6 +397,7 @@ sleep 60 & child=$!; printf '%s' "$child" > cancel-child.pid; wait "$child"; pri
 
     $update = Invoke-CloudApi -Method POST -Path '/api/cloud/agent-tasks' -Token $script:session.access_token -Body @{
         agent_id = $claimed.id
+        team_id = $ApprovalTeamId
         operation = 'server.properties.update'
         input = @{
             path = 'server/server.properties'
@@ -354,7 +405,7 @@ sleep 60 & child=$!; printf '%s' "$child" > cancel-child.pid; wait "$child"; pri
         }
         idempotency_key = "update-$stamp"
     }
-    Invoke-CloudApi -Method POST -Path "/api/cloud/agent-tasks/$($update.id)/approve" -Token $script:session.access_token | Out-Null
+    Approve-AgentTask -Task $update
     $update = Wait-AgentTask -TaskId $update.id -Statuses @('succeeded')
     if (-not $update.rollback_available) {
         throw 'Structured update did not expose rollback.'
@@ -368,7 +419,7 @@ sleep 60 & child=$!; printf '%s' "$child" > cancel-child.pid; wait "$child"; pri
     if ($rollback.status -ne 'awaiting_approval') {
         throw 'Rollback task did not require approval.'
     }
-    Invoke-CloudApi -Method POST -Path "/api/cloud/agent-tasks/$($rollback.id)/approve" -Token $script:session.access_token | Out-Null
+    Approve-AgentTask -Task $rollback
     $rollback = Wait-AgentTask -TaskId $rollback.id -Statuses @('succeeded')
     $restoredText = Get-Content -LiteralPath $propertiesPath -Raw
     if ($restoredText -notmatch 'motd=Before' -or $restoredText -notmatch 'max-players=20') {
@@ -377,6 +428,7 @@ sleep 60 & child=$!; printf '%s' "$child" > cancel-child.pid; wait "$child"; pri
 
     $failed = Invoke-CloudApi -Method POST -Path '/api/cloud/agent-tasks' -Token $script:session.access_token -Body @{
         agent_id = $claimed.id
+        team_id = $ApprovalTeamId
         operation = 'shell.exec'
         input = @{
             command = if ($AgentPlatform -eq 'windows') { "Write-Error 'expected-failure'; exit 7" } else { "printf 'expected-failure\n' >&2; exit 7" }
@@ -384,7 +436,7 @@ sleep 60 & child=$!; printf '%s' "$child" > cancel-child.pid; wait "$child"; pri
         }
         idempotency_key = "failed-$stamp"
     }
-    Invoke-CloudApi -Method POST -Path "/api/cloud/agent-tasks/$($failed.id)/approve" -Token $script:session.access_token | Out-Null
+    Approve-AgentTask -Task $failed
     $failed = Wait-AgentTask -TaskId $failed.id -Statuses @('failed')
     if ($failed.error -notmatch '7') {
         throw 'Failed Shell task did not preserve the exit status.'

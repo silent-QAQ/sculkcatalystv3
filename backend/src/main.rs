@@ -18,12 +18,13 @@ mod task_executor;
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{
-        Path, Query, State,
+        DefaultBodyLimit, Multipart, Path, Query, State,
         rejection::JsonRejection,
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderValue, Method, StatusCode},
+    http::{HeaderValue, Method, StatusCode, header},
     response::Response,
     routing::{delete, get, post},
 };
@@ -70,6 +71,7 @@ struct AppState {
 struct ManagedProcess {
     generation: Uuid,
     pid: u32,
+    guard: Arc<process_platform::ProcessGuard>,
     control: mpsc::Sender<ProcessCommand>,
     exit: watch::Receiver<Option<ProcessExit>>,
 }
@@ -103,7 +105,8 @@ pub(crate) struct ServerInfo {
     version: String,
     pub(crate) status: String,
     players: String,
-    memory: u8,
+    /// Resident set size in MiB while the process is running.
+    memory: u64,
     #[serde(default = "default_memory_gb")]
     memory_gb: u8,
     cpu: u8,
@@ -578,8 +581,15 @@ struct DeletedFileResponse {
     path: String,
     kind: String,
 }
+#[derive(Debug, Serialize)]
+struct FileTransferResponse {
+    path: String,
+    size: u64,
+}
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
+
+const MAX_FILE_TRANSFER_BYTES: usize = 256 * 1024 * 1024;
 
 #[tokio::main]
 async fn main() {
@@ -669,6 +679,11 @@ async fn main() {
             "/api/servers/{id}/file",
             get(read_file).put(write_file).delete(delete_file),
         )
+        .route(
+            "/api/servers/{id}/file/upload",
+            post(upload_file).layer(DefaultBodyLimit::max(MAX_FILE_TRANSFER_BYTES + 1024 * 1024)),
+        )
+        .route("/api/servers/{id}/file/download", get(download_file))
         .route("/api/servers/{id}/file/rename", post(rename_file))
         .route("/api/servers/{id}/directory", post(create_directory))
         .route("/api/download/mirrors", get(get_mirrors))
@@ -1813,6 +1828,12 @@ async fn start_server(state: AppState, id: String) -> ApiResult<ActionResponse> 
             format!("无法配置 Java 进程隔离：{error}"),
         )
     })?;
+    let process_guard = process_platform::create_process_guard().map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("无法创建 Java 进程托管对象：{error}"),
+        )
+    })?;
     let mut child = command.spawn().map_err(|error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1825,11 +1846,18 @@ async fn start_server(state: AppState, id: String) -> ApiResult<ActionResponse> 
             "Java 进程未返回 PID".into(),
         )
     })?;
+    if let Err(error) = process_platform::bind_process_to_guard(&process_guard, pid) {
+        terminate_untracked_child_with_guard(&mut child, pid, Some(&process_guard)).await;
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("无法将 Java 进程绑定到托管对象，启动已取消：{error}"),
+        ));
+    }
     let (stdin, stdout, stderr) =
         match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
             (Some(stdin), Some(stdout), Some(stderr)) => (stdin, stdout, stderr),
             _ => {
-                terminate_untracked_child(&mut child).await;
+                terminate_untracked_child_with_guard(&mut child, pid, Some(&process_guard)).await;
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "无法连接 Java 进程的标准输入输出，已终止该进程".into(),
@@ -1842,6 +1870,7 @@ async fn start_server(state: AppState, id: String) -> ApiResult<ActionResponse> 
     let managed = ManagedProcess {
         generation,
         pid,
+        guard: Arc::new(process_guard),
         control,
         exit,
     };
@@ -1858,7 +1887,7 @@ async fn start_server(state: AppState, id: String) -> ApiResult<ActionResponse> 
     let updated = match update_server_starting(&state, &id, generation, pid, &line).await {
         Ok(server) => server,
         Err(error) => {
-            terminate_untracked_child(&mut child).await;
+            terminate_untracked_child_with_guard(&mut child, pid, Some(&managed.guard)).await;
             reset_failed_start(&state, &id, generation).await;
             return Err(internal(error));
         }
@@ -1945,9 +1974,13 @@ async fn record_server_operation_error(state: &AppState, id: &str, error: &str) 
     }
 }
 
-async fn terminate_untracked_child(child: &mut Child) {
-    if let Some(pid) = child.id() {
-        let _ = process_platform::start_kill_tree(child, pid);
+async fn terminate_untracked_child_with_guard(
+    child: &mut Child,
+    pid: u32,
+    guard: Option<&process_platform::ProcessGuard>,
+) {
+    if child.id().is_some() {
+        let _ = process_platform::start_kill_tree(child, pid, guard);
     } else {
         let _ = child.start_kill();
     }
@@ -2163,6 +2196,8 @@ async fn run_process_actor(
     let mut forced = false;
     let mut startup_timed_out = false;
     let started = Instant::now();
+    let mut system = sysinfo::System::new();
+    let mut last_metrics_at = Instant::now() - Duration::from_secs(1);
     let mut poll = tokio::time::interval(Duration::from_millis(100));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut exit_status = None;
@@ -2212,14 +2247,14 @@ async fn run_process_actor(
                     requested_stop = true;
                     forced = true;
                     startup_timed_out |= startup_timeout;
-                    let result = process_platform::start_kill_tree(&mut child, managed.pid)
+                    let result = process_platform::start_kill_tree(&mut child, managed.pid, Some(&managed.guard))
                         .map_err(|error| error.to_string());
                     let _ = reply.send(result);
                 }
                 None => {
                     requested_stop = true;
                     forced = true;
-                    let _ = process_platform::start_kill_tree(&mut child, managed.pid);
+                    let _ = process_platform::start_kill_tree(&mut child, managed.pid, Some(&managed.guard));
                 }
             },
             _ = poll.tick(), if exit_status.is_none() => {
@@ -2229,6 +2264,20 @@ async fn run_process_actor(
                         exit_status = Some(status);
                     }
                     Ok(None) => {
+                        if last_metrics_at.elapsed() >= Duration::from_secs(1) {
+                            last_metrics_at = Instant::now();
+                            if let Some(metrics) =
+                                runtime::sample_process_metrics(&mut system, managed.pid)
+                            {
+                                record_process_metrics(
+                                    &state,
+                                    &id,
+                                    managed.generation,
+                                    metrics,
+                                )
+                                .await;
+                            }
+                        }
                         if !ready && !requested_stop && started.elapsed() >= Duration::from_secs(120) {
                             requested_stop = true;
                             forced = true;
@@ -2240,14 +2289,14 @@ async fn run_process_actor(
                                 "[启动超时] 120 秒内未检测到服务端就绪标记，正在终止进程。",
                                 false,
                             ).await;
-                            let _ = process_platform::start_kill_tree(&mut child, managed.pid);
+                            let _ = process_platform::start_kill_tree(&mut child, managed.pid, Some(&managed.guard));
                         }
                     }
                     Err(error) => {
                         requested_stop = true;
                         forced = true;
                         record_process_line(&state, &id, managed.generation, &format!("[进程状态检查失败] {error}"), false).await;
-                        let _ = process_platform::start_kill_tree(&mut child, managed.pid);
+                        let _ = process_platform::start_kill_tree(&mut child, managed.pid, Some(&managed.guard));
                     }
                 }
             },
@@ -2335,6 +2384,37 @@ async fn record_process_line(
         server.task = "运行中".into();
         server.operation_state = "idle".into();
         server.last_error = None;
+    }
+    let _ = persist(state, &data).await;
+}
+
+fn apply_process_metrics(
+    server: &mut ServerInfo,
+    id: &str,
+    generation: Uuid,
+    metrics: runtime::ProcessMetrics,
+) -> bool {
+    if server.id != id || server.runtime_generation != Some(generation) {
+        return false;
+    }
+    server.cpu = metrics.cpu;
+    server.memory = metrics.memory;
+    true
+}
+
+async fn record_process_metrics(
+    state: &AppState,
+    id: &str,
+    generation: Uuid,
+    metrics: runtime::ProcessMetrics,
+) {
+    let mut data = state.inner.write().await;
+    if !data
+        .servers
+        .iter_mut()
+        .any(|server| apply_process_metrics(server, id, generation, metrics))
+    {
+        return;
     }
     let _ = persist(state, &data).await;
 }
@@ -2688,6 +2768,185 @@ async fn read_file(
         readonly: !is_editable(&relative),
     }))
 }
+
+async fn download_file(
+    Path(id): Path<String>,
+    Query(query): Query<FileQuery>,
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, String)> {
+    let requested = query
+        .path
+        .ok_or((StatusCode::BAD_REQUEST, "file path is required".into()))?;
+    let root = ensure_workspace(&state, &id).await?;
+    let relative = safe_relative(&requested)?;
+    if relative.as_os_str().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "file path is required".into()));
+    }
+    let target = resolve_existing(&root, &relative).await?;
+    let metadata = fs::metadata(&target)
+        .await
+        .map_err(|error| (StatusCode::NOT_FOUND, error.to_string()))?;
+    if !metadata.is_file() {
+        return Err((StatusCode::BAD_REQUEST, "path is not a file".into()));
+    }
+    if metadata.len() > MAX_FILE_TRANSFER_BYTES as u64 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "file exceeds the {} MiB transfer limit",
+                MAX_FILE_TRANSFER_BYTES / 1024 / 1024
+            ),
+        ));
+    }
+    let bytes = fs::read(&target)
+        .await
+        .map_err(|error| internal(error.to_string()))?;
+    if bytes.len() > MAX_FILE_TRANSFER_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "file changed while it was being downloaded".into(),
+        ));
+    }
+    let filename = safe_download_filename(&relative);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, bytes.len().to_string())
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(Body::from(bytes))
+        .map_err(|error| internal(error.to_string()))
+}
+
+async fn upload_file(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> ApiResult<FileTransferResponse> {
+    let mut directory = None;
+    let mut filename = None;
+    let mut content = None;
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid multipart body: {error}"),
+        )
+    })? {
+        let field_name = field.name().map(str::to_owned);
+        match field_name.as_deref() {
+            Some("path") => {
+                if directory.is_some() {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "path field appears more than once".into(),
+                    ));
+                }
+                let value = field.text().await.map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid upload path: {error}"),
+                    )
+                })?;
+                directory = Some(value);
+            }
+            Some("file") => {
+                if content.is_some() {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "file field appears more than once".into(),
+                    ));
+                }
+                let name = field.file_name().map(str::to_owned).ok_or((
+                    StatusCode::BAD_REQUEST,
+                    "uploaded file name is required".into(),
+                ))?;
+                validate_upload_filename(&name)?;
+                let bytes = field.bytes().await.map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("unable to read upload: {error}"),
+                    )
+                })?;
+                if bytes.len() > MAX_FILE_TRANSFER_BYTES {
+                    return Err((
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        format!(
+                            "file exceeds the {} MiB transfer limit",
+                            MAX_FILE_TRANSFER_BYTES / 1024 / 1024
+                        ),
+                    ));
+                }
+                filename = Some(name);
+                content = Some(bytes);
+            }
+            Some(other) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("unsupported multipart field: {other}"),
+                ));
+            }
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "multipart field name is required".into(),
+                ));
+            }
+        }
+    }
+
+    let directory = safe_relative(directory.as_deref().unwrap_or(""))?;
+    let filename = filename.ok_or((StatusCode::BAD_REQUEST, "file field is required".into()))?;
+    let content = content.ok_or((StatusCode::BAD_REQUEST, "file field is required".into()))?;
+    let root = ensure_workspace(&state, &id).await?;
+    let directory_target = resolve_existing(&root, &directory).await?;
+    if !fs::metadata(&directory_target)
+        .await
+        .map_err(|error| (StatusCode::NOT_FOUND, error.to_string()))?
+        .is_dir()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "upload path is not a directory".into(),
+        ));
+    }
+    let relative = directory.join(&filename);
+    reject_protected_server_artifact(&relative)?;
+
+    let operation = server_operation_lock(&state, &format!("files:{id}")).await;
+    let _guard = operation.lock().await;
+    let target = resolve_for_write(&root, &relative).await?;
+    if fs::try_exists(&target)
+        .await
+        .map_err(|error| internal(error.to_string()))?
+    {
+        return Err((StatusCode::CONFLICT, "target path already exists".into()));
+    }
+
+    let parent = target
+        .parent()
+        .ok_or((StatusCode::BAD_REQUEST, "invalid upload path".into()))?;
+    let temporary = parent.join(format!(".sculk-upload-{}.part", Uuid::new_v4()));
+    if let Err(error) = fs::write(&temporary, &content).await {
+        let _ = fs::remove_file(&temporary).await;
+        return Err(internal(error.to_string()));
+    }
+    if let Err(error) = fs::rename(&temporary, &target).await {
+        let _ = fs::remove_file(&temporary).await;
+        return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+            (StatusCode::CONFLICT, "target path already exists".into())
+        } else {
+            internal(error.to_string())
+        });
+    }
+
+    Ok(Json(FileTransferResponse {
+        path: path_string(&relative),
+        size: content.len() as u64,
+    }))
+}
+
 async fn write_file(
     Path(id): Path<String>,
     State(state): State<AppState>,
@@ -2701,12 +2960,15 @@ async fn write_file(
     }
     let root = ensure_workspace(&state, &id).await?;
     let relative = safe_relative(&request.path)?;
+    reject_protected_server_artifact(&relative)?;
     if !is_editable(&relative) {
         return Err((
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "this file type is read-only".into(),
         ));
     }
+    let operation = server_operation_lock(&state, &format!("files:{id}")).await;
+    let _guard = operation.lock().await;
     let target = resolve_for_write(&root, &relative).await?;
     fs::write(&target, request.content.as_bytes())
         .await
@@ -2750,6 +3012,8 @@ async fn rename_file(
             "a directory cannot be moved inside itself".into(),
         ));
     }
+    reject_protected_server_artifact(&relative)?;
+    reject_protected_server_artifact(&new_relative)?;
 
     let operation = server_operation_lock(&state, &format!("files:{id}")).await;
     let _guard = operation.lock().await;
@@ -2826,6 +3090,7 @@ async fn delete_file(
             "workspace root cannot be deleted".into(),
         ));
     }
+    reject_protected_server_artifact(&relative)?;
 
     let operation = server_operation_lock(&state, &format!("files:{id}")).await;
     let _guard = operation.lock().await;
@@ -2873,6 +3138,29 @@ async fn delete_file(
 
 fn is_root_server_properties(path: &StdPath) -> bool {
     path == StdPath::new("server.properties")
+}
+
+fn is_protected_server_artifact(path: &StdPath) -> bool {
+    path.components().count() == 1
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "server.jar" | "server.jar.part" | "server.jar.backup"
+                )
+            })
+}
+
+fn reject_protected_server_artifact(path: &StdPath) -> Result<(), (StatusCode, String)> {
+    if is_protected_server_artifact(path) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "server core artifacts cannot be overwritten, renamed, or deleted".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn sync_config_after_rename(
@@ -3001,6 +3289,16 @@ pub(crate) async fn ensure_provision_workspace(state: &AppState, id: &str) -> Re
         .map_err(|error| error.to_string())
 }
 fn safe_relative(value: &str) -> Result<PathBuf, (StatusCode, String)> {
+    if value.len() > 1024
+        || value.chars().any(char::is_control)
+        || value.contains('\\')
+        || value.split('/').any(is_unsafe_windows_component)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "path is too long or contains unsafe characters".into(),
+        ));
+    }
     let mut result = PathBuf::new();
     for component in std::path::Path::new(value).components() {
         match component {
@@ -3016,6 +3314,71 @@ fn safe_relative(value: &str) -> Result<PathBuf, (StatusCode, String)> {
     }
     Ok(result)
 }
+
+fn validate_upload_filename(value: &str) -> Result<(), (StatusCode, String)> {
+    if value.is_empty()
+        || value.len() > 255
+        || value.chars().any(char::is_control)
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || is_unsafe_windows_component(value)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "uploaded file name must be a single safe path component".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_unsafe_windows_component(component: &str) -> bool {
+    if component.is_empty() || component == "." || component == ".." {
+        return false;
+    }
+    if component.contains(':')
+        || component
+            .as_bytes()
+            .last()
+            .is_some_and(|byte| matches!(byte, b'.' | b' '))
+    {
+        return true;
+    }
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(stem.as_str(), "con" | "prn" | "aux" | "nul")
+        || (stem.len() == 4
+            && (stem.starts_with("com") || stem.starts_with("lpt"))
+            && stem.as_bytes()[3].is_ascii_digit()
+            && stem.as_bytes()[3] != b'0')
+}
+
+fn safe_download_filename(path: &StdPath) -> String {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download");
+    let sanitized: String = filename
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "download".into()
+    } else {
+        sanitized
+    }
+}
+
 async fn resolve_existing(
     root: &PathBuf,
     relative: &PathBuf,
@@ -4198,6 +4561,126 @@ mod tests {
         fs::remove_dir_all(state_directory).await.unwrap();
     }
 
+    #[test]
+    fn core_artifacts_are_protected_at_the_workspace_root() {
+        for name in ["server.jar", "server.jar.part", "server.jar.backup"] {
+            let path = PathBuf::from(name);
+            assert!(is_protected_server_artifact(&path));
+            assert_eq!(
+                reject_protected_server_artifact(&path).unwrap_err().0,
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert!(!is_protected_server_artifact(StdPath::new(
+            "plugins/server.jar"
+        )));
+        assert!(reject_protected_server_artifact(StdPath::new("server.properties")).is_ok());
+    }
+
+    #[test]
+    fn upload_names_and_download_headers_are_sanitized() {
+        assert!(validate_upload_filename("backup.zip").is_ok());
+        for name in ["", ".", "..", "a/b", "a\\b", "line\nfeed"] {
+            assert!(validate_upload_filename(name).is_err(), "accepted {name:?}");
+        }
+        assert_eq!(
+            safe_download_filename(StdPath::new("logs/latest.log")),
+            "latest.log"
+        );
+        assert_eq!(
+            safe_download_filename(StdPath::new("备份 文件.zip")),
+            "_____.zip"
+        );
+    }
+
+    #[test]
+    fn process_metrics_are_applied_only_to_the_current_generation() {
+        let generation = Uuid::new_v4();
+        let mut server = test_server("metrics", "online", "running");
+        server.runtime_generation = Some(generation);
+        assert!(apply_process_metrics(
+            &mut server,
+            "metrics",
+            generation,
+            runtime::ProcessMetrics {
+                cpu: 42,
+                memory: 1536,
+            },
+        ));
+        assert_eq!(server.cpu, 42);
+        assert_eq!(server.memory, 1536);
+        assert!(!apply_process_metrics(
+            &mut server,
+            "metrics",
+            Uuid::new_v4(),
+            runtime::ProcessMetrics { cpu: 1, memory: 1 },
+        ));
+        assert_eq!(server.cpu, 42);
+        assert_eq!(server.memory, 1536);
+    }
+
+    #[tokio::test]
+    async fn upload_file_is_bounded_and_never_overwrites_existing_entries() {
+        use axum::extract::FromRequest;
+
+        let id = format!("server-upload-{}", Uuid::new_v4().simple());
+        let (state, state_directory) = test_state_with_workspace(&id, "server").await;
+        let root = runtime::server_directory(&id);
+        fs::create_dir_all(root.join("logs")).await.unwrap();
+        let boundary = "sculk-test-boundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\nlogs\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"upload.txt\"\r\nContent-Type: text/plain\r\n\r\nhello\r\n--{boundary}--\r\n"
+        );
+        let request = axum::http::Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let multipart = Multipart::from_request(request, &()).await.unwrap();
+        let uploaded = upload_file(Path(id.clone()), State(state.clone()), multipart)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(uploaded.path, "logs/upload.txt");
+        assert_eq!(uploaded.size, 5);
+        assert_eq!(
+            fs::read_to_string(root.join("logs/upload.txt"))
+                .await
+                .unwrap(),
+            "hello"
+        );
+
+        let conflict_body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\nlogs\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"upload.txt\"\r\n\r\nchanged\r\n--{boundary}--\r\n"
+        );
+        let conflict_request = axum::http::Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(conflict_body))
+            .unwrap();
+        let conflict_multipart = Multipart::from_request(conflict_request, &())
+            .await
+            .unwrap();
+        let conflict = upload_file(Path(id.clone()), State(state.clone()), conflict_multipart)
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.0, StatusCode::CONFLICT);
+        assert_eq!(
+            fs::read_to_string(root.join("logs/upload.txt"))
+                .await
+                .unwrap(),
+            "hello"
+        );
+
+        drop(state);
+        fs::remove_dir_all(&root).await.unwrap();
+        fs::remove_dir_all(state_directory).await.unwrap();
+    }
+
     #[tokio::test]
     async fn server_properties_mutations_keep_persisted_config_in_sync() {
         let id = format!("server-files-{}", Uuid::new_v4().simple());
@@ -4740,6 +5223,7 @@ mod tests {
         let managed = ManagedProcess {
             generation,
             pid,
+            guard: Arc::new(process_platform::create_process_guard().unwrap()),
             control,
             exit,
         };

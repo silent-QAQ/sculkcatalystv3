@@ -44,7 +44,7 @@ npm run dev
 
 团队角色包括 `owner`、`admin`、`approver` 和 `member`。邀请绑定邮箱并在 7 天后过期。团队成员都可以发起审批，只有所有者、管理员和审批人可以通过或拒绝。
 
-审批记录保存请求人、风险等级、业务负载、决定人、意见与时间，适合后续接入服务器高风险操作。当前远程审批接口已经可用，但尚未自动接管本地 `automation` 任务。
+审批记录保存请求人、风险等级、业务负载、决定人、意见与时间。Cloud Agent 的 high/critical 任务与持久终端会在同一事务中创建唯一的团队审批记录，并通过 `agent_task_id` 或 `terminal_session_id` 建立关联；审批通过后才会进入可租约状态，拒绝/取消会同步关闭资源。请求人不能处理自己的审批，只有团队 `owner`、`admin` 或 `approver` 可以决定。重试和回滚会创建新的资源与新的审批，不继承旧决定；这套机制不等同于本地 JSON `automation` 任务的通用执行器。
 
 ## 主机代理
 
@@ -55,7 +55,9 @@ Sculk Agent 由 Minecraft 主机主动连接 Cloud，不要求主机拥有可入
 - 用户可以在 Cloud 控制台确认或撤销 Agent；撤销后心跳凭据立即失效。
 - 已认证的 `POST /api/cloud/agent-bootstrap` 会返回可嵌入下载包的 JSON：一次性配对码、可信 Cloud 地址、主机与工作区元数据，以及当前账号明确批准的完整 Agent 默认能力和权限。响应不包含账号密码、会话或 Agent 凭据。
 - 在线状态由 90 秒内的真实心跳推导，不由前端模拟。
-- 当前 Agent 只发送出站心跳，`commands_available` 固定为 `false`，不会执行远程文件、进程或 Shell 操作。
+- Agent 会通过出站心跳报告真实的 `commands_available` 状态，并轮询任务与终端命令租约。低风险只读任务可以直接执行；写入、Shell 和终端启动必须经过关联团队审批。`log.tail` 限制在日志目录并对常见密钥/Token 脱敏，Windows Shell 使用 Job Object，Unix Shell 使用进程组清理子进程。
+
+迁移会对旧数据采取 fail-closed 策略：没有可验证审批关联的旧高风险任务和未启动终端会话不会继续排队等待；已经运行的旧会话保留用于显式终止和租约回收。旧高风险任务若仍处于租约中，租约过期后会标记为失败而不会重新排队。新建的每次重试、回滚或终端会话都必须生成新的审批记录。
 
 独立程序的下载、命令和配置位置见 [`SCULK_AGENT.md`](SCULK_AGENT.md)。
 
@@ -90,6 +92,8 @@ Invoke-RestMethod `
 | 加密凭据 | `GET/POST /api/cloud/credentials`、`DELETE /api/cloud/credentials/{id}` |
 | 团队 | `GET/POST /api/cloud/teams`、成员、邀请、接受邀请 |
 | 审批 | `GET/POST /api/cloud/approvals`、`POST /api/cloud/approvals/{id}/decision` |
+| Agent 任务 | `GET/POST /api/cloud/agent-tasks`、`GET /api/cloud/agent-tasks/{id}`、取消、重试、回滚；Agent 端使用心跳、租约、事件、检查点和完成接口 |
+| 持久终端与对话 | `GET/POST /api/cloud/terminal-sessions`、输入、调整大小、终止、事件；`GET/POST /api/cloud/conversations` 及计划任务接口 |
 | Token 与用量 | `GET/POST /api/cloud/tokens`、`DELETE /api/cloud/tokens/{id}`、`GET /api/cloud/usage` |
 | 中转管理 | `GET/PUT /api/cloud/admin/relay-provider` |
 | OpenAI 兼容中转 | `POST /api/cloud/v1/chat/completions` |

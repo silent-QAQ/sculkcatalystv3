@@ -1148,6 +1148,8 @@ struct CreateAgentTaskRequest {
     operation: String,
     input: Value,
     idempotency_key: Option<String>,
+    #[serde(default)]
+    team_id: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -1237,6 +1239,7 @@ struct AgentTaskCheckpointMetadata {
 struct AgentTaskView {
     id: Uuid,
     agent_id: Uuid,
+    team_id: Option<Uuid>,
     operation: String,
     required_permission: String,
     risk: String,
@@ -1244,6 +1247,7 @@ struct AgentTaskView {
     status: String,
     idempotency_key: Option<String>,
     source_task_id: Option<Uuid>,
+    approval_id: Option<Uuid>,
     lineage_id: Uuid,
     attempt_no: i32,
     retry_of_task_id: Option<Uuid>,
@@ -1305,8 +1309,8 @@ struct AgentTaskResumeLeaseView {
     payload: Value,
 }
 
-const AGENT_TASK_SELECT: &str = "SELECT id, agent_id, operation, required_permission, risk, input,
-    status, idempotency_key, source_task_id, approved_by, approved_at, lease_expires_at,
+const AGENT_TASK_SELECT: &str = "SELECT id, agent_id, team_id, operation, required_permission, risk, input,
+    status, idempotency_key, source_task_id, approval_id, approved_by, approved_at, lease_expires_at,
     leased_at, started_at, completed_at, cancelled_at, output, error, artifacts,
     rollback_available, created_at, updated_at, lineage_id, attempt_no, retry_of_task_id,
     execution_mode, resume_checkpoint_id, rollback_source_task_id, cancel_requested_at,
@@ -1438,6 +1442,37 @@ fn validate_relative_task_path(value: &Value) -> CloudResult<()> {
     Ok(())
 }
 
+fn validate_log_tail_path(value: &Value) -> CloudResult<()> {
+    validate_relative_task_path(value)?;
+    let path = value
+        .as_str()
+        .expect("validate_relative_task_path validated a string");
+    let components: Vec<&str> = path.split(['/', '\\']).collect();
+    let directory = components.first().copied().unwrap_or_default();
+    if !["logs", "crash-reports"]
+        .iter()
+        .any(|allowed| directory.eq_ignore_ascii_case(allowed))
+        || components.len() < 2
+        || components.iter().any(|component| {
+            let component = component.to_ascii_lowercase();
+            component == ".env"
+                || component.starts_with(".env.")
+                || matches!(
+                    component.as_str(),
+                    "database" | "db" | "database.sql" | "db.sql"
+                )
+                || [".db", ".sqlite", ".sqlite3", ".mdb", ".sql"]
+                    .iter()
+                    .any(|suffix| component.ends_with(suffix))
+        })
+    {
+        return Err(CloudError::bad_request(
+            "log.tail must target a file under logs/ or crash-reports/",
+        ));
+    }
+    Ok(())
+}
+
 fn bounded_task_integer(
     object: &serde_json::Map<String, Value>,
     key: &str,
@@ -1511,7 +1546,7 @@ fn validate_agent_task_input(
         }
         "log.tail" => {
             require_exact_task_keys(object, &["path", "lines", "max_bytes"], &[])?;
-            validate_relative_task_path(&object["path"])?;
+            validate_log_tail_path(&object["path"])?;
             bounded_task_integer(object, "lines", 1, 1000)?;
             bounded_task_integer(object, "max_bytes", 1, 262_144)?;
         }
@@ -2313,6 +2348,7 @@ fn agent_task_view(
     AgentTaskView {
         id: row.get("id"),
         agent_id: row.get("agent_id"),
+        team_id: row.get("team_id"),
         operation: row.get("operation"),
         required_permission: row.get("required_permission"),
         risk: row.get("risk"),
@@ -2320,6 +2356,7 @@ fn agent_task_view(
         status: row.get("status"),
         idempotency_key: row.get("idempotency_key"),
         source_task_id: row.get("source_task_id"),
+        approval_id: row.get("approval_id"),
         lineage_id: row.get("lineage_id"),
         attempt_no: row.get("attempt_no"),
         retry_of_task_id: row.get("retry_of_task_id"),
@@ -2563,6 +2600,321 @@ async fn get_agent_task(
     Ok(Json(load_agent_task(&cloud, user.user_id, task_id).await?))
 }
 
+fn agent_task_team_required_error() -> CloudError {
+    CloudError::new(
+        StatusCode::BAD_REQUEST,
+        "agent_task_team_required",
+        "high-risk agent tasks require an explicit team_id when the account belongs to zero or multiple teams",
+    )
+}
+
+fn agent_task_approval_missing_error() -> CloudError {
+    CloudError::new(
+        StatusCode::CONFLICT,
+        "agent_task_approval_missing",
+        "this high-risk agent task has no linked team approval and cannot be approved; create a new task",
+    )
+}
+
+fn agent_task_approval_invalid_error() -> CloudError {
+    CloudError::new(
+        StatusCode::FORBIDDEN,
+        "agent_task_approval_invalid",
+        "the linked team approval does not have a valid independent team decision",
+    )
+}
+
+fn terminal_team_required_error() -> CloudError {
+    CloudError::new(
+        StatusCode::BAD_REQUEST,
+        "terminal_team_required",
+        "persistent terminal sessions require an explicit team_id when the account belongs to zero or multiple teams",
+    )
+}
+
+async fn resolve_approval_team(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    requested_team_id: Option<Uuid>,
+    approval_required: bool,
+    required_error: fn() -> CloudError,
+) -> CloudResult<Option<Uuid>> {
+    if requested_team_id.is_none() && !approval_required {
+        return Ok(None);
+    }
+    let memberships = sqlx::query_scalar::<_, Uuid>(
+        "SELECT team_id FROM cloud_team_members
+         WHERE user_id = $1 ORDER BY team_id FOR SHARE",
+    )
+    .bind(user_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(CloudError::database)?;
+    if let Some(team_id) = requested_team_id {
+        if memberships.contains(&team_id) {
+            return Ok(Some(team_id));
+        }
+        return Err(CloudError::new(
+            StatusCode::FORBIDDEN,
+            "team_access_denied",
+            "the requester must be a member of the selected team",
+        ));
+    }
+    if approval_required {
+        return match memberships.as_slice() {
+            [team_id] => Ok(Some(*team_id)),
+            _ => Err(required_error()),
+        };
+    }
+    Ok(None)
+}
+
+async fn create_agent_task_approval(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    team_id: Option<Uuid>,
+    task_id: Uuid,
+    agent_id: Uuid,
+    operation: &str,
+    required_permission: &str,
+    risk: &str,
+    input: &Value,
+) -> CloudResult<Option<Uuid>> {
+    let approval_risk = match risk {
+        "high" | "critical" => "high",
+        _ => return Ok(None),
+    };
+    let team_id = team_id.ok_or_else(agent_task_team_required_error)?;
+    let member = sqlx::query(
+        "SELECT role FROM cloud_team_members
+         WHERE team_id = $1 AND user_id = $2 FOR SHARE",
+    )
+    .bind(team_id)
+    .bind(user_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(CloudError::database)?;
+    if member.is_none() {
+        return Err(CloudError::new(
+            StatusCode::FORBIDDEN,
+            "team_access_denied",
+            "the requester must be a member of the selected team",
+        ));
+    }
+
+    let approval_id = Uuid::new_v4();
+    let title = format!("Cloud Agent task: {operation}");
+    let summary = format!(
+        "Request to execute {operation} with {required_permission} permission; review the linked task input before deciding."
+    );
+    let payload = json!({
+        "source": "cloud-agent-task",
+        "task_id": task_id,
+        "agent_id": agent_id,
+        "operation": operation,
+        "required_permission": required_permission,
+        "risk": risk,
+        "input": input,
+    });
+    sqlx::query(
+        "INSERT INTO cloud_approvals
+         (id, team_id, requested_by, title, summary, risk, payload, agent_task_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(approval_id)
+    .bind(team_id)
+    .bind(user_id)
+    .bind(title)
+    .bind(summary)
+    .bind(approval_risk)
+    .bind(payload)
+    .bind(task_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(CloudError::database)?;
+    Ok(Some(approval_id))
+}
+
+async fn sync_agent_task_after_approval(
+    transaction: &mut Transaction<'_, Postgres>,
+    approval_id: Uuid,
+    linked_task_id: Option<Uuid>,
+    team_id: Uuid,
+    requested_by: Uuid,
+    decided_by: Uuid,
+    decision: &str,
+) -> CloudResult<()> {
+    let Some(task_id) = linked_task_id else {
+        return Ok(());
+    };
+    let task = sqlx::query(
+        "SELECT id, user_id, team_id, risk, status, approval_id
+         FROM cloud_agent_tasks
+         WHERE id = $1 AND approval_id = $2 FOR UPDATE",
+    )
+    .bind(task_id)
+    .bind(approval_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(CloudError::database)?
+    .ok_or_else(agent_task_approval_invalid_error)?;
+    if task.get::<Uuid, _>("user_id") != requested_by
+        || task.get::<Option<Uuid>, _>("team_id") != Some(team_id)
+        || task.get::<String, _>("risk") == "low"
+        || task.get::<Option<Uuid>, _>("approval_id") != Some(approval_id)
+        || task.get::<String, _>("status") != "awaiting_approval"
+    {
+        return Err(agent_task_approval_invalid_error());
+    }
+    match decision {
+        "approved" => {
+            sqlx::query(
+                "UPDATE cloud_agent_tasks
+                 SET status = 'queued', approved_by = $2, approved_at = NOW(), updated_at = NOW()
+                 WHERE id = $1 AND status = 'awaiting_approval'",
+            )
+            .bind(task_id)
+            .bind(decided_by)
+            .execute(&mut **transaction)
+            .await
+            .map_err(CloudError::database)?;
+            append_agent_task_event(
+                transaction,
+                task_id,
+                "info",
+                "Task approved",
+                Some(json!({
+                    "status": "queued",
+                    "approval_id": approval_id,
+                    "approved_by": decided_by
+                })),
+            )
+            .await?;
+        }
+        "rejected" => {
+            sqlx::query(
+                "UPDATE cloud_agent_tasks
+                 SET status = 'cancelled', cancelled_at = NOW(), completed_at = NOW(),
+                     updated_at = NOW()
+                 WHERE id = $1 AND status = 'awaiting_approval'",
+            )
+            .bind(task_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(CloudError::database)?;
+            append_agent_task_event(
+                transaction,
+                task_id,
+                "warn",
+                "Task approval rejected",
+                Some(json!({
+                    "status": "cancelled",
+                    "approval_id": approval_id,
+                    "rejected_by": decided_by
+                })),
+            )
+            .await?;
+        }
+        _ => {
+            return Err(CloudError::bad_request(
+                "审批决定必须为 approved 或 rejected",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn sync_terminal_after_approval(
+    transaction: &mut Transaction<'_, Postgres>,
+    approval_id: Uuid,
+    linked_session_id: Option<Uuid>,
+    team_id: Uuid,
+    requested_by: Uuid,
+    decided_by: Uuid,
+    decision: &str,
+) -> CloudResult<()> {
+    let Some(session_id) = linked_session_id else {
+        return Ok(());
+    };
+    let session = sqlx::query(
+        "SELECT id, user_id, team_id, approval_id, status, cwd, cols, rows, next_command_seq
+         FROM cloud_terminal_sessions
+         WHERE id = $1 AND approval_id = $2 FOR UPDATE",
+    )
+    .bind(session_id)
+    .bind(approval_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(CloudError::database)?
+    .ok_or_else(|| {
+        CloudError::new(
+            StatusCode::FORBIDDEN,
+            "terminal_approval_invalid",
+            "the linked terminal approval does not match the session",
+        )
+    })?;
+    if session.get::<Uuid, _>("user_id") != requested_by
+        || session.get::<Option<Uuid>, _>("team_id") != Some(team_id)
+        || session.get::<Option<Uuid>, _>("approval_id") != Some(approval_id)
+        || session.get::<String, _>("status") != "awaiting_approval"
+    {
+        return Err(CloudError::new(
+            StatusCode::FORBIDDEN,
+            "terminal_approval_invalid",
+            "the linked terminal approval is no longer valid",
+        ));
+    }
+    match decision {
+        "approved" => {
+            let seq = session.get::<i64, _>("next_command_seq") + 1;
+            sqlx::query(
+                "INSERT INTO cloud_terminal_commands (id, session_id, seq, kind, payload)
+                 VALUES ($1, $2, $3, 'start', $4)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(session_id)
+            .bind(seq)
+            .bind(json!({
+                "cwd": session.get::<Option<String>, _>("cwd"),
+                "cols": session.get::<i32, _>("cols"),
+                "rows": session.get::<i32, _>("rows"),
+            }))
+            .execute(&mut **transaction)
+            .await
+            .map_err(CloudError::database)?;
+            sqlx::query(
+                "UPDATE cloud_terminal_sessions
+                 SET status = 'pending', approved_by = $2, approved_at = NOW(),
+                     next_command_seq = $3, updated_at = NOW()
+                 WHERE id = $1 AND status = 'awaiting_approval'",
+            )
+            .bind(session_id)
+            .bind(decided_by)
+            .bind(seq)
+            .execute(&mut **transaction)
+            .await
+            .map_err(CloudError::database)?;
+        }
+        "rejected" => {
+            sqlx::query(
+                "UPDATE cloud_terminal_sessions
+                 SET status = 'cancelled', exited_at = NOW(), updated_at = NOW()
+                 WHERE id = $1 AND status = 'awaiting_approval'",
+            )
+            .bind(session_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(CloudError::database)?;
+        }
+        _ => {
+            return Err(CloudError::bad_request(
+                "审批决定必须为 approved 或 rejected",
+            ));
+        }
+    }
+    Ok(())
+}
+
 struct CreatedAgentTask {
     id: Uuid,
     created: bool,
@@ -2575,9 +2927,18 @@ async fn create_agent_task_record(
     operation: &str,
     input: &Value,
     idempotency_key: Option<String>,
+    team_id: Option<Uuid>,
 ) -> CloudResult<CreatedAgentTask> {
     let operation = operation.trim().to_ascii_lowercase();
     let spec = validate_agent_task_input(&operation, input, false)?;
+    let team_id = resolve_approval_team(
+        transaction,
+        user_id,
+        team_id,
+        spec.approval_required,
+        agent_task_team_required_error,
+    )
+    .await?;
     let idempotency_key = validate_idempotency_key(idempotency_key)?;
     if let Some(key) = &idempotency_key {
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
@@ -2586,7 +2947,7 @@ async fn create_agent_task_record(
             .await
             .map_err(CloudError::database)?;
         let existing = sqlx::query(
-            "SELECT id, agent_id, operation, input FROM cloud_agent_tasks
+            "SELECT id, agent_id, team_id, operation, input, approval_id FROM cloud_agent_tasks
              WHERE user_id = $1 AND idempotency_key = $2 FOR UPDATE",
         )
         .bind(user_id)
@@ -2604,6 +2965,40 @@ async fn create_agent_task_record(
                     "idempotency_conflict",
                     "idempotency_key was already used for a different task",
                 ));
+            }
+            if spec.approval_required {
+                let existing_approval_id = existing.get::<Option<Uuid>, _>("approval_id");
+                if existing.get::<Option<Uuid>, _>("team_id") != team_id {
+                    return Err(CloudError::new(
+                        StatusCode::CONFLICT,
+                        "idempotency_conflict",
+                        "idempotency_key was already used with a different approval team",
+                    ));
+                }
+                let existing_team_id = if let Some(approval_id) = existing_approval_id {
+                    sqlx::query_scalar::<_, Uuid>(
+                        "SELECT team_id FROM cloud_approvals
+                         WHERE id = $1 AND requested_by = $2 AND agent_task_id = $3",
+                    )
+                    .bind(approval_id)
+                    .bind(user_id)
+                    .bind(existing.get::<Uuid, _>("id"))
+                    .fetch_optional(&mut **transaction)
+                    .await
+                    .map_err(CloudError::database)?
+                } else {
+                    None
+                };
+                if existing_team_id.is_none() {
+                    return Err(agent_task_approval_missing_error());
+                }
+                if existing_team_id != team_id {
+                    return Err(CloudError::new(
+                        StatusCode::CONFLICT,
+                        "idempotency_conflict",
+                        "idempotency_key was already used with a different approval team",
+                    ));
+                }
             }
             return Ok(CreatedAgentTask {
                 id: existing.get("id"),
@@ -2625,21 +3020,35 @@ async fn create_agent_task_record(
     } else {
         "queued"
     };
+    let approval_id = create_agent_task_approval(
+        transaction,
+        user_id,
+        team_id,
+        task_id,
+        agent_id,
+        &operation,
+        spec.permission,
+        spec.risk,
+        input,
+    )
+    .await?;
     sqlx::query(
         "INSERT INTO cloud_agent_tasks
-         (id, user_id, agent_id, operation, required_permission, risk, input, status, idempotency_key,
-          lineage_id, attempt_no, execution_mode)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $1, 1, 'original')",
+         (id, user_id, agent_id, team_id, operation, required_permission, risk, input, status, idempotency_key,
+          approval_id, lineage_id, attempt_no, execution_mode)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $1, 1, 'original')",
     )
     .bind(task_id)
     .bind(user_id)
     .bind(agent_id)
+    .bind(team_id)
     .bind(&operation)
     .bind(spec.permission)
     .bind(spec.risk)
     .bind(input.clone())
     .bind(status)
     .bind(idempotency_key)
+    .bind(approval_id)
     .execute(&mut **transaction)
     .await
     .map_err(CloudError::database)?;
@@ -2648,7 +3057,7 @@ async fn create_agent_task_record(
         task_id,
         "info",
         "Task created",
-        Some(json!({ "status": status })),
+        Some(json!({ "status": status, "approval_id": approval_id })),
     )
     .await?;
     Ok(CreatedAgentTask {
@@ -2672,6 +3081,7 @@ async fn create_agent_task(
         &request.operation,
         &request.input,
         request.idempotency_key,
+        request.team_id,
     )
     .await?;
     transaction.commit().await.map_err(CloudError::database)?;
@@ -2693,8 +3103,9 @@ async fn approve_agent_task(
     let cloud = cloud(&state)?;
     let user = authenticate(&headers, &cloud).await?;
     let mut transaction = cloud.db.begin().await.map_err(CloudError::database)?;
-    let status = sqlx::query_scalar::<_, String>(
-        "SELECT status FROM cloud_agent_tasks WHERE id = $1 AND user_id = $2 FOR UPDATE",
+    let task = sqlx::query(
+        "SELECT status, risk, user_id, team_id, approval_id FROM cloud_agent_tasks
+         WHERE id = $1 AND user_id = $2 FOR UPDATE",
     )
     .bind(task_id)
     .bind(user.user_id)
@@ -2708,6 +3119,7 @@ async fn approve_agent_task(
             "agent task was not found",
         )
     })?;
+    let status: String = task.get("status");
     if status != "awaiting_approval" {
         return Err(CloudError::new(
             StatusCode::CONFLICT,
@@ -2715,13 +3127,82 @@ async fn approve_agent_task(
             "agent task is not awaiting approval",
         ));
     }
+    let mut approved_by = user.user_id;
+    if task.get::<String, _>("risk") != "low" {
+        let approval_id = task
+            .get::<Option<Uuid>, _>("approval_id")
+            .ok_or_else(agent_task_approval_missing_error)?;
+        let approval = sqlx::query(
+            "SELECT team_id, requested_by, status, decided_by, agent_task_id
+             FROM cloud_approvals WHERE id = $1 FOR UPDATE",
+        )
+        .bind(approval_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(CloudError::database)?
+        .ok_or_else(agent_task_approval_missing_error)?;
+        let requested_by: Uuid = approval.get("requested_by");
+        if requested_by != task.get::<Uuid, _>("user_id") {
+            return Err(agent_task_approval_invalid_error());
+        }
+        if approval.get::<Option<Uuid>, _>("agent_task_id") != Some(task_id) {
+            return Err(agent_task_approval_invalid_error());
+        }
+        if task.get::<Option<Uuid>, _>("team_id") != Some(approval.get("team_id")) {
+            return Err(agent_task_approval_invalid_error());
+        }
+        match approval.get::<String, _>("status").as_str() {
+            "pending" => {
+                return Err(CloudError::new(
+                    StatusCode::CONFLICT,
+                    "agent_task_approval_pending",
+                    "the linked team approval is still pending",
+                ));
+            }
+            "rejected" | "cancelled" => {
+                return Err(CloudError::new(
+                    StatusCode::CONFLICT,
+                    "agent_task_approval_rejected",
+                    "the linked team approval was not approved",
+                ));
+            }
+            "approved" => {}
+            _ => return Err(agent_task_approval_invalid_error()),
+        }
+        let decided_by = approval
+            .get::<Option<Uuid>, _>("decided_by")
+            .ok_or_else(agent_task_approval_invalid_error)?;
+        if decided_by == requested_by {
+            return Err(CloudError::new(
+                StatusCode::FORBIDDEN,
+                "agent_task_approval_self",
+                "the task requester cannot be the team approval decision maker",
+            ));
+        }
+        let role = sqlx::query_scalar::<_, String>(
+            "SELECT role FROM cloud_team_members
+             WHERE team_id = $1 AND user_id = $2 FOR SHARE",
+        )
+        .bind(approval.get::<Uuid, _>("team_id"))
+        .bind(decided_by)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(CloudError::database)?;
+        if !role
+            .as_deref()
+            .is_some_and(|role| ["owner", "admin", "approver"].contains(&role))
+        {
+            return Err(agent_task_approval_invalid_error());
+        }
+        approved_by = decided_by;
+    }
     sqlx::query(
         "UPDATE cloud_agent_tasks
          SET status = 'queued', approved_by = $2, approved_at = NOW(), updated_at = NOW()
-         WHERE id = $1",
+         WHERE id = $1 AND status = 'awaiting_approval'",
     )
     .bind(task_id)
-    .bind(user.user_id)
+    .bind(approved_by)
     .execute(&mut *transaction)
     .await
     .map_err(CloudError::database)?;
@@ -2730,7 +3211,7 @@ async fn approve_agent_task(
         task_id,
         "info",
         "Task approved",
-        Some(json!({ "status": "queued" })),
+        Some(json!({ "status": "queued", "approval_id": task.get::<Option<Uuid>, _>("approval_id"), "approved_by": approved_by })),
     )
     .await?;
     transaction.commit().await.map_err(CloudError::database)?;
@@ -2813,6 +3294,15 @@ async fn cancel_agent_task(
     .execute(&mut *transaction)
     .await
     .map_err(CloudError::database)?;
+    sqlx::query(
+        "UPDATE cloud_approvals
+         SET status = 'cancelled', decision_comment = '任务已取消', decided_at = NOW()
+         WHERE agent_task_id = $1 AND status = 'pending'",
+    )
+    .bind(task_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(CloudError::database)?;
     append_agent_task_event(
         &mut transaction,
         task_id,
@@ -2834,9 +3324,14 @@ async fn rollback_agent_task(
     let user = authenticate(&headers, &cloud).await?;
     let mut transaction = cloud.db.begin().await.map_err(CloudError::database)?;
     let source = sqlx::query(
-        "SELECT agent_id, status, rollback_available, rollback_source_task_id
-         FROM cloud_agent_tasks
-         WHERE id = $1 AND user_id = $2 FOR UPDATE",
+        "SELECT t.agent_id, t.team_id, t.status, t.rollback_available, t.rollback_source_task_id,
+                t.approval_id,
+                (SELECT a.team_id FROM cloud_approvals a
+                 WHERE a.id = t.approval_id AND a.agent_task_id = t.id
+                   AND a.requested_by = t.user_id AND a.status = 'approved'
+                   AND a.decided_by = t.approved_by) AS approval_team_id
+         FROM cloud_agent_tasks t
+         WHERE t.id = $1 AND t.user_id = $2 FOR UPDATE",
     )
     .bind(source_task_id)
     .bind(user.user_id)
@@ -2858,6 +3353,12 @@ async fn rollback_agent_task(
             "rollback_not_available",
             "source agent task is not rollback-capable",
         ));
+    }
+    let approval_team_id = source
+        .get::<Option<Uuid>, _>("approval_team_id")
+        .ok_or_else(agent_task_approval_missing_error)?;
+    if source.get::<Option<Uuid>, _>("team_id") != Some(approval_team_id) {
+        return Err(agent_task_approval_invalid_error());
     }
     let agent_id: Uuid = source.get("agent_id");
     let local_source_task_id: Uuid = source
@@ -2884,18 +3385,33 @@ async fn rollback_agent_task(
     let task_id = Uuid::new_v4();
     let input = json!({ "source_task_id": local_source_task_id });
     validate_agent_task_input("task.rollback", &input, true)?;
+    let approval_id = create_agent_task_approval(
+        &mut transaction,
+        user.user_id,
+        Some(approval_team_id),
+        task_id,
+        agent_id,
+        "task.rollback",
+        "write",
+        "high",
+        &input,
+    )
+    .await?
+    .expect("rollback tasks always require team approval");
     sqlx::query(
         "INSERT INTO cloud_agent_tasks
-         (id, user_id, agent_id, operation, required_permission, risk, input, status, source_task_id,
-          lineage_id, attempt_no, execution_mode)
-         VALUES ($1, $2, $3, 'task.rollback', 'write', 'high', $4, 'awaiting_approval', $5,
-                 $1, 1, 'original')",
+         (id, user_id, agent_id, team_id, operation, required_permission, risk, input, status, source_task_id,
+          approval_id, lineage_id, attempt_no, execution_mode)
+         VALUES ($1, $2, $3, $4, 'task.rollback', 'write', 'high', $5, 'awaiting_approval', $6,
+                 $7, $1, 1, 'original')",
     )
     .bind(task_id)
     .bind(user.user_id)
     .bind(agent_id)
+    .bind(approval_team_id)
     .bind(input)
     .bind(local_source_task_id)
+    .bind(approval_id)
     .execute(&mut *transaction)
     .await
     .map_err(CloudError::database)?;
@@ -2906,7 +3422,8 @@ async fn rollback_agent_task(
         "Rollback task created and awaiting approval",
         Some(json!({
             "requested_task_id": source_task_id,
-            "source_task_id": local_source_task_id
+            "source_task_id": local_source_task_id,
+            "approval_id": approval_id
         })),
     )
     .await?;
@@ -2935,9 +3452,13 @@ async fn retry_agent_task(
         .expect("a required idempotency key remains present");
     let mut transaction = cloud.db.begin().await.map_err(CloudError::database)?;
     let source = sqlx::query(
-        "SELECT id, user_id, agent_id, operation, required_permission, risk, input, status,
-                lineage_id, attempt_no
-         FROM cloud_agent_tasks WHERE id = $1 AND user_id = $2 FOR UPDATE",
+        "SELECT t.id, t.user_id, t.agent_id, t.team_id, t.operation, t.required_permission, t.risk,
+                t.input, t.status, t.approval_id, t.lineage_id, t.attempt_no,
+                (SELECT a.team_id FROM cloud_approvals a
+                 WHERE a.id = t.approval_id AND a.agent_task_id = t.id
+                   AND a.requested_by = t.user_id AND a.status = 'approved'
+                   AND a.decided_by = t.approved_by) AS approval_team_id
+         FROM cloud_agent_tasks t WHERE t.id = $1 AND t.user_id = $2 FOR UPDATE",
     )
     .bind(source_task_id)
     .bind(user.user_id)
@@ -2953,6 +3474,19 @@ async fn retry_agent_task(
     })?;
     let source_status: String = source.get("status");
     let operation: String = source.get("operation");
+    let source_risk: String = source.get("risk");
+    let approval_team_id = if source_risk == "low" {
+        None
+    } else {
+        Some(
+            source
+                .get::<Option<Uuid>, _>("approval_team_id")
+                .ok_or_else(agent_task_approval_missing_error)?,
+        )
+    };
+    if source_risk != "low" && source.get::<Option<Uuid>, _>("team_id") != approval_team_id {
+        return Err(agent_task_approval_invalid_error());
+    }
     if !agent_task_is_terminal(&source_status) {
         return Err(CloudError::new(
             StatusCode::CONFLICT,
@@ -2974,7 +3508,7 @@ async fn retry_agent_task(
         .await
         .map_err(CloudError::database)?;
     if let Some(existing) = sqlx::query(
-        "SELECT id, execution_mode FROM cloud_agent_tasks
+        "SELECT id, execution_mode, approval_id FROM cloud_agent_tasks
          WHERE retry_of_task_id = $1 AND retry_request_key = $2 FOR UPDATE",
     )
     .bind(source_task_id)
@@ -2990,6 +3524,9 @@ async fn retry_agent_task(
                 "idempotency_key was already used with a different retry mode",
             ));
         }
+        if source_risk != "low" && existing.get::<Option<Uuid>, _>("approval_id").is_none() {
+            return Err(agent_task_approval_missing_error());
+        }
         let existing_id: Uuid = existing.get("id");
         transaction.commit().await.map_err(CloudError::database)?;
         return Ok((
@@ -3000,6 +3537,8 @@ async fn retry_agent_task(
     let agent_id: Uuid = source.get("agent_id");
     let input: Value = source.get("input");
     let spec = validate_agent_task_input(&operation, &input, false)?;
+    let required_permission: String = source.get("required_permission");
+    let risk: String = source.get("risk");
     lock_user_agent_for_task(
         &mut transaction,
         user.user_id,
@@ -3060,19 +3599,32 @@ async fn retry_agent_task(
     let resume_checkpoint_id = resume_checkpoint
         .as_ref()
         .map(|checkpoint| checkpoint.get::<Uuid, _>("id"));
+    let approval_id = create_agent_task_approval(
+        &mut transaction,
+        user.user_id,
+        approval_team_id,
+        task_id,
+        agent_id,
+        &operation,
+        &required_permission,
+        &risk,
+        &input,
+    )
+    .await?;
     sqlx::query(
         "INSERT INTO cloud_agent_tasks
-         (id, user_id, agent_id, operation, required_permission, risk, input, status,
+         (id, user_id, agent_id, team_id, operation, required_permission, risk, input, status,
           lineage_id, attempt_no, retry_of_task_id, execution_mode, resume_checkpoint_id,
-          retry_request_key)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+          retry_request_key, approval_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
     )
     .bind(task_id)
     .bind(user.user_id)
     .bind(agent_id)
+    .bind(approval_team_id)
     .bind(&operation)
-    .bind(source.get::<String, _>("required_permission"))
-    .bind(source.get::<String, _>("risk"))
+    .bind(&required_permission)
+    .bind(&risk)
     .bind(input)
     .bind(status)
     .bind(lineage_id)
@@ -3081,6 +3633,7 @@ async fn retry_agent_task(
     .bind(&mode)
     .bind(resume_checkpoint_id)
     .bind(&retry_key)
+    .bind(approval_id)
     .execute(&mut *transaction)
     .await
     .map_err(CloudError::database)?;
@@ -3095,7 +3648,8 @@ async fn retry_agent_task(
             "lineage_id": lineage_id,
             "attempt_no": attempt_no,
             "resume_checkpoint_id": resume_checkpoint_id,
-            "status": status
+            "status": status,
+            "approval_id": approval_id
         })),
     )
     .await?;
@@ -3206,20 +3760,26 @@ fn expired_running_task_outcome(cancellation_pending: bool) -> (&'static str, &'
     }
 }
 
+fn expired_leased_task_can_requeue(risk: &str, approval_enforced: bool) -> bool {
+    risk == "low" || approval_enforced
+}
+
 async fn reconcile_expired_agent_tasks(
     transaction: &mut Transaction<'_, Postgres>,
     scope: ExpiredAgentTaskScope,
 ) -> CloudResult<()> {
     let (sql, owner_id) = match scope {
         ExpiredAgentTaskScope::Agent(agent_id) => (
-            "SELECT id, status, cancel_requested_at FROM cloud_agent_tasks
+            "SELECT id, status, risk, approval_enforced, cancel_requested_at
+             FROM cloud_agent_tasks
              WHERE agent_id = $1 AND status IN ('leased', 'running')
                AND lease_expires_at <= NOW()
              ORDER BY lease_expires_at FOR UPDATE SKIP LOCKED",
             agent_id,
         ),
         ExpiredAgentTaskScope::User(user_id) => (
-            "SELECT id, status, cancel_requested_at FROM cloud_agent_tasks
+            "SELECT id, status, risk, approval_enforced, cancel_requested_at
+             FROM cloud_agent_tasks
              WHERE user_id = $1 AND status IN ('leased', 'running')
                AND lease_expires_at <= NOW()
              ORDER BY lease_expires_at FOR UPDATE SKIP LOCKED",
@@ -3233,7 +3793,12 @@ async fn reconcile_expired_agent_tasks(
         .map_err(CloudError::database)?;
     for row in expired {
         let task_id: Uuid = row.get("id");
-        if row.get::<String, _>("status") == "leased" {
+        if row.get::<String, _>("status") == "leased"
+            && expired_leased_task_can_requeue(
+                &row.get::<String, _>("risk"),
+                row.get::<bool, _>("approval_enforced"),
+            )
+        {
             sqlx::query(
                 "UPDATE cloud_agent_tasks
                  SET status = 'queued', lease_token_hash = NULL, lease_expires_at = NULL,
@@ -3255,7 +3820,14 @@ async fn reconcile_expired_agent_tasks(
             let cancellation_pending = row
                 .get::<Option<DateTime<Utc>>, _>("cancel_requested_at")
                 .is_some();
-            let (error, event_message) = expired_running_task_outcome(cancellation_pending);
+            let (error, event_message) = if row.get::<String, _>("status") == "leased" {
+                (
+                    "legacy high-risk task lease expired; it was not requeued without a linked team approval",
+                    "Legacy high-risk task lease expired and was not requeued without a linked team approval",
+                )
+            } else {
+                expired_running_task_outcome(cancellation_pending)
+            };
             sqlx::query(
                 "UPDATE cloud_agent_tasks
                  SET status = 'failed', lease_token_hash = NULL, lease_expires_at = NULL,
@@ -3273,6 +3845,53 @@ async fn reconcile_expired_agent_tasks(
     Ok(())
 }
 
+async fn agent_task_approval_is_current_for_lease(
+    transaction: &mut Transaction<'_, Postgres>,
+    task_id: Uuid,
+    team_id: Option<Uuid>,
+    approval_id: Option<Uuid>,
+    requested_by: Uuid,
+    approved_by: Option<Uuid>,
+) -> CloudResult<bool> {
+    let (Some(team_id), Some(approval_id), Some(approved_by)) = (team_id, approval_id, approved_by)
+    else {
+        return Ok(false);
+    };
+    let Some(approval) = sqlx::query(
+        "SELECT team_id, requested_by, agent_task_id, status, decided_by
+         FROM cloud_approvals WHERE id = $1 FOR SHARE",
+    )
+    .bind(approval_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(CloudError::database)?
+    else {
+        return Ok(false);
+    };
+    let decided_by = approval.get::<Option<Uuid>, _>("decided_by");
+    if approval.get::<Uuid, _>("team_id") != team_id
+        || approval.get::<Uuid, _>("requested_by") != requested_by
+        || approval.get::<Option<Uuid>, _>("agent_task_id") != Some(task_id)
+        || approval.get::<String, _>("status") != "approved"
+        || decided_by != Some(approved_by)
+        || decided_by == Some(requested_by)
+    {
+        return Ok(false);
+    }
+    let role = sqlx::query_scalar::<_, String>(
+        "SELECT role FROM cloud_team_members
+         WHERE team_id = $1 AND user_id = $2 FOR SHARE",
+    )
+    .bind(team_id)
+    .bind(approved_by)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(CloudError::database)?;
+    Ok(role
+        .as_deref()
+        .is_some_and(|role| ["owner", "admin", "approver"].contains(&role)))
+}
+
 async fn lease_agent_task(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3286,12 +3905,30 @@ async fn lease_agent_task(
     reconcile_expired_agent_tasks(&mut transaction, ExpiredAgentTaskScope::Agent(agent_id)).await?;
 
     let task = sqlx::query(
-        "SELECT t.id, t.operation, t.input, t.required_permission, t.risk, t.execution_mode,
+        "SELECT t.id, t.user_id, t.team_id, t.approval_id, t.approved_by,
+                t.operation, t.input, t.required_permission, t.risk, t.execution_mode,
                 c.id AS checkpoint_id, c.task_id AS checkpoint_task_id,
                 c.kind AS checkpoint_kind, c.payload AS checkpoint_payload
          FROM cloud_agent_tasks t
          LEFT JOIN cloud_agent_task_checkpoints c ON c.id = t.resume_checkpoint_id
          WHERE t.agent_id = $1 AND t.status = 'queued'
+           AND (
+             t.risk = 'low'
+             OR EXISTS (
+               SELECT 1 FROM cloud_approvals a
+               JOIN cloud_team_members m
+                 ON m.team_id = a.team_id AND m.user_id = a.decided_by
+               WHERE a.id = t.approval_id
+                 AND a.agent_task_id = t.id
+                 AND a.team_id = t.team_id
+                 AND a.requested_by = t.user_id
+                 AND a.status = 'approved'
+                 AND a.decided_by IS NOT NULL
+                 AND a.decided_by <> t.user_id
+                 AND m.role IN ('owner', 'admin', 'approver')
+                 AND t.approved_by = a.decided_by
+             )
+           )
          ORDER BY t.created_at FOR UPDATE OF t SKIP LOCKED LIMIT 1",
     )
     .bind(agent_id)
@@ -3303,6 +3940,20 @@ async fn lease_agent_task(
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
     let task_id: Uuid = task.get("id");
+    if task.get::<String, _>("risk") != "low"
+        && !agent_task_approval_is_current_for_lease(
+            &mut transaction,
+            task_id,
+            task.get("team_id"),
+            task.get("approval_id"),
+            task.get("user_id"),
+            task.get("approved_by"),
+        )
+        .await?
+    {
+        transaction.commit().await.map_err(CloudError::database)?;
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
     let resume = if task.get::<String, _>("execution_mode") == "resume" {
         Some(AgentTaskResumeLeaseView {
             source_task_id: task.get("checkpoint_task_id"),
@@ -3894,13 +4545,62 @@ async fn agent_heartbeat(
     let commands_available = if active {
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(
-                SELECT 1 FROM cloud_agent_tasks
-                WHERE agent_id = $1 AND status IN ('queued', 'leased', 'running')
+                SELECT 1
+                FROM cloud_agent_tasks t
+                WHERE t.agent_id = $1
+                  AND (
+                    t.status IN ('leased', 'running')
+                    OR (
+                        t.status = 'queued'
+                        AND (
+                            t.risk = 'low'
+                            OR EXISTS (
+                                SELECT 1
+                                FROM cloud_approvals a
+                                JOIN cloud_team_members m
+                                  ON m.team_id = a.team_id AND m.user_id = a.decided_by
+                                WHERE a.id = t.approval_id
+                                  AND a.agent_task_id = t.id
+                                  AND a.team_id = t.team_id
+                                  AND a.requested_by = t.user_id
+                                  AND a.status = 'approved'
+                                  AND a.decided_by IS NOT NULL
+                                  AND a.decided_by <> t.user_id
+                                  AND m.role IN ('owner', 'admin', 'approver')
+                                  AND t.approved_by = a.decided_by
+                            )
+                        )
+                    )
+                  )
                 UNION ALL
                 SELECT 1 FROM cloud_terminal_commands c
                 JOIN cloud_terminal_sessions s ON s.id = c.session_id
                 WHERE s.agent_id = $1 AND c.acknowledged_at IS NULL
-                  AND s.status IN ('pending', 'starting', 'running', 'terminating')
+                  AND (
+                    (
+                        c.kind = 'start'
+                        AND s.status = 'pending'
+                        AND EXISTS (
+                            SELECT 1
+                            FROM cloud_approvals a
+                            JOIN cloud_team_members m
+                              ON m.team_id = a.team_id AND m.user_id = a.decided_by
+                            WHERE a.id = s.approval_id
+                              AND a.terminal_session_id = s.id
+                              AND a.team_id = s.team_id
+                              AND a.requested_by = s.user_id
+                              AND a.status = 'approved'
+                              AND a.decided_by IS NOT NULL
+                              AND a.decided_by <> s.user_id
+                              AND m.role IN ('owner', 'admin', 'approver')
+                              AND s.approved_by = a.decided_by
+                        )
+                    )
+                    OR (
+                        c.kind <> 'start'
+                        AND s.status IN ('starting', 'running', 'terminating')
+                    )
+                  )
             )",
         )
         .bind(agent_id)
@@ -3924,6 +4624,8 @@ async fn agent_heartbeat(
 #[serde(deny_unknown_fields)]
 struct CreateTerminalSessionRequest {
     agent_id: Uuid,
+    #[serde(default)]
+    team_id: Option<Uuid>,
     title: Option<String>,
     cwd: Option<String>,
     cols: i32,
@@ -3981,6 +4683,8 @@ struct TerminalEventsQuery {
 struct TerminalSessionView {
     id: Uuid,
     agent_id: Uuid,
+    team_id: Option<Uuid>,
+    approval_id: Option<Uuid>,
     title: String,
     cwd: Option<String>,
     cols: i32,
@@ -4020,7 +4724,8 @@ struct TerminalEventsResponse {
     events: Vec<TerminalEventView>,
 }
 
-const TERMINAL_SESSION_SELECT: &str = "SELECT id, agent_id, title, cwd, cols, rows, status,
+const TERMINAL_SESSION_SELECT: &str =
+    "SELECT id, agent_id, team_id, approval_id, title, cwd, cols, rows, status,
     exit_code, error, created_at, approved_at, started_at, last_seen_at, exited_at, updated_at
     FROM cloud_terminal_sessions";
 
@@ -4173,6 +4878,8 @@ fn terminal_session_view(row: &sqlx::postgres::PgRow) -> TerminalSessionView {
     TerminalSessionView {
         id: row.get("id"),
         agent_id: row.get("agent_id"),
+        team_id: row.get("team_id"),
+        approval_id: row.get("approval_id"),
         title: row.get("title"),
         cwd: row.get("cwd"),
         cols: row.get("cols"),
@@ -4341,6 +5048,49 @@ async fn list_terminal_sessions(
     Ok(Json(sessions))
 }
 
+async fn create_terminal_session_approval(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    team_id: Uuid,
+    session_id: Uuid,
+    agent_id: Uuid,
+    title: &str,
+    cwd: &Option<String>,
+    cols: i32,
+    rows: i32,
+) -> CloudResult<Uuid> {
+    let approval_id = Uuid::new_v4();
+    let approval_title = format!("Persistent terminal: {title}");
+    let summary = "Request to start a persistent full-permission terminal session; review the target agent and working directory before deciding.";
+    let payload = json!({
+        "source": "cloud-terminal-session",
+        "terminal_session_id": session_id,
+        "agent_id": agent_id,
+        "title": title,
+        "cwd": cwd,
+        "cols": cols,
+        "rows": rows,
+        "risk": "critical",
+        "required_permission": "full",
+    });
+    sqlx::query(
+        "INSERT INTO cloud_approvals
+         (id, team_id, requested_by, title, summary, risk, payload, terminal_session_id)
+         VALUES ($1, $2, $3, $4, $5, 'high', $6, $7)",
+    )
+    .bind(approval_id)
+    .bind(team_id)
+    .bind(user_id)
+    .bind(approval_title)
+    .bind(summary)
+    .bind(payload)
+    .bind(session_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(CloudError::database)?;
+    Ok(approval_id)
+}
+
 async fn create_terminal_session(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4353,15 +5103,38 @@ async fn create_terminal_session(
     validate_terminal_dimensions(request.cols, request.rows)?;
     let session_id = Uuid::new_v4();
     let mut transaction = cloud.db.begin().await.map_err(CloudError::database)?;
+    let team_id = resolve_approval_team(
+        &mut transaction,
+        user.user_id,
+        request.team_id,
+        true,
+        terminal_team_required_error,
+    )
+    .await?
+    .expect("terminal sessions always require an approval team");
     lock_user_terminal_agent(&mut transaction, user.user_id, request.agent_id).await?;
+    let approval_id = create_terminal_session_approval(
+        &mut transaction,
+        user.user_id,
+        team_id,
+        session_id,
+        request.agent_id,
+        &title,
+        &cwd,
+        request.cols,
+        request.rows,
+    )
+    .await?;
     sqlx::query(
         "INSERT INTO cloud_terminal_sessions
-         (id, user_id, agent_id, title, cwd, cols, rows, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'awaiting_approval')",
+         (id, user_id, agent_id, team_id, approval_id, title, cwd, cols, rows, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'awaiting_approval')",
     )
     .bind(session_id)
     .bind(user.user_id)
     .bind(request.agent_id)
+    .bind(team_id)
+    .bind(approval_id)
     .bind(title)
     .bind(cwd)
     .bind(request.cols)
@@ -4385,7 +5158,7 @@ async fn approve_terminal_session(
     let user = authenticate(&headers, &cloud).await?;
     let mut transaction = cloud.db.begin().await.map_err(CloudError::database)?;
     let row = sqlx::query(
-        "SELECT agent_id, cwd, cols, rows, status, next_command_seq
+        "SELECT agent_id, team_id, approval_id, cwd, cols, rows, status, next_command_seq
          FROM cloud_terminal_sessions WHERE id = $1 AND user_id = $2 FOR UPDATE",
     )
     .bind(session_id)
@@ -4408,6 +5181,87 @@ async fn approve_terminal_session(
         ));
     }
     let agent_id: Uuid = row.get("agent_id");
+    let team_id = row.get::<Option<Uuid>, _>("team_id").ok_or_else(|| {
+        CloudError::new(
+            StatusCode::CONFLICT,
+            "terminal_approval_missing",
+            "this terminal session has no linked team approval; create a new session",
+        )
+    })?;
+    let approval_id = row.get::<Option<Uuid>, _>("approval_id").ok_or_else(|| {
+        CloudError::new(
+            StatusCode::CONFLICT,
+            "terminal_approval_missing",
+            "this terminal session has no linked team approval; create a new session",
+        )
+    })?;
+    let approval = sqlx::query(
+        "SELECT team_id, requested_by, terminal_session_id, status, decided_by
+         FROM cloud_approvals WHERE id = $1 FOR UPDATE",
+    )
+    .bind(approval_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(CloudError::database)?
+    .ok_or_else(|| {
+        CloudError::new(
+            StatusCode::CONFLICT,
+            "terminal_approval_missing",
+            "this terminal session has no linked team approval; create a new session",
+        )
+    })?;
+    if approval.get::<Uuid, _>("team_id") != team_id
+        || approval.get::<Uuid, _>("requested_by") != user.user_id
+        || approval.get::<Option<Uuid>, _>("terminal_session_id") != Some(session_id)
+    {
+        return Err(CloudError::new(
+            StatusCode::FORBIDDEN,
+            "terminal_approval_invalid",
+            "the linked terminal approval does not match the session",
+        ));
+    }
+    if approval.get::<String, _>("status") != "approved" {
+        return Err(CloudError::new(
+            StatusCode::CONFLICT,
+            "terminal_approval_pending",
+            "the linked team approval is not approved yet",
+        ));
+    }
+    let decided_by = approval
+        .get::<Option<Uuid>, _>("decided_by")
+        .ok_or_else(|| {
+            CloudError::new(
+                StatusCode::FORBIDDEN,
+                "terminal_approval_invalid",
+                "the linked terminal approval has no independent decision maker",
+            )
+        })?;
+    if decided_by == user.user_id {
+        return Err(CloudError::new(
+            StatusCode::FORBIDDEN,
+            "terminal_approval_self",
+            "the terminal requester cannot approve their own session",
+        ));
+    }
+    let role = sqlx::query_scalar::<_, String>(
+        "SELECT role FROM cloud_team_members
+         WHERE team_id = $1 AND user_id = $2 FOR SHARE",
+    )
+    .bind(team_id)
+    .bind(decided_by)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(CloudError::database)?;
+    if !role
+        .as_deref()
+        .is_some_and(|role| ["owner", "admin", "approver"].contains(&role))
+    {
+        return Err(CloudError::new(
+            StatusCode::FORBIDDEN,
+            "terminal_approval_invalid",
+            "the terminal approval decision maker is no longer a team approver",
+        ));
+    }
     lock_user_terminal_agent(&mut transaction, user.user_id, agent_id).await?;
     let seq = row.get::<i64, _>("next_command_seq") + 1;
     sqlx::query(
@@ -4431,7 +5285,7 @@ async fn approve_terminal_session(
              next_command_seq = $3, updated_at = NOW() WHERE id = $1",
     )
     .bind(session_id)
-    .bind(user.user_id)
+    .bind(decided_by)
     .bind(seq)
     .execute(&mut *transaction)
     .await
@@ -4632,6 +5486,15 @@ async fn terminate_terminal_session(
             .execute(&mut *transaction)
             .await
             .map_err(CloudError::database)?;
+            sqlx::query(
+                "UPDATE cloud_approvals
+                 SET status = 'cancelled', decision_comment = '终端会话已取消', decided_at = NOW()
+                 WHERE terminal_session_id = $1 AND status = 'pending'",
+            )
+            .bind(session_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(CloudError::database)?;
         }
         "starting" | "running" => {
             enqueue_terminal_command(
@@ -4696,6 +5559,53 @@ async fn get_terminal_events(
     Ok(Json(TerminalEventsResponse { session, events }))
 }
 
+async fn terminal_start_approval_is_current_for_lease(
+    transaction: &mut Transaction<'_, Postgres>,
+    session_id: Uuid,
+    team_id: Option<Uuid>,
+    approval_id: Option<Uuid>,
+    requested_by: Uuid,
+    approved_by: Option<Uuid>,
+) -> CloudResult<bool> {
+    let (Some(team_id), Some(approval_id), Some(approved_by)) = (team_id, approval_id, approved_by)
+    else {
+        return Ok(false);
+    };
+    let Some(approval) = sqlx::query(
+        "SELECT team_id, requested_by, terminal_session_id, status, decided_by
+         FROM cloud_approvals WHERE id = $1 FOR SHARE",
+    )
+    .bind(approval_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(CloudError::database)?
+    else {
+        return Ok(false);
+    };
+    let decided_by = approval.get::<Option<Uuid>, _>("decided_by");
+    if approval.get::<Uuid, _>("team_id") != team_id
+        || approval.get::<Uuid, _>("requested_by") != requested_by
+        || approval.get::<Option<Uuid>, _>("terminal_session_id") != Some(session_id)
+        || approval.get::<String, _>("status") != "approved"
+        || decided_by != Some(approved_by)
+        || decided_by == Some(requested_by)
+    {
+        return Ok(false);
+    }
+    let role = sqlx::query_scalar::<_, String>(
+        "SELECT role FROM cloud_team_members
+         WHERE team_id = $1 AND user_id = $2 FOR SHARE",
+    )
+    .bind(team_id)
+    .bind(approved_by)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(CloudError::database)?;
+    Ok(role
+        .as_deref()
+        .is_some_and(|role| ["owner", "admin", "approver"].contains(&role)))
+}
+
 async fn lease_terminal_commands(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4714,13 +5624,28 @@ async fn lease_terminal_commands(
     reconcile_expired_terminal_sessions(&mut transaction, ExpiredTerminalScope::Agent(agent_id))
         .await?;
     let rows = sqlx::query(
-        "SELECT c.id, c.session_id, c.seq, c.kind, c.payload
+        "SELECT c.id, c.session_id, c.seq, c.kind, c.payload,
+                s.user_id, s.team_id, s.approval_id, s.approved_by
          FROM cloud_terminal_commands c
          JOIN cloud_terminal_sessions s ON s.id = c.session_id
          WHERE s.agent_id = $1 AND c.acknowledged_at IS NULL
            AND (c.lease_expires_at IS NULL OR c.lease_expires_at <= NOW())
            AND (
-             (c.kind = 'start' AND s.status = 'pending') OR
+             (c.kind = 'start' AND s.status = 'pending'
+               AND EXISTS (
+                 SELECT 1 FROM cloud_approvals a
+                 JOIN cloud_team_members m
+                   ON m.team_id = a.team_id AND m.user_id = a.decided_by
+                 WHERE a.id = s.approval_id
+                   AND a.terminal_session_id = s.id
+                   AND a.team_id = s.team_id
+                   AND a.requested_by = s.user_id
+                   AND a.status = 'approved'
+                   AND a.decided_by IS NOT NULL
+                   AND a.decided_by <> s.user_id
+                   AND m.role IN ('owner', 'admin', 'approver')
+                   AND s.approved_by = a.decided_by
+               )) OR
              (c.kind <> 'start' AND s.status IN ('starting', 'running', 'terminating')
                AND s.instance_id = $2)
            )
@@ -4733,6 +5658,22 @@ async fn lease_terminal_commands(
     .fetch_all(&mut *transaction)
     .await
     .map_err(CloudError::database)?;
+    for row in &rows {
+        if row.get::<String, _>("kind") == "start"
+            && !terminal_start_approval_is_current_for_lease(
+                &mut transaction,
+                row.get("session_id"),
+                row.get("team_id"),
+                row.get("approval_id"),
+                row.get("user_id"),
+                row.get("approved_by"),
+            )
+            .await?
+        {
+            transaction.commit().await.map_err(CloudError::database)?;
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        }
+    }
     let mut commands = Vec::with_capacity(rows.len());
     for row in rows {
         let command_id: Uuid = row.get("id");
@@ -5142,6 +6083,8 @@ struct CreateConversationPlanRequest {
     operation: String,
     input: Value,
     idempotency_key: Option<String>,
+    #[serde(default)]
+    team_id: Option<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -5452,6 +6395,7 @@ async fn create_conversation_plan(
         &request.operation,
         &request.input,
         request.idempotency_key,
+        request.team_id,
     )
     .await?;
     if !task.created {
@@ -6108,6 +7052,8 @@ async fn accept_invitation(
 struct ApprovalView {
     id: Uuid,
     team_id: Uuid,
+    agent_task_id: Option<Uuid>,
+    terminal_session_id: Option<Uuid>,
     team_name: String,
     requested_by: Uuid,
     requester_name: String,
@@ -6117,6 +7063,7 @@ struct ApprovalView {
     status: String,
     payload: Value,
     decision_comment: String,
+    decided_by: Option<Uuid>,
     decided_by_name: Option<String>,
     decided_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
@@ -6126,6 +7073,8 @@ fn approval_from_row(row: &sqlx::postgres::PgRow) -> ApprovalView {
     ApprovalView {
         id: row.get("id"),
         team_id: row.get("team_id"),
+        agent_task_id: row.get("agent_task_id"),
+        terminal_session_id: row.get("terminal_session_id"),
         team_name: row.get("team_name"),
         requested_by: row.get("requested_by"),
         requester_name: row.get("requester_name"),
@@ -6135,6 +7084,7 @@ fn approval_from_row(row: &sqlx::postgres::PgRow) -> ApprovalView {
         status: row.get("status"),
         payload: row.get("payload"),
         decision_comment: row.get("decision_comment"),
+        decided_by: row.get("decided_by"),
         decided_by_name: row.get("decided_by_name"),
         decided_at: row.get("decided_at"),
         created_at: row.get("created_at"),
@@ -6147,9 +7097,10 @@ struct ApprovalQuery {
     status: Option<String>,
 }
 
-const APPROVAL_SELECT: &str = "SELECT a.id, a.team_id, t.name AS team_name, a.requested_by,
+const APPROVAL_SELECT: &str = "SELECT a.id, a.team_id, a.agent_task_id, a.terminal_session_id,
+            t.name AS team_name, a.requested_by,
             requester.nickname AS requester_name, a.title, a.summary, a.risk, a.status,
-            a.payload, a.decision_comment, decider.nickname AS decided_by_name,
+            a.payload, a.decision_comment, a.decided_by, decider.nickname AS decided_by_name,
             a.decided_at, a.created_at
      FROM cloud_approvals a
      JOIN cloud_teams t ON t.id = a.team_id
@@ -6259,11 +7210,13 @@ async fn decide_approval(
             "审批决定必须为 approved 或 rejected",
         ));
     }
-    let team_id = sqlx::query_scalar::<_, Uuid>(
-        "SELECT team_id FROM cloud_approvals WHERE id = $1 AND status = 'pending'",
+    let mut transaction = cloud.db.begin().await.map_err(CloudError::database)?;
+    let initial = sqlx::query(
+        "SELECT team_id, requested_by, agent_task_id, terminal_session_id
+         FROM cloud_approvals WHERE id = $1 AND status = 'pending'",
     )
     .bind(approval_id)
-    .fetch_optional(&cloud.db)
+    .fetch_optional(&mut *transaction)
     .await
     .map_err(CloudError::database)?
     .ok_or_else(|| {
@@ -6273,14 +7226,86 @@ async fn decide_approval(
             "审批不存在或已经处理",
         )
     })?;
-    require_team_role(
-        &cloud,
-        team_id,
-        user.user_id,
-        &["owner", "admin", "approver"],
+    let requested_by: Uuid = initial.get("requested_by");
+    if requested_by == user.user_id {
+        return Err(CloudError::new(
+            StatusCode::FORBIDDEN,
+            "approval_self_forbidden",
+            "审批请求人不能处理自己的审批",
+        ));
+    }
+
+    // Lock linked resources before the approval row. Cancellation and the
+    // compatibility task-approval endpoint use the same order, preventing a
+    // task/approval deadlock under concurrent decisions.
+    if let Some(task_id) = initial.get::<Option<Uuid>, _>("agent_task_id") {
+        sqlx::query(
+            "SELECT id FROM cloud_agent_tasks
+             WHERE id = $1 AND approval_id = $2 FOR UPDATE",
+        )
+        .bind(task_id)
+        .bind(approval_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(CloudError::database)?
+        .ok_or_else(agent_task_approval_invalid_error)?;
+    }
+    if let Some(session_id) = initial.get::<Option<Uuid>, _>("terminal_session_id") {
+        sqlx::query(
+            "SELECT id FROM cloud_terminal_sessions
+             WHERE id = $1 AND approval_id = $2 FOR UPDATE",
+        )
+        .bind(session_id)
+        .bind(approval_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(CloudError::database)?
+        .ok_or_else(|| {
+            CloudError::new(
+                StatusCode::FORBIDDEN,
+                "terminal_approval_invalid",
+                "the linked terminal approval does not match the session",
+            )
+        })?;
+    }
+    let approval = sqlx::query(
+        "SELECT team_id, requested_by, agent_task_id, terminal_session_id, status
+         FROM cloud_approvals WHERE id = $1 FOR UPDATE",
     )
-    .await?;
-    let result = sqlx::query(
+    .bind(approval_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(CloudError::database)?;
+    if approval.get::<String, _>("status") != "pending"
+        || approval.get::<Uuid, _>("requested_by") != requested_by
+    {
+        return Err(CloudError::new(
+            StatusCode::CONFLICT,
+            "approval_closed",
+            "该审批刚刚被其他成员处理",
+        ));
+    }
+    let team_id: Uuid = approval.get("team_id");
+    let role = sqlx::query_scalar::<_, String>(
+        "SELECT role FROM cloud_team_members
+         WHERE team_id = $1 AND user_id = $2 FOR SHARE",
+    )
+    .bind(team_id)
+    .bind(user.user_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(CloudError::database)?;
+    if !role
+        .as_deref()
+        .is_some_and(|role| ["owner", "admin", "approver"].contains(&role))
+    {
+        return Err(CloudError::new(
+            StatusCode::FORBIDDEN,
+            "team_approval_required",
+            "只有团队所有者、管理员或审批人可以处理审批",
+        ));
+    }
+    sqlx::query(
         "UPDATE cloud_approvals
          SET status = $2, decision_comment = $3, decided_by = $4, decided_at = NOW()
          WHERE id = $1 AND status = 'pending'",
@@ -6289,16 +7314,30 @@ async fn decide_approval(
     .bind(&request.decision)
     .bind(request.comment.trim())
     .bind(user.user_id)
-    .execute(&cloud.db)
+    .execute(&mut *transaction)
     .await
     .map_err(CloudError::database)?;
-    if result.rows_affected() == 0 {
-        return Err(CloudError::new(
-            StatusCode::CONFLICT,
-            "approval_closed",
-            "该审批刚刚被其他成员处理",
-        ));
-    }
+    sync_agent_task_after_approval(
+        &mut transaction,
+        approval_id,
+        approval.get("agent_task_id"),
+        team_id,
+        requested_by,
+        user.user_id,
+        &request.decision,
+    )
+    .await?;
+    sync_terminal_after_approval(
+        &mut transaction,
+        approval_id,
+        approval.get("terminal_session_id"),
+        team_id,
+        requested_by,
+        user.user_id,
+        &request.decision,
+    )
+    .await?;
+    transaction.commit().await.map_err(CloudError::database)?;
     let sql = format!("{APPROVAL_SELECT} WHERE a.id = $1");
     let row = sqlx::query(&sql)
         .bind(approval_id)
@@ -7414,6 +8453,34 @@ mod tests {
             )
             .is_err()
         );
+        for path in [
+            ".env",
+            "database.db",
+            "logs/.env",
+            "logs/world.sqlite3",
+            "server.log",
+        ] {
+            assert!(
+                validate_agent_task_input(
+                    "log.tail",
+                    &json!({ "path": path, "lines": 10, "max_bytes": 1024 }),
+                    false
+                )
+                .is_err(),
+                "accepted unsafe log path {path}"
+            );
+        }
+        for path in ["logs/latest.log", "crash-reports/crash-1.log"] {
+            assert!(
+                validate_agent_task_input(
+                    "log.tail",
+                    &json!({ "path": path, "lines": 10, "max_bytes": 1024 }),
+                    false
+                )
+                .is_ok(),
+                "rejected allowed log path {path}"
+            );
+        }
     }
 
     #[test]
@@ -7537,6 +8604,10 @@ mod tests {
         assert!(expired_error.contains("result unknown"));
         assert!(expired_event.contains("not acknowledged"));
         assert!(expired_event.contains("result is unknown"));
+        assert!(expired_leased_task_can_requeue("low", true));
+        assert!(expired_leased_task_can_requeue("high", true));
+        assert!(!expired_leased_task_can_requeue("high", false));
+        assert!(!expired_leased_task_can_requeue("critical", false));
         assert!(validate_task_completion_values("cancelled", &None, &None, &None, true).is_ok());
         assert!(validate_task_completion_values("cancelled", &None, &None, &None, false).is_err());
     }

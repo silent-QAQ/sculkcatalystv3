@@ -121,11 +121,22 @@ $approval = Invoke-Cloud POST '/api/cloud/approvals' @{
     risk = 'high'
     payload = @{ server_id = 'integration-test'; action = 'restart' }
 } $memberToken
+$selfApprovalRejected = $false
+try {
+    Invoke-Cloud POST "/api/cloud/approvals/$($approval.id)/decision" @{
+        decision = 'approved'
+        comment = 'Requester must not self-approve'
+    } $memberToken | Out-Null
+} catch {
+    $selfApprovalRejected = $_.Exception.Response.StatusCode.value__ -eq 403
+}
+Assert-Cloud $selfApprovalRejected 'approval requester should not be able to self-approve'
 $decidedApproval = Invoke-Cloud POST "/api/cloud/approvals/$($approval.id)/decision" @{
     decision = 'approved'
     comment = 'Integration test passed'
 } $adminToken
 Assert-Cloud ($decidedApproval.status -eq 'approved') 'admin should approve remote request'
+Assert-Cloud ($decidedApproval.requested_by -ne $decidedApproval.decided_by) 'approval requester and decision maker should differ'
 
 $provider = Invoke-Cloud PUT '/api/cloud/admin/relay-provider' @{
     name = 'Local Integration Upstream'
@@ -173,6 +184,9 @@ Assert-Cloud $logoutRejected 'logged-out session should be rejected'
     device_revoked = $revokedSessionRejected
     team_members = $members.Count
     approval_status = $decidedApproval.status
+    self_approval_rejected = $selfApprovalRejected
+    approval_requester = $decidedApproval.requested_by
+    approval_decision_maker = $decidedApproval.decided_by
     relay_reply = $relayResponse.choices[0].message.content
     relay_tokens = $usage.total_tokens
     deployment_reserved_501 = $deploymentReserved
