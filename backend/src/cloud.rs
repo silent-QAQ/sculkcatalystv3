@@ -1522,9 +1522,9 @@ fn validate_agent_task_input(
         "server.properties.update" => {
             require_exact_task_keys(object, &["path", "changes"], &[])?;
             validate_relative_task_path(&object["path"])?;
-            if !object["path"]
+            if object["path"]
                 .as_str()
-                .is_some_and(|path| path.rsplit(['/', '\\']).next() == Some("server.properties"))
+                .is_none_or(|path| path.rsplit(['/', '\\']).next() != Some("server.properties"))
             {
                 return Err(CloudError::bad_request(
                     "server.properties.update must target server.properties",
@@ -1707,7 +1707,7 @@ fn validate_task_completion_values(
     artifacts: &Option<Value>,
     allow_cancelled: bool,
 ) -> CloudResult<()> {
-    if !["succeeded", "failed"].contains(&status) && !(allow_cancelled && status == "cancelled") {
+    if !(["succeeded", "failed"].contains(&status) || allow_cancelled && status == "cancelled") {
         return Err(CloudError::bad_request(
             "completion status must be succeeded, failed, or an acknowledged cancellation",
         ));

@@ -1682,10 +1682,13 @@ fn sanitized_cli_stderr(stderr: &[u8]) -> String {
     redact_secrets(String::from_utf8_lossy(stderr).into_owned(), &secrets)
 }
 
+#[cfg(windows)]
 fn hide_cli_window(command: &mut Command) {
-    #[cfg(windows)]
     command.creation_flags(0x0800_0000);
 }
+
+#[cfg(not(windows))]
+fn hide_cli_window(_command: &mut Command) {}
 
 async fn stream_cli_agent(
     agent: &AiAgent,

@@ -812,10 +812,7 @@ pub(crate) async fn maybe_ask_knowledge_group(
     }
     let _ = persist(state, &data).await;
     if replied {
-        format!(
-            "已通过 QQ 机器人向指定群 {} 发起协查，等待群内回复后继续确认。",
-            group_id
-        )
+        format!("已通过 QQ 机器人向指定群 {group_id} 发起协查，等待群内回复后继续确认。")
     } else {
         "已尝试调用 QQ 机器人，但 NapCat 未成功发出消息；请检查 QQ 机器人连接和群号配置。".into()
     }
