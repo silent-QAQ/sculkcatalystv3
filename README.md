@@ -30,6 +30,17 @@ Sculk Catalyst V3 是一个 AI 驱动的 Minecraft 服务器工作台。它把�
 
 最后审计：2026-08-01。
 
+本轮项目审计已关闭以下问题：资源搜索输入可能带入本地路径、Token 或密码等敏感词；Rust 1.88 下后端 Clippy 与跨平台 CI 不一致；Cloud、Agent、资源中心的启动入口和配置说明不完整。对应代码修复和验证已合入 `main`，但这不代表项目已经具备公网生产环境所需的登录、RBAC、沙箱和高可用能力。
+
+| 审计项 | 处理结果 | 验证依据 |
+| --- | --- | --- |
+| 资源搜索敏感输入 | 已修复：过滤 Windows/Unix 路径、`token`、`password` 等词后再进入搜索上下文 | [`backend/src/server_intelligence.rs`](backend/src/server_intelligence.rs)，提交 `8db1fa3` |
+| Rust 1.88 Clippy | 已修复：后端 Clippy 规则与 CI 命令已对齐 | [`.github/workflows/ci.yml`](.github/workflows/ci.yml)，提交 `1da86f2` |
+| 跨平台 CI | 已验证：Ubuntu 后端、Windows 后端、前端构建均通过 | [Actions run 30675684790](https://github.com/silent-QAQ/sculkcatalystv3/actions/runs/30675684790) |
+| README 操作闭环 | 已补齐：运行模式、Cloud/Agent、资源中心、配置、API、排错和备份说明 | [README 当前版本](https://github.com/silent-QAQ/sculkcatalystv3/blob/main/README.md) |
+
+仍属于产品功能缺口的内容，以本节下方“主要缺口”和“已知限制与安全边界”为准，不会因为审计项关闭而被标记为已实现。
+
 | 模块 | 当前状态 | 已具备能力 | 主要缺口 |
 | --- | --- | --- | --- |
 | 本地工作台 | 已实现 MVP | 多服务器导航、项目模式、对话树、服务器控制、任务和设置中心 | 桌面端打包、系统托盘和自动升级 |
