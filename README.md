@@ -11,6 +11,8 @@ Sculk Catalyst V3 是一个 AI 驱动的 Minecraft 服务器工作台。它把�
 - [项目状态](#项目状态)
 - [功能概览](#功能概览)
 - [运行架构](#运行架构)
+- [运行模式](#运行模式)
+- [API 快速参考](#api-快速参考)
 - [环境要求](#环境要求)
 - [本地开发](#本地开发)
 - [本地生产构建](#本地生产构建)
@@ -18,6 +20,7 @@ Sculk Catalyst V3 是一个 AI 驱动的 Minecraft 服务器工作台。它把�
 - [资源中心](#资源中心)
 - [配置项](#配置项)
 - [测试与 CI](#测试与-ci)
+- [常见问题与排错](#常见问题与排错)
 - [目录结构](#目录结构)
 - [已知限制与安全边界](#已知限制与安全边界)
 - [文档索引](#文档索引)
@@ -96,6 +99,12 @@ Sculk Catalyst V3 是一个 AI 驱动的 Minecraft 服务器工作台。它把�
 - Windows Shell 使用 Job Object，Unix Shell 使用独立进程组清理进程树。
 - Agent 的 `full` Shell 权限不是沙箱；命令最终受运行 Agent 的操作系统账号权限约束，Cloud 审批也不等价于文件系统隔离。
 
+### 机器人与外部集成
+
+- QQ/NapCat、Bilibili、抖音和通用 webhook 适配器的配置集中在 `.env.bot.example` 与 [`docs/BOT_INTEGRATIONS.md`](docs/BOT_INTEGRATIONS.md)。
+- QQ 群消息需要显式 @ 机器人后才触发回复；私聊按适配器规则处理。
+- 入站 webhook 使用 `SCULK_BOT_WEBHOOK_TOKEN` 校验，出站回复交给 NapCat 或平台桥接服务；这些令牌不应写进前端或提交到仓库。
+
 ## 运行架构
 
 ```mermaid
@@ -112,6 +121,36 @@ flowchart LR
 ```
 
 本地模式可以只运行 Rust 后端和前端开发服务器；Cloud 模式额外需要 PostgreSQL 与 Redis；独立资源中心可以把目录 API、Caddy 静态对象和主站前端分开部署。
+
+## 运行模式
+
+| 模式 | 后端/入口 | 依赖 | 适用场景 |
+| --- | --- | --- | --- |
+| 本地工作台 | Rust API `127.0.0.1:8787`，前端 `127.0.0.1:5173` | JSON 状态文件；运行 Minecraft 时需要 Java | 单机管理服务器、开发和功能验证 |
+| Cloud Web | Cloud API：Docker 本地通常为 `127.0.0.1:8787`，Windows 原生脚本为 `127.0.0.1:8788` | PostgreSQL、Redis、`SCULK_MASTER_KEY` | 账号、团队、设备和 Agent 协作 |
+| 独立资源管理 | 前端 `/resource-admin`，资源 API 可为官方源站或自部署域名 | 资源中心 Rust API；可选 Caddy 和对象目录 | 管理核心、插件、皮肤、Skill 等资源 |
+| 主机 Agent | 主机侧 `sculk-agent` 主动连接 Cloud | Rust 编译产物、可访问 Cloud 的 HTTPS 地址 | 管理与 Cloud 不在同一台机器的服务器 |
+
+本地工作台和 Cloud 可以并行运行，但必须使用不同的监听端口和状态文件；推荐 Cloud 使用 `SCULK_STATE_FILE=data/state-cloud.json`，避免两个后端同时写入同一个 `state.json`。
+
+## API 快速参考
+
+以下是最常用的入口，完整路由和请求结构以代码及专项文档为准：
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/api/health` | 后端健康检查，返回 `ok` |
+| `GET` | `/api/dashboard` | 读取工作台总览、服务器和任务状态 |
+| `POST` | `/api/servers` | 创建服务器并生成首次初始化任务 |
+| `POST` | `/api/servers/{id}/provision` | 启动或重试核心初始化 |
+| `POST` | `/api/servers/{id}/action` | 启动、停止或重启服务器进程 |
+| `POST` | `/api/servers/{id}/command` | 向运行中的服务器 stdin 发送命令 |
+| `GET` | `/api/servers/{id}/ws/logs` | 订阅实时日志 WebSocket |
+| `POST` | `/api/chat/stream` | 获取 SSE 流式 AI 对话回复 |
+| `GET` | `/api/resource-catalog/...` | 主控制台读取远程资源目录的同源只读代理 |
+| `GET` | `/api/openapi.json` | 独立资源中心的 OpenAPI 描述 |
+
+Cloud 路由统一位于 `/api/cloud/...`，包括账号、团队、Agent、任务、终端、Token 和用量；资源中心自身的目录接口位于 `/api/catalog/...`，不要将这两套路由与主控制台的 `/api/resource-catalog/...` 代理混用。
 
 ## 环境要求
 
@@ -133,7 +172,7 @@ flowchart LR
 
 ### Windows PowerShell
 
-在第一个终端启动后端：
+在第一个终端启动本地后端：
 
 ```powershell
 Set-Location backend
@@ -148,15 +187,20 @@ npm ci
 npm run dev
 ```
 
-打开 <http://127.0.0.1:5173>。Vite 开发服务器默认把 API 请求代理到本地后端；如需调整地址，查看 `frontend/vite.config.ts` 和环境变量示例。
+打开 <http://127.0.0.1:5173>。Vite 开发服务器默认把 `/api` 请求代理到 `http://127.0.0.1:8787`；如果后端端口不同，在启动前端的终端设置 `VITE_API_PROXY`。
 
 ### Linux / macOS shell
+
+终端 1：
 
 ```bash
 cd backend
 cargo run
+```
 
-# 另开终端
+终端 2：
+
+```bash
 cd frontend
 npm ci
 npm run dev
@@ -166,8 +210,19 @@ npm run dev
 
 ```bash
 cd frontend
+VITE_API_PROXY=http://127.0.0.1:8788 \
 npm run dev:cloud
 ```
+
+Windows PowerShell 对应写法：
+
+```powershell
+Set-Location frontend
+$env:VITE_API_PROXY = 'http://127.0.0.1:8788'
+npm run dev:cloud
+```
+
+Cloud 前端仍然由 Vite 提供，默认访问 <http://127.0.0.1:5173>；它只是把 API 代理到 Cloud 后端，不会替代 PostgreSQL、Redis 或 Rust API。
 
 ## 本地生产构建
 
@@ -229,45 +284,112 @@ Linux 启动脚本使用 `/api/health`，Windows 启动脚本使用 `/api/dashbo
 
 ### Cloud 本地依赖
 
-复制示例配置并启动 PostgreSQL、Redis：
+Cloud 本地开发推荐使用 Docker Compose 这一套端口：PostgreSQL 为 `127.0.0.1:5432`，Redis 为 `127.0.0.1:6379`，Rust 后端默认监听 `127.0.0.1:8787`，前端默认监听 `127.0.0.1:5173`。复制示例配置前，如果根目录已经存在 `.env`，请手动合并变量，不要覆盖已有密钥：
 
 ```powershell
 docker compose -f docker-compose.cloud.yml up -d
 Copy-Item .env.cloud.example .env
 ```
 
-至少配置：
+本地配置至少应确认以下值：
 
 ```text
-DATABASE_URL
-REDIS_URL
-SCULK_MASTER_KEY
-SCULK_CLOUD_PUBLIC_URL
-SCULK_ALLOWED_ORIGINS
+DATABASE_URL=postgres://sculk:sculk_dev_password@127.0.0.1:5432/sculk_cloud
+REDIS_URL=redis://127.0.0.1:6379/
+SCULK_MASTER_KEY=请替换为至少 24 个字符的随机值
+SCULK_CLOUD_PUBLIC_URL=http://127.0.0.1:8787
+SCULK_BIND_ADDRESS=127.0.0.1:8787
+SCULK_STATE_FILE=data/state-cloud.json
+SCULK_ALLOWED_ORIGINS=http://127.0.0.1:5173
 ```
 
-`SCULK_MASTER_KEY` 用于 Cloud 上游凭据加密，生产环境必须替换为独立高熵值；对外部署时必须使用 HTTPS 反向代理，并限制 PostgreSQL、Redis 只允许内网访问。详细的数据库迁移、会话、Token 和部署边界见 [`docs/SCULK_CLOUD.md`](docs/SCULK_CLOUD.md)。
+启动完整 Cloud 开发链路：
+
+```powershell
+# 终端 1：从项目根目录启动 Rust API；启动时会自动执行 backend/migrations
+Set-Location backend
+cargo run
+
+# 终端 2：启动 Cloud 前端
+Set-Location ..\frontend
+npm ci
+$env:VITE_API_PROXY = 'http://127.0.0.1:8787'
+npm run dev:cloud
+```
+
+打开 <http://127.0.0.1:5173>，进入“设置 > Sculk Cloud”注册首个账号；数据库中的第一个账号会自动成为 Cloud 管理员。`SCULK_MASTER_KEY` 用于 Cloud 上游凭据加密，生产环境必须替换为独立高熵值。
+
+仓库还提供 `scripts/start-cloud.ps1`，但它是另一套 Windows 原生运行链路，不要与 Docker Compose 的端口混用：它要求本机 PostgreSQL 18、`.runtime\redis` 中的 Redis、`backend\target-cloud\debug\backend.exe`，并使用 PostgreSQL `127.0.0.1:55432`、Redis `127.0.0.1:56379`、Cloud 后端 `127.0.0.1:8788`。需要使用该脚本时，应先按脚本要求准备运行时、设置对应 `DATABASE_URL`/`REDIS_URL`，再执行：
+
+```powershell
+Set-Location backend
+$env:CARGO_TARGET_DIR = 'target-cloud'
+cargo build
+Set-Location ..
+.\scripts\start-cloud.ps1
+```
+
+生产环境对外部署必须使用 HTTPS 反向代理，并限制 PostgreSQL、Redis 只允许内网访问。`SCULK_CLOUD_PUBLIC_URL` 必须是 Agent 可访问的 HTTPS 根地址，不能包含账号密码、查询参数或片段；只有 `localhost` 或回环地址的本地开发环境允许使用 HTTP。详细的数据库迁移、会话、Token 和部署边界见 [`docs/SCULK_CLOUD.md`](docs/SCULK_CLOUD.md)。
 
 ### 构建和运行 Agent
 
 ```bash
 cd agent
 cargo build --release --locked
-```
 
-配对示例：
-
-```bash
-sculk-agent pair --cloud <https-cloud-url> --code <pairing-code> --name <host-name> \
-  --workspace <workspace-label> --workspace-root <path> \
+agent_bin='./target/release/sculk-agent'
+"$agent_bin" pair \
+  --cloud "$CLOUD_URL" \
+  --code "$PAIRING_CODE" \
+  --name 'mc-host' \
+  --workspace 'minecraft' \
+  --workspace-root '/srv/minecraft' \
   --permissions full \
   --capabilities heartbeat,tasks-v1,task-checkpoints-v1,shell-v1,terminal-v1
-sculk-agent run
+"$agent_bin" run
 ```
 
-Agent 默认只向 Cloud 发起 HTTPS 请求。配对码是一次性短时凭据，完成配对后应依赖指纹确认和已保存的 Agent 凭据运行。下载平台、配置文件、权限模型和 Shell 风险见 [`docs/SCULK_AGENT.md`](docs/SCULK_AGENT.md)。
+Windows PowerShell 对应命令：
+
+```powershell
+Set-Location agent
+cargo build --release --locked
+
+$agent = '.\target\release\sculk-agent.exe'
+& $agent pair `
+  --cloud 'https://your-cloud.example.com' `
+  --code 'scp_replace_with_pairing_code' `
+  --name 'mc-host' `
+  --workspace 'minecraft' `
+  --workspace-root 'D:\minecraft' `
+  --permissions full `
+  --capabilities 'heartbeat,tasks-v1,task-checkpoints-v1,shell-v1,terminal-v1'
+& $agent run
+```
+
+构建产物不会自动安装到 PATH；Windows 路径是 `agent\target\release\sculk-agent.exe`，Linux/macOS 路径是 `agent/target/release/sculk-agent`。Agent 默认只向 Cloud 发起 HTTPS 请求，Windows 默认配置保存在 `%APPDATA%\SculkCatalyst\agent.json`。配对码是一次性短时凭据，完成配对后还需要在 Cloud 控制台确认指纹。下载版命令、配置文件、权限模型和 Shell 风险见 [`docs/SCULK_AGENT.md`](docs/SCULK_AGENT.md)。
 
 ## 资源中心
+
+资源 API 有两个前端入口：主控制台默认使用同源只读代理 `/api/resource-catalog`；独立 `/resource-admin` 页面默认直连官方源站 `https://res.mcmy.love`。构建时设置 `VITE_RESOURCE_API_BASE` 可以让独立管理页指向自部署资源域名，例如：
+
+```powershell
+$env:VITE_RESOURCE_API_BASE = 'https://resources.example.com'
+Set-Location frontend
+npm run build
+```
+
+主控制台的 Rust 代理由 `SCULK_RESOURCE_API_BASE` 指定上游，未配置时也回退到 `https://res.mcmy.love`。该代理只允许公开资源的 `GET`/`HEAD` 读取，不转发管理写入、Authorization 或 Cookie；创建、修改、删除和上传资源时，应让 `/resource-admin` 直连资源服务，并在 HTTPS 反向代理层配置认证。
+
+资源中心的核心 API 包括：
+
+- `GET /api/catalog/{resource}`：查询资源项目；
+- `GET /api/catalog/{resource}/{slug}/versions`：查询项目版本；
+- `GET /api/catalog/summary`：读取目录摘要；
+- `GET /api/v1/resolve`：按资源、Minecraft 版本和渠道解析兼容版本；
+- `GET /api/v1/plugins/search`：搜索插件；
+- `GET /api/v1/download/{kind}/{project}/{version}`：下载或重定向到资源文件；
+- `GET /api/openapi.json`：查看 OpenAPI 3.1 描述。
 
 本地或独立资源中心使用 `.env.resource-center.example` 配置。常见部署文件包括：
 
@@ -277,9 +399,14 @@ Agent 默认只向 Cloud 发起 HTTPS 请求。配对码是一次性短时凭据
 - `deploy/sculk-resource-backup.service`
 - `deploy/sculk-resource-backup.timer`
 - `deploy/Caddyfile.resources`
+- `deploy/Caddyfile.resources.example`
 - `scripts/deploy-resource-center.ps1`
 
-资源管理页路径为 `/resource-admin`。浏览器管理页使用账号密码，自动化客户端使用 Bearer Token；生产环境应使用 HTTPS、精确的 CORS 来源和高熵令牌，不要把源站写接口直接暴露在公网。完整的对象上传、镜像同步、备份和 Caddy 配置见 [`docs/RESOURCE_CENTER.md`](docs/RESOURCE_CENTER.md)。
+资源管理页路径为 `/resource-admin`。浏览器管理页使用 `SCULK_CATALOG_ADMIN_USERNAME`/`SCULK_CATALOG_ADMIN_PASSWORD` 的 Basic Auth，自动化客户端使用 `SCULK_CATALOG_ADMIN_TOKEN` 的 Bearer Token；Caddy 的 `SCULK_RESOURCE_API_TOKEN` 应与后者保持一致，`SCULK_CATALOG_ADMIN_BASIC_AUTH` 仅供 Caddy 匹配浏览器凭证。不要把令牌或密码写入 `VITE_*` 前端构建变量。
+
+对象存储常用配置为：`SCULK_RESOURCE_OBJECT_DIR`（Rust 写入目录，默认 `data/objects`）、`SCULK_RESOURCE_OBJECT_ROOT`（Caddy 静态服务目录，应与前者一致）、`SCULK_RESOURCE_PUBLIC_BASE`（生成公开下载 URL 的基地址）和 `SCULK_RESOURCE_UPLOAD_MAX_BYTES`（默认 256 MiB，实际限制范围 1 MiB–2 GiB）。主控制台代理响应上限由 `SCULK_RESOURCE_PROXY_MAX_BYTES` 控制，默认 16 MiB，实际范围 64 KiB–64 MiB。
+
+如果直接暴露资源中心 Rust 后端，必须至少配置一套服务端认证；不要依赖 Caddy 单层保护，也不要在未配置认证变量时将写接口暴露到公网。完整的对象上传、镜像同步、备份和 Caddy 配置见 [`docs/RESOURCE_CENTER.md`](docs/RESOURCE_CENTER.md)。
 
 ## 配置项
 
@@ -293,11 +420,25 @@ Agent 默认只向 Cloud 发起 HTTPS 请求。配对码是一次性短时凭据
 | `SCULK_STATE_FILE` | JSON 状态文件路径 | 默认是 `SCULK_DATA_DIR/state.json` |
 | `SCULK_JAVA_BIN` | 指定 Java 可执行文件 | 优先级高于托管 Java、`JAVA_HOME` 和 PATH |
 | `SCULK_ALLOWED_ORIGINS` | CORS 允许的前端来源 | 生产环境填写精确来源，不要使用宽泛通配 |
-| `SCULK_RESOURCE_API_BASE` | 主站连接的独立资源 API | 未配置时回退到同源 API |
+| `SCULK_RESOURCE_API_BASE` | 主控制台只读代理连接的资源 API 上游 | 未配置时回退到 `https://res.mcmy.love` |
+| `SCULK_RESOURCE_PROXY_MAX_BYTES` | 主控制台资源代理的单响应上限 | 默认 16 MiB，实际范围 64 KiB–64 MiB |
+| `SCULK_RESOURCE_API_TOKEN` | 反向代理层校验资源同步写请求的令牌 | 由 Caddy 使用，应与 `SCULK_CATALOG_ADMIN_TOKEN` 保持一致 |
+| `SCULK_CATALOG_ADMIN_TOKEN` | 资源目录 Rust 写接口 Bearer Token | 至少 16 字符；生产环境必须配置 |
+| `SCULK_CATALOG_ADMIN_USERNAME` / `SCULK_CATALOG_ADMIN_PASSWORD` | 资源管理页 Basic Auth | 密码 8–256 字符；只配置在服务端 |
+| `SCULK_CATALOG_ADMIN_BASIC_AUTH` | Caddy 匹配完整 Basic 凭证的 Base64 值 | 仅供反向代理使用，不写入前端 |
+| `SCULK_RESOURCE_OBJECT_DIR` / `SCULK_RESOURCE_OBJECT_ROOT` | Rust 对象写入目录 / Caddy 静态对象目录 | 两者应指向同一目录 |
+| `SCULK_RESOURCE_PUBLIC_BASE` | 资源上传响应中生成公开下载 URL 的基地址 | 生产环境填写 HTTPS 资源域名 |
+| `SCULK_RESOURCE_UPLOAD_MAX_BYTES` | 资源上传大小上限 | 默认 256 MiB，实际范围 1 MiB–2 GiB |
 | `DATABASE_URL` / `REDIS_URL` | 启用 Cloud 数据层 | 未同时配置时本地模式仍可运行 |
 | `SCULK_MASTER_KEY` | Cloud 上游凭据加密密钥 | 至少 24 字符，生产环境使用独立随机值 |
+| `SCULK_CLOUD_PUBLIC_URL` | Agent bootstrap 使用的 Cloud 根地址 | 生产必须是 Agent 可访问的 HTTPS 根地址 |
+| `SCULK_CLOUD_SESSION_DAYS` / `SCULK_CLOUD_RATE_LIMIT` | Cloud 会话期限 / Token 每分钟请求上限 | 示例值分别为 30 / 60 |
+| `SCULK_NAPCAT_API_URL` / `SCULK_NAPCAT_ACCESS_TOKEN` | NapCat OneBot HTTP API 地址 / Bearer Token | 见 `.env.bot.example` |
+| `SCULK_BOT_WEBHOOK_TOKEN` | 入站机器人 webhook 共享令牌 | 建议配置高熵随机值 |
+| `VITE_API_PROXY` | Vite 开发服务器的 `/api` 代理目标 | 默认 `http://127.0.0.1:8787` |
+| `VITE_RESOURCE_API_BASE` | 前端资源 API 地址构建覆盖项 | 不配置时主控制台代理，`/resource-admin` 默认官方源站 |
 
-完整变量名按场景拆分在 `.env.*.example` 中，包括机器人、Cloud、主站资源同步和独立资源中心。真实 `.env`、数据库状态、令牌和运行时密钥不会随项目发布。
+完整变量名按场景拆分在 `.env.*.example` 中，包括机器人、Cloud、主站资源同步和独立资源中心。`VITE_*` 会进入前端构建产物，只能放公开地址，不能放密码、API Key 或令牌。真实 `.env`、数据库状态、令牌和运行时密钥不会随项目发布。
 
 ## 测试与 CI
 
@@ -307,7 +448,7 @@ Agent 默认只向 Cloud 发起 HTTPS 请求。配对码是一次性短时凭据
 cd backend
 cargo fmt --check
 cargo check --all-targets --locked
-cargo clippy --all-targets --locked -- -D warnings
+cargo clippy --all-targets --locked -- -D warnings -A clippy::too_many_arguments
 cargo test --all-targets --locked
 
 cd ../agent
@@ -326,7 +467,46 @@ npm run build
 - `scripts/cloud-smoke-test.ps1`：Cloud API 冒烟测试。
 - `bash -n scripts/*.sh` 与 ShellCheck：Linux 启停脚本检查。
 
-GitHub Actions 工作流见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)，当前覆盖 Ubuntu/Windows 后端矩阵、Rust 格式化、check、Clippy、测试、Linux shell 检查和 Node 24 前端构建。上述 PowerShell E2E 脚本不是每次 CI 的默认步骤，需要按场景单独运行。
+GitHub Actions 工作流见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)，当前覆盖 Ubuntu/Windows 后端矩阵、Rust 格式化、check、Clippy、测试、Linux shell 检查和 Node 24 前端构建。`agent` 的检查目前是本地额外检查，不属于当前 Actions 的必跑 job。上述 PowerShell E2E 脚本也不是每次 CI 的默认步骤，需要按场景单独运行。最近一次三项 CI job 全部通过的运行记录为 [Actions run 30675684790](https://github.com/silent-QAQ/sculkcatalystv3/actions/runs/30675684790)。
+
+## 常见问题与排错
+
+### 后端或前端端口被占用
+
+- 本地后端通过 `SCULK_BIND_ADDRESS` 修改监听地址，例如 `127.0.0.1:8790`；生产脚本也支持 `SCULK_PORT`。
+- 前端通过 `PORT` 修改 Vite 端口，同时把 `VITE_API_PROXY` 指向实际后端地址。
+- Cloud Docker 链路的 PostgreSQL、Redis 端口分别是 `5432`、`6379`；不要直接套用 `scripts/start-cloud.ps1` 的 `55432`、`56379`。
+
+### Cloud 不可用
+
+先确认容器和日志：
+
+```powershell
+docker compose -f docker-compose.cloud.yml ps
+docker compose -f docker-compose.cloud.yml logs postgres redis
+Invoke-RestMethod http://127.0.0.1:8787/api/cloud/status
+```
+
+再检查 `.env` 中的 `DATABASE_URL`、`REDIS_URL`、`SCULK_MASTER_KEY`、`SCULK_BIND_ADDRESS` 和 `SCULK_ALLOWED_ORIGINS`。后端启动时会执行迁移；如果迁移失败，应先查看启动终端或 `.runtime/backend.err.log`，不要反复删除数据库卷。
+
+### 前端显示 API 请求失败
+
+确认前端启动前设置的 `VITE_API_PROXY` 与后端监听地址一致；修改 Vite 环境变量后需要重启 `npm run dev`。资源管理页若报 CORS 或 401，分别检查 `VITE_RESOURCE_API_BASE`、`SCULK_ALLOWED_ORIGINS` 和资源中心的服务端认证变量。
+
+### Java 或服务器初始化失败
+
+运行 `java -version` 验证系统 Java；如果使用指定路径，检查 `SCULK_JAVA_BIN`，否则依次检查托管 Java、`JAVA_HOME` 和 PATH。初始化任务失败后可以通过工作台重试；后端重启能恢复任务队列，但不会重新接管已经在运行的旧 Java 进程。
+
+### 状态文件备份
+
+本地状态通常位于 `data/state.json`（若从 `backend` 目录启动，则为 `backend/data/state.json`），并可能有 `.bak` 和 `.lock` 文件。备份前先停止对应后端，确保同一状态文件只有一个进程写入：
+
+```powershell
+Copy-Item backend\data\state.json backend\data\state.json.manual-backup
+Copy-Item backend\data\state.json.bak backend\data\state.json.bak.manual-backup -ErrorAction SilentlyContinue
+```
+
+Cloud 的 `data/state-cloud.json` 与本地状态分开；资源中心对象目录和目录 JSON 的备份策略见 [`docs/RESOURCE_CENTER.md`](docs/RESOURCE_CENTER.md)。
 
 ## 目录结构
 
