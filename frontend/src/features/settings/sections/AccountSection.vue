@@ -32,12 +32,16 @@ const CloudConversationsView = defineAsyncComponent(() => import('../../cloud/Cl
 type CloudTab = 'overview' | 'agents' | 'tasks' | 'terminal' | 'conversations' | 'workspace' | 'api' | 'team' | 'approvals' | 'deployments'
 type AuthMode = 'login' | 'register'
 
-const props = withDefaults(defineProps<{ context?: 'desktop' | 'web'; initialTab?: CloudTab }>(), { context: 'desktop' })
+const props = withDefaults(defineProps<{
+  context?: 'desktop' | 'web'
+  initialTab?: CloudTab
+  initialAuthMode?: AuthMode
+}>(), { context: 'desktop', initialAuthMode: 'login' })
 const emit = defineEmits<{ applyServerTemplate: [template: ServerTemplate] }>()
 const isWeb = computed(() => props.context === 'web')
 
 const tab = ref<CloudTab>(props.initialTab || 'overview')
-const authMode = ref<AuthMode>('login')
+const authMode = ref<AuthMode>(props.initialAuthMode)
 const status = ref<CloudStatus | null>(null)
 const profile = ref<CloudProfile | null>(null)
 const devices = ref<CloudDevice[]>([])

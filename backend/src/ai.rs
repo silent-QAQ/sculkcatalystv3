@@ -1,12 +1,11 @@
 use crate::acp::AcpClient;
 use crate::cli_tools::{CLAUDE_EFFORTS, CODEX_EFFORTS, MODEL_EFFORTS};
 use crate::{
-    AppState, classify_intent, effective_task_start, intent_risk, internal, persist, rule_reply,
-    task_title,
+    AppState, effective_task_start, intent_risk, internal, persist, rule_reply, task_title,
 };
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Multipart, Path, State},
     http::StatusCode,
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post, put},
@@ -17,7 +16,8 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     convert::Infallible,
-    path::PathBuf,
+    io::Read,
+    path::{Path as FsPath, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
 };
@@ -47,6 +47,9 @@ const AGENT_KINDS: [&str; 5] = ["codex", "claude-code", "openclaw", "hermes", "c
 const HISTORY_CHAR_LIMIT: usize = 16_000;
 const CHAT_MESSAGE_CHAR_LIMIT: usize = 64_000;
 const CHAT_HISTORY_TURN_LIMIT: usize = crate::conversations::MAX_MESSAGES;
+const ACP_MAX_TEXT_FILE_BYTES: u64 = 2_000_000;
+const MAX_ASR_AUDIO_BYTES: usize = 25 * 1024 * 1024;
+const SPEECH_RECOGNITION_MODES: [&str; 2] = ["browser", "model"];
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct AiProvider {
@@ -91,6 +94,29 @@ pub(crate) struct AiAgent {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct SpeechRecognitionSettings {
+    #[serde(default = "default_speech_recognition_mode")]
+    pub(crate) mode: String,
+    #[serde(default = "default_speech_recognition_language")]
+    pub(crate) language: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_id: Option<String>,
+    #[serde(default = "default_speech_recognition_model")]
+    pub(crate) model_id: String,
+}
+
+impl Default for SpeechRecognitionSettings {
+    fn default() -> Self {
+        Self {
+            mode: default_speech_recognition_mode(),
+            language: default_speech_recognition_language(),
+            provider_id: None,
+            model_id: default_speech_recognition_model(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct AiSettings {
     #[serde(default)]
     pub(crate) providers: Vec<AiProvider>,
@@ -106,6 +132,8 @@ pub(crate) struct AiSettings {
     pub(crate) active_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub(crate) speech_recognition: SpeechRecognitionSettings,
 }
 
 impl Default for AiSettings {
@@ -118,6 +146,7 @@ impl Default for AiSettings {
             agents: Vec::new(),
             active_agent: None,
             reasoning_effort: None,
+            speech_recognition: SpeechRecognitionSettings::default(),
         }
     }
 }
@@ -128,6 +157,18 @@ fn default_agent_transport() -> String {
 
 fn default_review_mode() -> String {
     "approval".into()
+}
+
+fn default_speech_recognition_mode() -> String {
+    "browser".into()
+}
+
+fn default_speech_recognition_language() -> String {
+    "zh-CN".into()
+}
+
+fn default_speech_recognition_model() -> String {
+    "whisper-1".into()
 }
 
 #[derive(Serialize)]
@@ -168,6 +209,7 @@ struct AiSettingsView {
     reasoning_effort: Option<String>,
     reasoning_effort_values: &'static [&'static str],
     detected_agents: Vec<crate::cli_tools::DetectedAgent>,
+    speech_recognition: SpeechRecognitionSettings,
 }
 
 impl AiSettingsView {
@@ -182,6 +224,7 @@ impl AiSettingsView {
             reasoning_effort: settings.reasoning_effort.clone(),
             reasoning_effort_values: MODEL_EFFORTS,
             detected_agents,
+            speech_recognition: settings.speech_recognition.clone(),
         }
     }
 }
@@ -244,6 +287,11 @@ struct SetReviewModeRequest {
 #[derive(Deserialize)]
 struct SetReasoningEffortRequest {
     reasoning_effort: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TranscriptionResult {
+    text: String,
 }
 
 #[derive(Deserialize)]
@@ -322,6 +370,11 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/api/ai/scenarios", put(set_scenario))
         .route("/api/ai/review-mode", put(set_review_mode))
         .route("/api/ai/reasoning-effort", put(set_reasoning_effort))
+        .route("/api/ai/speech-recognition", put(set_speech_recognition))
+        .route(
+            "/api/ai/transcriptions",
+            post(transcribe_audio).layer(DefaultBodyLimit::max(MAX_ASR_AUDIO_BYTES + 1024 * 1024)),
+        )
         .route("/api/ai/agents", post(create_agent))
         .route(
             "/api/ai/agents/{id}",
@@ -371,6 +424,71 @@ fn authed(builder: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBu
     } else {
         builder.bearer_auth(api_key)
     }
+}
+
+fn validate_speech_recognition_settings(
+    settings: &SpeechRecognitionSettings,
+    providers: &[AiProvider],
+) -> Result<(), ApiError> {
+    if !SPEECH_RECOGNITION_MODES.contains(&settings.mode.as_str()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "语音识别模式仅支持 browser 或 model".into(),
+        ));
+    }
+    let language = settings.language.trim();
+    if language.is_empty()
+        || language.len() > 35
+        || (language != "auto"
+            && !language
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-'))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "识别语言必须是 auto 或有效的 BCP 47 语言标签".into(),
+        ));
+    }
+    if settings.model_id.trim().is_empty() || settings.model_id.trim().chars().count() > 200 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "ASR 模型 ID 不能为空且不能超过 200 个字符".into(),
+        ));
+    }
+    if settings.mode == "model" {
+        let provider_id = settings
+            .provider_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or((StatusCode::BAD_REQUEST, "ASR 模型模式必须选择提供商".into()))?;
+        if !providers.iter().any(|provider| provider.id == provider_id) {
+            return Err((StatusCode::BAD_REQUEST, "ASR 提供商不存在".into()));
+        }
+    }
+    Ok(())
+}
+
+fn upstream_transcription_language(language: &str) -> Option<String> {
+    let language = language.trim();
+    if language.is_empty() || language == "auto" {
+        None
+    } else {
+        Some(
+            language
+                .split('-')
+                .next()
+                .unwrap_or(language)
+                .to_ascii_lowercase(),
+        )
+    }
+}
+
+fn transcription_text(payload: &Value) -> Option<String> {
+    payload["text"]
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
 }
 
 fn validate_base_url(raw: &str) -> Result<String, ApiError> {
@@ -555,6 +673,10 @@ async fn delete_provider(
         .is_some_and(|binding| binding.provider_id == id)
     {
         data.ai.default_binding = None;
+    }
+    if data.ai.speech_recognition.provider_id.as_deref() == Some(id.as_str()) {
+        data.ai.speech_recognition.mode = default_speech_recognition_mode();
+        data.ai.speech_recognition.provider_id = None;
     }
     let view: AiSettingsView = (&data.ai).into();
     persist(&state, &data).await.map_err(internal)?;
@@ -863,6 +985,170 @@ async fn set_reasoning_effort(
     let view: AiSettingsView = (&data.ai).into();
     persist(&state, &data).await.map_err(internal)?;
     Ok(Json(view))
+}
+
+async fn set_speech_recognition(
+    State(state): State<AppState>,
+    Json(mut request): Json<SpeechRecognitionSettings>,
+) -> ApiResult<AiSettingsView> {
+    request.mode = request.mode.trim().to_ascii_lowercase();
+    request.language = request.language.trim().to_string();
+    request.provider_id = request
+        .provider_id
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty());
+    request.model_id = request.model_id.trim().to_string();
+    let mut data = state.inner.write().await;
+    validate_speech_recognition_settings(&request, &data.ai.providers)?;
+    data.ai.speech_recognition = request;
+    let view: AiSettingsView = (&data.ai).into();
+    persist(&state, &data).await.map_err(internal)?;
+    Ok(Json(view))
+}
+
+async fn transcribe_audio(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> ApiResult<TranscriptionResult> {
+    let (settings, provider) = {
+        let data = state.inner.read().await;
+        let settings = data.ai.speech_recognition.clone();
+        if settings.mode != "model" {
+            return Err((
+                StatusCode::CONFLICT,
+                "当前使用浏览器语音识别模式，不接受音频上传".into(),
+            ));
+        }
+        let provider_id = settings
+            .provider_id
+            .as_deref()
+            .ok_or((StatusCode::CONFLICT, "尚未配置 ASR 提供商".into()))?;
+        let provider = data
+            .ai
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .cloned()
+            .ok_or((StatusCode::CONFLICT, "配置的 ASR 提供商已不存在".into()))?;
+        if !provider.enabled {
+            return Err((StatusCode::CONFLICT, "配置的 ASR 提供商已停用".into()));
+        }
+        if settings.model_id.trim().is_empty() {
+            return Err((StatusCode::CONFLICT, "尚未配置 ASR 模型".into()));
+        }
+        (settings, provider)
+    };
+
+    let mut audio: Option<(Vec<u8>, String, Option<String>)> = None;
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("无效的录音上传请求：{error}"),
+        )
+    })? {
+        let name = field
+            .name()
+            .ok_or((StatusCode::BAD_REQUEST, "multipart 字段必须有名称".into()))?
+            .to_string();
+        if name != "audio" && name != "file" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("不支持的 multipart 字段：{name}"),
+            ));
+        }
+        if audio.is_some() {
+            return Err((StatusCode::BAD_REQUEST, "只能上传一个录音文件".into()));
+        }
+        let raw_filename = field.file_name().unwrap_or("recording.webm");
+        let filename = raw_filename
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("recording.webm")
+            .chars()
+            .filter(|character| {
+                character.is_ascii_alphanumeric() || ['.', '-', '_'].contains(character)
+            })
+            .take(120)
+            .collect::<String>();
+        let filename = if filename.is_empty() {
+            "recording.webm".to_string()
+        } else {
+            filename
+        };
+        let content_type = field.content_type().map(str::to_string);
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|error| (StatusCode::BAD_REQUEST, format!("读取录音失败：{error}")))?;
+        if bytes.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "录音文件为空".into()));
+        }
+        if bytes.len() > MAX_ASR_AUDIO_BYTES {
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, "录音不能超过 25 MiB".into()));
+        }
+        audio = Some((bytes.to_vec(), filename, content_type));
+    }
+    let (bytes, filename, content_type) =
+        audio.ok_or((StatusCode::BAD_REQUEST, "缺少 audio 录音字段".into()))?;
+
+    let mut audio_part = reqwest::multipart::Part::bytes(bytes).file_name(filename);
+    if let Some(content_type) = content_type {
+        audio_part = audio_part
+            .mime_str(&content_type)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "录音 Content-Type 无效".into()))?;
+    }
+    let mut form = reqwest::multipart::Form::new()
+        .text("model", settings.model_id.clone())
+        .text("response_format", "json")
+        .part("file", audio_part);
+    if let Some(language) = upstream_transcription_language(&settings.language) {
+        form = form.text("language", language);
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(180))
+        .build()
+        .map_err(|error| internal(error.to_string()))?;
+    let url = upstream_url(&provider.base_url, "/audio/transcriptions");
+    let response = authed(client.post(url), &provider.api_key)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| {
+            let status = if error.is_timeout() {
+                StatusCode::GATEWAY_TIMEOUT
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            (status, format!("ASR 请求失败：{error}"))
+        })?;
+    let status = response.status();
+    let body = response.bytes().await.map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("读取 ASR 响应失败：{error}"),
+        )
+    })?;
+    if body.len() > 1024 * 1024 {
+        return Err((StatusCode::BAD_GATEWAY, "ASR 响应过大".into()));
+    }
+    let body_text = String::from_utf8_lossy(&body).into_owned();
+    if !status.is_success() {
+        let redacted = redact_secrets(body_text, std::slice::from_ref(&provider.api_key));
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("ASR HTTP {}：{}", status.as_u16(), snippet(&redacted, 300)),
+        ));
+    }
+    let payload: Value = serde_json::from_slice(&body).map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("ASR 响应不是有效 JSON：{error}"),
+        )
+    })?;
+    let text = transcription_text(&payload)
+        .ok_or((StatusCode::BAD_GATEWAY, "ASR 响应缺少有效文本".into()))?;
+    Ok(Json(TranscriptionResult { text }))
 }
 
 fn validate_effort(effort: Option<&str>, supported: &[&str]) -> Result<(), ApiError> {
@@ -1206,12 +1492,211 @@ fn validate_chat_execution_targets(
     Ok(())
 }
 
+fn latest_task_for_chat<'a>(
+    data: &'a crate::PersistedState,
+    server_id: &str,
+    conversation_id: Option<&str>,
+) -> Option<&'a crate::TaskInfo> {
+    let linked = conversation_id
+        .and_then(|conversation_id| {
+            data.conversations.iter().find(|conversation| {
+                conversation.id == conversation_id && conversation.server_id == server_id
+            })
+        })
+        .and_then(|conversation| {
+            conversation
+                .messages
+                .iter()
+                .rev()
+                .filter_map(|message| message.task_id)
+                .find_map(|task_id| data.tasks.iter().find(|task| task.id == task_id))
+        });
+    linked.or_else(|| data.tasks.iter().find(|task| task.server_id == server_id))
+}
+
+fn active_bootstrap_task<'a>(
+    data: &'a crate::PersistedState,
+    server_id: &str,
+) -> Option<&'a crate::TaskInfo> {
+    data.tasks.iter().find(|task| {
+        task.server_id == server_id
+            && matches!(
+                task.kind.as_str(),
+                "server_bootstrap" | "server_provision" | "bootstrap"
+            )
+            && matches!(
+                task.status.as_str(),
+                "awaiting_approval" | "queued" | "running" | "cancelling"
+            )
+    })
+}
+
+fn is_task_follow_up(message: &str) -> bool {
+    let compact = message
+        .trim()
+        .trim_end_matches(['。', '！', '!', '？', '?'])
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    matches!(
+        compact.as_str(),
+        "继续"
+            | "继续吧"
+            | "下一步"
+            | "状态"
+            | "进度"
+            | "任务状态"
+            | "查看状态"
+            | "现在怎么样"
+            | "现在怎么样了"
+            | "怎么样了"
+            | "完成了吗"
+            | "好了吗"
+            | "ok"
+    )
+}
+
+fn human_server_status(status: &str) -> &str {
+    match status {
+        "online" => "在线",
+        "starting" => "启动中",
+        "stopping" => "停止中",
+        "planning" => "规划中",
+        "error" => "异常",
+        _ => "已停止",
+    }
+}
+
+fn current_server_fact(server: Option<&crate::ServerInfo>) -> String {
+    let Some(server) = server else {
+        return "当前工作区记录不存在。".into();
+    };
+    let core = if server.core.trim().is_empty() {
+        "核心尚未确定".into()
+    } else {
+        format!("{} {}", server.core, server.version)
+    };
+    let port = if server.port == 0 {
+        "端口尚未分配".into()
+    } else {
+        format!("端口 {}", server.port)
+    };
+    let mut fact = format!(
+        "当前服务器“{}”{}，{}，{}，核心文件{}就绪，操作状态为 {}。",
+        server.name,
+        human_server_status(&server.status),
+        core,
+        port,
+        if server.core_ready { "已" } else { "未" },
+        server.operation_state
+    );
+    if let Some(error) = server.last_error.as_deref()
+        && !error.trim().is_empty()
+    {
+        fact.push_str(&format!(" 最近错误：{error}"));
+    }
+    fact
+}
+
+fn task_follow_up_reply(task: &crate::TaskInfo, server: Option<&crate::ServerInfo>) -> String {
+    let fact = current_server_fact(server);
+    match task.status.as_str() {
+        "awaiting_approval" => format!(
+            "任务“{}”正在等待批准（{}%），批准前不会执行。\n\n{}",
+            task.title, task.progress, fact
+        ),
+        "queued" => format!(
+            "任务“{}”已进入执行队列（{}%），尚未开始执行。\n\n{}",
+            task.title, task.progress, fact
+        ),
+        "running" | "cancelling" => {
+            let event = task
+                .events
+                .last()
+                .map(|event| event.message.as_str())
+                .unwrap_or("执行器正在处理。");
+            format!(
+                "任务“{}”{}（{}%）。最新事件：{}\n\n{}",
+                task.title,
+                if task.status == "cancelling" {
+                    "正在取消并安全收尾"
+                } else {
+                    "正在执行"
+                },
+                task.progress,
+                event,
+                fact
+            )
+        }
+        "completed" => format!(
+            "任务“{}”已经完成。{}\n\n{}\n\n基础开服不会重复提交；请直接告诉我接下来要配置的玩法、插件或文件。",
+            task.title,
+            task.summary.as_deref().unwrap_or("执行器已确认完成。"),
+            fact
+        ),
+        "failed" | "interrupted" | "rollback_failed" => format!(
+            "任务“{}”未能完成：{}\n\n{}\n\n我不会自动重复执行；确认原因后可明确要求“重新执行任务”。",
+            task.title,
+            task.error.as_deref().unwrap_or("执行器未返回具体错误。"),
+            fact
+        ),
+        "cancelled" => format!(
+            "任务“{}”已取消。{}\n\n{}\n\n如需重试，请明确说“重新执行任务”。",
+            task.title,
+            task.summary.as_deref().unwrap_or("执行器已完成安全收尾。"),
+            fact
+        ),
+        _ => format!(
+            "任务“{}”当前状态为 {}（{}%）。\n\n{}",
+            task.title, task.status, task.progress, fact
+        ),
+    }
+}
+
+fn workspace_runtime_context(
+    server: Option<&crate::ServerInfo>,
+    latest_task: Option<&crate::TaskInfo>,
+    fallback_id: &str,
+) -> String {
+    let mut context = server
+        .map(|server| current_server_fact(Some(server)))
+        .unwrap_or_else(|| format!("工作区 {fallback_id} 不存在于后端状态中。"));
+    if let Some(task) = latest_task {
+        context.push_str(&format!(
+            " 最近关联任务：id={}，标题={}，类型={}，状态={}，进度={}%，摘要={}，错误={}，结束时间={}。",
+            task.id,
+            task.title,
+            task.kind,
+            task.status,
+            task.progress,
+            task.summary.as_deref().unwrap_or("无"),
+            task.error.as_deref().unwrap_or("无"),
+            task.finished_at.as_deref().unwrap_or("未结束")
+        ));
+    } else {
+        context.push_str(" 当前没有关联任务记录。");
+    }
+    context.push_str(" 以上内容来自后端持久化状态，是当前事实；旧对话中的进行中文案不能覆盖它。除非本轮响应实际返回 task.id，否则不得声称已创建或提交任务。");
+    context
+}
+
 async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::Sender<Event>) {
     if let Err((_, message)) = validate_effort(request.reasoning_effort.as_deref(), MODEL_EFFORTS) {
         let _ = send_event(&tx, "error", &json!({ "message": message })).await;
         return;
     }
-    let (settings, server_context, workspace_directory, language, persona, is_planning) = {
+    let (
+        settings,
+        server_context,
+        workspace_directory,
+        language,
+        persona,
+        is_planning,
+        server_snapshot,
+        latest_task,
+        bootstrap_inflight,
+    ) = {
         let data = state.inner.read().await;
         let server = data
             .servers
@@ -1220,18 +1705,13 @@ async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::
         let is_planning = server.map(|s| s.status == "planning").unwrap_or(false);
         let workspace_directory =
             server.map(|server| workspace_directory(&server.id, &server.kind));
-        let mut context = server
-            .map(|server| {
-                format!(
-                    "{}（{} {}，端口 {}，状态 {}）",
-                    server.name, server.core, server.version, server.port, server.status
-                )
-            })
-            .unwrap_or_else(|| request.server_id.clone());
-        if is_planning {
-            context
-                .push_str("（规划中：尚未创建任何文件，需与用户确定服务端核心与版本后再执行创建）");
-        }
+        let latest_task = latest_task_for_chat(
+            &data,
+            &request.server_id,
+            request.conversation_id.as_deref(),
+        )
+        .cloned();
+        let context = workspace_runtime_context(server, latest_task.as_ref(), &request.server_id);
         (
             data.ai.clone(),
             context,
@@ -1239,8 +1719,12 @@ async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::
             crate::prefs::language_directive(&data.ui.language).to_string(),
             crate::prefs::persona_directive(&data.ui.personalization),
             is_planning,
+            server.cloned(),
+            latest_task,
+            active_bootstrap_task(&data, &request.server_id).cloned(),
         )
     };
+    let intent = crate::classify_workspace_intent(&request.message, is_planning);
     let skill_query = skill_query_for_request(&request, is_planning);
     let is_plugin_request = crate::skills::is_minecraft_plugin_request(&skill_query);
     let is_server_request = is_planning || crate::skills::is_minecraft_server_request(&skill_query);
@@ -1284,6 +1768,66 @@ async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::
     let mut full_reply = String::new();
     let mut fallback = resolved.is_none();
     let mut handled = false;
+    let mut existing_task = None;
+
+    let deterministic_reply = if is_task_follow_up(&request.message) {
+        latest_task.as_ref().map(|task| {
+            existing_task = Some(task.clone());
+            task_follow_up_reply(task, server_snapshot.as_ref())
+        })
+    } else if intent == "server_bootstrap" {
+        if let Some(task) = bootstrap_inflight.as_ref() {
+            existing_task = Some(task.clone());
+            Some(format!(
+                "同一服务器已有开服任务在处理，我不会重复提交。\n\n{}",
+                task_follow_up_reply(task, server_snapshot.as_ref())
+            ))
+        } else if server_snapshot
+            .as_ref()
+            .is_some_and(|server| server.core_ready && server.status != "planning")
+        {
+            existing_task = latest_task.clone().filter(|task| {
+                matches!(
+                    task.kind.as_str(),
+                    "server_bootstrap" | "server_provision" | "bootstrap"
+                )
+            });
+            Some(format!(
+                "这台服务器已经完成基础创建，我不会重复初始化或覆盖现有文件。\n\n{}\n\n如需启动、重启或重装，请明确说明对应操作。",
+                current_server_fact(server_snapshot.as_ref())
+            ))
+        } else {
+            Some(rule_reply(intent).to_string())
+        }
+    } else {
+        None
+    };
+
+    // 短状态追问和明确开服请求都由后端事实直接回答，避免模型根据旧历史猜测。
+    if let Some(text) = deterministic_reply {
+        let meta = json!({
+            "provider": Value::Null,
+            "model": Value::Null,
+            "fallback": false,
+            "executor": intent == "server_bootstrap",
+            "reused_task": existing_task.is_some(),
+        });
+        if send_event(&tx, "meta", &meta).await.is_err() {
+            return;
+        }
+        for piece in text.chars().collect::<Vec<_>>().chunks(4) {
+            let piece = piece.iter().collect::<String>();
+            full_reply.push_str(&piece);
+            if send_event(&tx, "delta", &json!({ "content": piece }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        handled = true;
+        fallback = false;
+    }
 
     // Agent 选择：请求覆盖 "default" 强制内置直连；指定 id 或全局 active_agent 走 ACP。
     let agent_choice = match request.agent_override.as_deref() {
@@ -1302,7 +1846,7 @@ async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::
         }),
     };
 
-    if let Some(agent) = agent_choice {
+    if !handled && let Some(agent) = agent_choice {
         let agent_effort = request
             .reasoning_effort
             .as_deref()
@@ -1347,9 +1891,11 @@ async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::
                 return;
             }
             stream_acp(
+                &state,
                 &agent,
                 &request,
                 &server_context,
+                workspace_directory.as_ref(),
                 &settings.review_mode,
                 &language,
                 &persona,
@@ -1427,11 +1973,7 @@ async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::
             return;
         }
         let text = if plugin_context.is_empty() {
-            format!(
-                "{}\n\n目标服务器：{}",
-                rule_reply(classify_intent(&request.message)),
-                server_context
-            )
+            format!("{}\n\n目标服务器：{}", rule_reply(intent), server_context)
         } else {
             format!(
                 "已按主流插件库 → 开源插件库 → 普通插件库 → 付费插件库排序检索。\n\n{plugin_context}\n\n目标服务器：{server_context}"
@@ -1456,29 +1998,193 @@ async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::
         }
     }
 
-    let intent = classify_intent(&request.message);
     let risk = intent_risk(intent);
-    let task = {
+    let host_total_memory = if intent == "server_bootstrap" {
+        crate::runtime::total_memory_bytes().await
+    } else {
+        None
+    };
+    let (task, task_created) = {
         let mut data = state.inner.write().await;
-        let task = if crate::task_executor::is_executable_kind(intent) {
-            let (status, progress, approved_by) = effective_task_start(risk, &data.ai.review_mode);
-            let mut task = crate::new_task_record(
-                request.server_id.clone(),
-                task_title(intent).into(),
-                intent.into(),
-                status.into(),
-                progress,
-                risk.into(),
-                approved_by.map(Into::into),
-            );
-            task.events.push(crate::TaskEvent {
-                at: task.created_at.clone(),
-                level: "info".into(),
-                message: "结构化服务器操作已从对话创建。".into(),
-            });
-            data.tasks.insert(0, task.clone());
-            crate::trim_task_history(&mut data.tasks, 30);
+        // 规划工作区最初没有 core/version。开服请求必须先把对话中明确出现的
+        // 结构化方案绑定到服务器记录，再交给执行器；不能只把推荐文本当作已配置。
+        if intent == "server_bootstrap"
+            && existing_task.is_none()
+            && let Some(server_index) = data
+                .servers
+                .iter()
+                .position(|server| server.id == request.server_id && server.kind == "server")
+        {
+            let needs_plan = data.servers[server_index].core.trim().is_empty()
+                || data.servers[server_index].version.trim().is_empty();
+            if needs_plan {
+                let mut user_candidates = vec![request.message.clone()];
+                let mut assistant_candidates = Vec::new();
+                let conversations = request
+                    .conversation_id
+                    .as_deref()
+                    .and_then(|conversation_id| {
+                        data.conversations.iter().find(|conversation| {
+                            conversation.id == conversation_id
+                                && conversation.server_id == request.server_id
+                        })
+                    })
+                    .into_iter()
+                    .chain(
+                        request
+                            .conversation_id
+                            .is_none()
+                            .then(|| {
+                                data.conversations
+                                    .iter()
+                                    .filter(|conversation| {
+                                        conversation.server_id == request.server_id
+                                    })
+                                    .max_by_key(|conversation| conversation.updated_at.clone())
+                            })
+                            .flatten(),
+                    );
+                for conversation in conversations {
+                    for message in conversation.messages.iter().rev() {
+                        if message.role.eq_ignore_ascii_case("user") {
+                            user_candidates.push(message.content.clone());
+                        } else if message.role.eq_ignore_ascii_case("assistant") {
+                            assistant_candidates.push(message.content.clone());
+                        }
+                    }
+                }
+                let inferred_plan = user_candidates
+                    .iter()
+                    .find_map(|text| crate::extract_server_plan_details(text))
+                    .or_else(|| {
+                        assistant_candidates
+                            .iter()
+                            .find_map(|text| crate::extract_server_plan_details(text))
+                    })
+                    .or_else(|| {
+                        crate::catalog::recommended_minecraft_version(&data.catalog, "Paper")
+                            .map(|version| ("Paper".into(), version, None))
+                    });
+                let candidates = user_candidates
+                    .iter()
+                    .chain(assistant_candidates.iter())
+                    .chain(std::iter::once(&full_reply))
+                    .collect::<Vec<_>>();
+                if let Some((core, version, resource_id)) = inferred_plan {
+                    let server_id = data.servers[server_index].id.clone();
+                    let server_name = data.servers[server_index].name.clone();
+                    let expected_players = candidates
+                        .iter()
+                        .find_map(|text| crate::server_intelligence::expected_player_count(text));
+                    let modded = candidates.iter().any(|text| {
+                        let lower = text.to_ascii_lowercase();
+                        lower.contains("模组")
+                            || lower.contains("modpack")
+                            || lower.contains("forge")
+                            || lower.contains("fabric")
+                    });
+                    let memory_gb = crate::runtime::recommended_server_memory_gb(
+                        host_total_memory,
+                        expected_players,
+                        modded,
+                    );
+                    let max_players = expected_players
+                        .unwrap_or(12)
+                        .saturating_mul(2)
+                        .clamp(10, 500);
+                    let port = if data.servers[server_index].port == 0 {
+                        let used_ports: std::collections::HashSet<u16> = data
+                            .servers
+                            .iter()
+                            .filter(|item| item.port != 0 && item.id != server_id)
+                            .map(|item| item.port)
+                            .collect();
+                        (25565..=65535)
+                            .find(|port| !used_ports.contains(port))
+                            .unwrap_or(25565)
+                    } else {
+                        data.servers[server_index].port
+                    };
+                    let server = &mut data.servers[server_index];
+                    server.core = core.clone();
+                    server.core_resource_id = resource_id;
+                    server.version = version.clone();
+                    server.status = "stopped".into();
+                    server.port = port;
+                    server.memory_gb = memory_gb;
+                    server.operation_state = "provisioning".into();
+                    server.task =
+                        format!("已绑定 {core} {version}，自动分配 {memory_gb} GB，准备初始化");
+                    server.last_error = None;
+                    let config = format!(
+                        "# {}\nserver-port={}\nmax-players={}\nview-distance=10\nsimulation-distance=8\nonline-mode=true\ndifficulty=normal\npvp=true\nmotd=§3{} §8| §fPowered by Sculk Catalyst",
+                        server_name, port, max_players, server_name
+                    );
+                    data.configs.insert(server_id.clone(), config);
+                    data.logs.entry(server_id).or_default();
+                }
+            } else if data.servers[server_index].status == "planning" {
+                data.servers[server_index].status = "stopped".into();
+                data.servers[server_index].operation_state = "provisioning".into();
+            }
+        }
+        let workspace_exists = data
+            .servers
+            .iter()
+            .any(|server| server.id == request.server_id);
+        let mut task_created = false;
+        let task = if let Some(task) = existing_task.clone() {
             Some(task)
+        } else if workspace_exists && crate::task_executor::is_executable_kind(intent) {
+            let reusable = (intent == "server_bootstrap")
+                .then(|| active_bootstrap_task(&data, &request.server_id).cloned())
+                .flatten();
+            let already_prepared = intent == "server_bootstrap"
+                && data.servers.iter().any(|server| {
+                    server.id == request.server_id
+                        && server.core_ready
+                        && server.status != "planning"
+                });
+            if let Some(task) = reusable {
+                Some(task)
+            } else if already_prepared {
+                data.tasks
+                    .iter()
+                    .find(|task| {
+                        task.server_id == request.server_id
+                            && matches!(
+                                task.kind.as_str(),
+                                "server_bootstrap" | "server_provision" | "bootstrap"
+                            )
+                    })
+                    .cloned()
+            } else {
+                let (status, progress, approved_by) =
+                    effective_task_start(risk, &data.ai.review_mode);
+                let mut task = crate::new_task_record(
+                    request.server_id.clone(),
+                    task_title(intent).into(),
+                    intent.into(),
+                    status.into(),
+                    progress,
+                    risk.into(),
+                    approved_by.map(Into::into),
+                );
+                task.events.push(crate::TaskEvent {
+                    at: task.created_at.clone(),
+                    level: "info".into(),
+                    message: if intent == "server_bootstrap" {
+                        "开服计划已绑定到当前工作区，执行器将按资源、运行时、核心、启动顺序执行。"
+                            .into()
+                    } else {
+                        "结构化服务器操作已从对话创建。".into()
+                    },
+                });
+                data.tasks.insert(0, task.clone());
+                crate::trim_task_history(&mut data.tasks, 30);
+                task_created = true;
+                Some(task)
+            }
         } else {
             None
         };
@@ -1508,9 +2214,10 @@ async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::
             .await;
             return;
         }
-        task
+        (task, task_created)
     };
-    if let Some(task) = task.as_ref()
+    if task_created
+        && let Some(task) = task.as_ref()
         && task.status == "queued"
     {
         crate::task_executor::spawn(state.clone(), task.id).await;
@@ -1842,10 +2549,132 @@ async fn stream_cli_agent(
     StreamOutcome::Completed
 }
 
+fn acp_relative_path(root: &FsPath, requested: &str) -> Result<PathBuf, String> {
+    if requested.trim().is_empty() {
+        return Err("ACP 文件路径不能为空".into());
+    }
+    let requested_path = FsPath::new(requested);
+    let relative = if requested_path.is_absolute() {
+        requested_path
+            .strip_prefix(root)
+            .map_err(|_| "ACP 文件路径必须位于当前工作区内".to_string())?
+    } else {
+        requested_path
+    };
+    let normalized = relative.to_string_lossy().replace('\\', "/");
+    crate::safe_relative(&normalized)
+        .map_err(|(_, message)| message)
+        .and_then(|path| {
+            if path.as_os_str().is_empty() {
+                Err("ACP 文件路径不能为空".into())
+            } else {
+                Ok(path)
+            }
+        })
+}
+
+async fn acp_read_text_file(
+    root: &FsPath,
+    requested: &str,
+    start_line: Option<u64>,
+    num_lines: Option<u64>,
+) -> Result<Value, String> {
+    let relative = acp_relative_path(root, requested)?;
+    let bytes = crate::workspace_fs::within_workspace(root.to_path_buf(), {
+        let relative = relative.clone();
+        move |workspace| {
+            let metadata = workspace.symlink_metadata(&relative)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ACP 路径不是普通文件",
+                ));
+            }
+            let file = workspace.open(&relative)?;
+            let mut bytes =
+                Vec::with_capacity(metadata.len().min(ACP_MAX_TEXT_FILE_BYTES + 1) as usize);
+            file.take(ACP_MAX_TEXT_FILE_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            Ok(bytes)
+        }
+    })
+    .await
+    .map_err(|error| format!("ACP 读取文件失败：{error}"))?;
+    if bytes.len() > ACP_MAX_TEXT_FILE_BYTES as usize {
+        return Err("ACP 文本文件超过 2 MB 限制".into());
+    }
+    let content =
+        String::from_utf8(bytes).map_err(|_| "ACP 只能读取 UTF-8 文本文件".to_string())?;
+    let start = start_line.unwrap_or(1).max(1) as usize - 1;
+    let selected = if start == 0 && num_lines.is_none() {
+        content
+    } else {
+        let limit = num_lines.map(|value| value.min(ACP_MAX_TEXT_FILE_BYTES) as usize);
+        content
+            .lines()
+            .skip(start)
+            .take(limit.unwrap_or(usize::MAX))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok(json!({"content": selected}))
+}
+
+async fn acp_write_text_file(
+    state: &AppState,
+    server_id: &str,
+    root: &FsPath,
+    requested: &str,
+    content: &str,
+) -> Result<Value, String> {
+    if content.len() > ACP_MAX_TEXT_FILE_BYTES as usize {
+        return Err("ACP 文本文件超过 2 MB 限制".into());
+    }
+    let relative = acp_relative_path(root, requested)?;
+    crate::reject_protected_server_artifact(&relative).map_err(|(_, message)| message)?;
+    tokio::fs::create_dir_all(root)
+        .await
+        .map_err(|error| format!("ACP 创建工作区目录失败：{error}"))?;
+    let operation = crate::server_operation_lock(state, &format!("files:{server_id}")).await;
+    let _guard = operation.lock().await;
+    let content_owned = content.to_string();
+    crate::workspace_fs::within_workspace(root.to_path_buf(), {
+        let relative = relative.clone();
+        let content = content_owned.clone();
+        move |workspace| {
+            let parent = relative.parent().unwrap_or(FsPath::new(""));
+            workspace.create_dir_all(parent)?;
+            match workspace.symlink_metadata(&relative) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "ACP 不允许通过符号链接写入",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            workspace.write(&relative, content.as_bytes())?;
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|error| format!("ACP 写入文件失败：{error}"))?;
+    if crate::path_string(&relative) == "server.properties" {
+        let mut data = state.inner.write().await;
+        data.configs.insert(server_id.to_string(), content_owned);
+        crate::persist(state, &data).await?;
+    }
+    Ok(Value::Null)
+}
+
 async fn stream_acp(
+    state: &AppState,
     agent: &AiAgent,
     request: &ChatStreamRequest,
     server_context: &str,
+    workspace_directory: Option<&PathBuf>,
     review_mode: &str,
     language: &str,
     persona: &str,
@@ -1860,9 +2689,11 @@ async fn stream_acp(
     };
     let outcome = stream_acp_inner(
         &mut client,
+        state,
         agent,
         request,
         server_context,
+        workspace_directory,
         review_mode,
         language,
         persona,
@@ -1878,9 +2709,11 @@ async fn stream_acp(
 
 async fn stream_acp_inner(
     client: &mut AcpClient,
+    state: &AppState,
     agent: &AiAgent,
     request: &ChatStreamRequest,
     server_context: &str,
+    workspace_directory: Option<&PathBuf>,
     review_mode: &str,
     language: &str,
     persona: &str,
@@ -1890,12 +2723,18 @@ async fn stream_acp_inner(
     full_reply: &mut String,
 ) -> StreamOutcome {
     let handshake_timeout = Duration::from_secs(30);
+    let fs_available = workspace_directory.is_some_and(|path| path.is_dir());
     let init_id = match client
         .send_request(
             "initialize",
             json!({
                 "protocolVersion": 1,
-                "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}},
+                "clientCapabilities": {
+                    "fs": {
+                        "readTextFile": fs_available,
+                        "writeTextFile": fs_available
+                    }
+                },
             }),
         )
         .await
@@ -1906,9 +2745,15 @@ async fn stream_acp_inner(
     if let Err(error) = client.wait_response(init_id, handshake_timeout).await {
         return StreamOutcome::FailedBeforeOutput(format!("initialize 失败：{error}"));
     }
-    let cwd = std::env::current_dir()
+    let cwd = workspace_directory
+        .filter(|_| fs_available)
         .map(|path| path.to_string_lossy().to_string())
-        .unwrap_or_else(|_| ".".into());
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|path| path.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| ".".into());
     let new_id = match client
         .send_request("session/new", json!({"cwd": cwd, "mcpServers": []}))
         .await
@@ -1989,6 +2834,62 @@ async fn stream_acp_inner(
                         }
                     }
                 }
+                "fs/read_text_file" | "fs/write_text_file" => {
+                    let request_id = message["id"].clone();
+                    if request_id.is_null() {
+                        continue;
+                    }
+                    let Some(root) = workspace_directory else {
+                        let _ = client
+                            .respond_error(&request_id, -32001, "当前工作区没有可用文件根目录")
+                            .await;
+                        continue;
+                    };
+                    let session_id = message["params"]["sessionId"].as_str();
+                    if session_id != Some(session.as_str()) {
+                        let _ = client
+                            .respond_error(&request_id, -32602, "sessionId 与当前会话不匹配")
+                            .await;
+                        continue;
+                    }
+                    let result = if method == "fs/read_text_file" {
+                        acp_read_text_file(
+                            root,
+                            message["params"]["path"].as_str().unwrap_or_default(),
+                            message["params"]["startLine"].as_u64(),
+                            message["params"]["numLines"].as_u64(),
+                        )
+                        .await
+                    } else {
+                        acp_write_text_file(
+                            state,
+                            &request.server_id,
+                            root,
+                            message["params"]["path"].as_str().unwrap_or_default(),
+                            message["params"]["content"].as_str().unwrap_or_default(),
+                        )
+                        .await
+                    };
+                    match result {
+                        Ok(result) => {
+                            if client.respond(&request_id, result).await.is_err() {
+                                return mid_fail("文件操作响应失败".into(), !full_reply.is_empty());
+                            }
+                        }
+                        Err(error) => {
+                            if client
+                                .respond_error(&request_id, -32001, &error)
+                                .await
+                                .is_err()
+                            {
+                                return mid_fail(
+                                    "文件操作错误响应失败".into(),
+                                    !full_reply.is_empty(),
+                                );
+                            }
+                        }
+                    }
+                }
                 "session/request_permission" => {
                     let request_id = message["id"].clone();
                     if request_id.is_null() {
@@ -2025,7 +2926,7 @@ async fn stream_acp_inner(
                     }
                 }
                 _ => {
-                    // 其他反向请求（如 fs 读写）一律拒绝，通知直接忽略。
+                    // 未实现的反向请求拒绝，但不会中断 ACP 会话。
                     let request_id = message["id"].clone();
                     if !request_id.is_null() {
                         let _ = client
@@ -2065,6 +2966,7 @@ async fn stream_upstream(
     let mut system = format!(
         "你是 Sculk Agent，一款 AI 驱动的 Minecraft 服务器管理工作台助手。当前工作区服务器：{server_context}。{language}聚焦服务器运维、插件、配置与社区运营，回答保持简洁、可执行。"
     );
+    system.push_str("\n服务器级变更由工作台的受审计任务执行器处理。不要声称当前会话没有执行器或承诺“恢复后自动执行”；未收到明确创建指令时只给出方案，收到任务状态前也不要宣称已下载、写入或启动成功。基础开服任务只负责核心、Java、工作区、EULA 与启动验证，不能根据模糊的 RPG 需求猜测并安装插件。");
     if !persona.is_empty() {
         system.push('\n');
         system.push_str(persona);
@@ -2266,6 +3168,85 @@ mod tests {
     }
 
     #[test]
+    fn legacy_ai_settings_default_to_browser_speech_recognition() {
+        let settings: AiSettings = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(settings.speech_recognition.mode, "browser");
+        assert_eq!(settings.speech_recognition.language, "zh-CN");
+        assert_eq!(settings.speech_recognition.model_id, "whisper-1");
+        assert!(settings.speech_recognition.provider_id.is_none());
+    }
+
+    #[test]
+    fn speech_recognition_settings_validate_model_provider_without_affecting_browser_mode() {
+        let settings = settings_with_enabled_targets();
+        let browser = SpeechRecognitionSettings {
+            provider_id: Some("missing".into()),
+            ..SpeechRecognitionSettings::default()
+        };
+        assert!(validate_speech_recognition_settings(&browser, &settings.providers).is_ok());
+
+        let model = SpeechRecognitionSettings {
+            mode: "model".into(),
+            provider_id: Some("provider-1".into()),
+            model_id: "whisper-1".into(),
+            language: "zh-CN".into(),
+        };
+        assert!(validate_speech_recognition_settings(&model, &settings.providers).is_ok());
+        let missing = SpeechRecognitionSettings {
+            provider_id: Some("missing".into()),
+            ..model.clone()
+        };
+        assert!(validate_speech_recognition_settings(&missing, &settings.providers).is_err());
+    }
+
+    #[test]
+    fn transcription_language_and_payload_are_normalized() {
+        assert_eq!(
+            upstream_transcription_language("zh-CN").as_deref(),
+            Some("zh")
+        );
+        assert_eq!(
+            upstream_transcription_language("EN-us").as_deref(),
+            Some("en")
+        );
+        assert_eq!(upstream_transcription_language("auto"), None);
+        assert_eq!(
+            transcription_text(&json!({"text": "  你好世界  "})).as_deref(),
+            Some("你好世界")
+        );
+        assert!(transcription_text(&json!({"text": "   "})).is_none());
+    }
+
+    #[test]
+    fn acp_paths_are_confined_to_the_workspace_root() {
+        let root = std::env::temp_dir().join("sculk-acp-workspace");
+        assert_eq!(
+            acp_relative_path(&root, &root.join("src/main.rs").to_string_lossy()).unwrap(),
+            PathBuf::from("src/main.rs")
+        );
+        assert_eq!(
+            acp_relative_path(&root, "src/main.rs").unwrap(),
+            PathBuf::from("src/main.rs")
+        );
+        assert!(acp_relative_path(&root, &root.join("../outside.rs").to_string_lossy()).is_err());
+        assert!(acp_relative_path(&root, "../outside.rs").is_err());
+    }
+
+    #[tokio::test]
+    async fn acp_reads_utf8_text_with_line_ranges() {
+        let root = std::env::temp_dir().join(format!("sculk-acp-read-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(root.join("notes.txt"), "one\ntwo\nthree\n")
+            .await
+            .unwrap();
+        let result = acp_read_text_file(&root, "notes.txt", Some(2), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(result["content"], "two");
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[test]
     fn skill_query_carries_recent_server_context_into_follow_up_messages() {
         let request = ChatStreamRequest {
             server_id: "server-1".into(),
@@ -2290,6 +3271,81 @@ mod tests {
         assert!(query.contains("按上面的方案继续配置"));
         assert!(query.contains("插件生电服"));
         assert!(!query.contains("请确认版本"));
+    }
+
+    #[test]
+    fn persisted_task_facts_override_stale_chat_progress_text() {
+        let mut state = crate::initial_state();
+        let server: crate::ServerInfo = serde_json::from_value(json!({
+            "id": "server-1",
+            "kind": "server",
+            "name": "生存服",
+            "core": "Paper",
+            "version": "1.21.4",
+            "status": "online",
+            "players": "0 / 20",
+            "memory": 0,
+            "memory_gb": 8,
+            "cpu": 0,
+            "port": 25565,
+            "task": "运行中",
+            "operation_state": "idle",
+            "core_ready": true
+        }))
+        .unwrap();
+        state.servers.push(server.clone());
+        let mut task = crate::new_task_record(
+            "server-1".into(),
+            "准备并启动服务器".into(),
+            "server_bootstrap".into(),
+            "completed".into(),
+            100,
+            "medium".into(),
+            Some("auto".into()),
+        );
+        task.summary = Some("服务器已启动并通过就绪标记确认。".into());
+        state.tasks.push(task.clone());
+        let conversation = crate::conversations::new_conversation("server-1", None, None);
+        let conversation_id = conversation.id.clone();
+        state.conversations.push(conversation);
+        assert!(crate::conversations::append_exchange(
+            &mut state,
+            "server-1",
+            &conversation_id,
+            "开始创建服务器",
+            "正在创建任务，尚未确认结果。",
+            vec![],
+            Some(task.id),
+        ));
+
+        let latest = latest_task_for_chat(&state, "server-1", Some(&conversation_id)).unwrap();
+        let context = workspace_runtime_context(Some(&server), Some(latest), "server-1");
+        let reply = task_follow_up_reply(latest, Some(&server));
+        assert_eq!(latest.id, task.id);
+        assert!(context.contains("状态=completed"));
+        assert!(context.contains("服务器已启动并通过就绪标记确认"));
+        assert!(context.contains("旧对话中的进行中文案不能覆盖它"));
+        assert!(reply.contains("已经完成"));
+        assert!(reply.contains("当前服务器“生存服”在线"));
+        assert!(is_task_follow_up("继续"));
+        assert!(is_task_follow_up("完成了吗？"));
+    }
+
+    #[test]
+    fn active_bootstrap_is_reused_instead_of_duplicated() {
+        let mut state = crate::initial_state();
+        let task = crate::new_task_record(
+            "server-1".into(),
+            "准备并启动服务器".into(),
+            "server_bootstrap".into(),
+            "running".into(),
+            42,
+            "medium".into(),
+            Some("auto".into()),
+        );
+        let id = task.id;
+        state.tasks.push(task);
+        assert_eq!(active_bootstrap_task(&state, "server-1").unwrap().id, id);
     }
 
     #[test]

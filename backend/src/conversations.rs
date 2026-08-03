@@ -26,6 +26,10 @@ pub(crate) struct ChatMessage {
     pub(crate) actions: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) task_id: Option<Uuid>,
+    /// 执行器最后一次回写到这条消息的任务终态。
+    /// 旧状态没有该字段时保持兼容，同时用它保证终态摘要只追加一次。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) task_status: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -193,6 +197,7 @@ pub(crate) fn assistant_message(content: &str, actions: Option<Vec<String>>) -> 
         time: now_hm(),
         actions,
         task_id: None,
+        task_status: None,
     }
 }
 
@@ -226,6 +231,7 @@ pub(crate) fn append_exchange(
         time: now_hm(),
         actions: None,
         task_id: None,
+        task_status: None,
     });
     if !assistant_content.trim().is_empty() {
         conversation.messages.push(ChatMessage {
@@ -239,6 +245,7 @@ pub(crate) fn append_exchange(
                 Some(assistant_actions)
             },
             task_id,
+            task_status: None,
         });
     }
     if conversation.messages.len() > MAX_MESSAGES {
@@ -250,6 +257,88 @@ pub(crate) fn append_exchange(
     }
     conversation.updated_at = now_rfc3339();
     true
+}
+
+fn task_result_text(task: &crate::TaskInfo) -> String {
+    match task.status.as_str() {
+        "completed" => format!(
+            "任务已完成：{}",
+            task.summary.as_deref().unwrap_or("执行器已确认任务完成。")
+        ),
+        "failed" => format!(
+            "任务执行失败：{}",
+            task.error.as_deref().unwrap_or("执行器未返回具体错误。")
+        ),
+        "cancelled" => format!(
+            "任务已取消：{}",
+            task.summary.as_deref().unwrap_or("执行器已完成安全收尾。")
+        ),
+        "interrupted" => format!(
+            "任务已中断：{}",
+            task.error.as_deref().unwrap_or("执行器会话意外中断。")
+        ),
+        "rollback_failed" => format!(
+            "任务与补偿均未完成：{}",
+            task.error
+                .as_deref()
+                .unwrap_or("请打开任务详情检查执行事件。")
+        ),
+        _ => return String::new(),
+    }
+}
+
+/// 将执行器的持久化终态同步回最初创建任务的助手消息。
+/// 返回 true 表示对话内容发生了变化。调用方应与任务状态在同一次 persist 中提交。
+pub(crate) fn sync_task_result(data: &mut PersistedState, task: &crate::TaskInfo) -> bool {
+    let result = task_result_text(task);
+    if result.is_empty() {
+        return false;
+    }
+    let Some((conversation_index, message_index)) =
+        data.conversations
+            .iter()
+            .enumerate()
+            .find_map(|(conversation_index, conversation)| {
+                conversation
+                    .messages
+                    .iter()
+                    .rposition(|message| {
+                        message.role == "assistant" && message.task_id == Some(task.id)
+                    })
+                    .map(|message_index| (conversation_index, message_index))
+            })
+    else {
+        return false;
+    };
+    let conversation = &mut data.conversations[conversation_index];
+    let message = &mut conversation.messages[message_index];
+    if message.task_status.as_deref() == Some(task.status.as_str()) {
+        return false;
+    }
+    message.content.push_str("\n\n");
+    message.content.push_str(&result);
+    message.time = now_hm();
+    message.task_status = Some(task.status.clone());
+    conversation.updated_at = now_rfc3339();
+    true
+}
+
+/// 启动迁移：把旧状态中已经结束、但尚未回写到对话的任务补齐。
+pub(crate) fn reconcile_task_results(data: &mut PersistedState) -> bool {
+    let terminal_tasks = data
+        .tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.status.as_str(),
+                "completed" | "failed" | "cancelled" | "interrupted" | "rollback_failed"
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    terminal_tasks.iter().fold(false, |changed, task| {
+        sync_task_result(data, task) || changed
+    })
 }
 
 fn forked(original: &Conversation) -> Conversation {
@@ -525,6 +614,7 @@ mod tests {
                 time: "00:00".into(),
                 actions: None,
                 task_id: None,
+                task_status: None,
             });
         }
         if conversation.messages.len() > MAX_MESSAGES {
@@ -533,5 +623,39 @@ mod tests {
         }
         assert_eq!(conversation.messages.len(), MAX_MESSAGES);
         assert_eq!(conversation.messages[0].id, "10");
+    }
+
+    #[test]
+    fn terminal_task_result_is_written_back_once() {
+        let mut data = crate::initial_state();
+        let conversation = sample("sculk");
+        let conversation_id = conversation.id.clone();
+        data.conversations.push(conversation);
+        let mut task = crate::new_task_record(
+            "sculk".into(),
+            "准备并启动服务器".into(),
+            "server_bootstrap".into(),
+            "completed".into(),
+            100,
+            "medium".into(),
+            Some("auto".into()),
+        );
+        task.summary = Some("服务器已启动并通过就绪标记确认。".into());
+        assert!(append_exchange(
+            &mut data,
+            "sculk",
+            &conversation_id,
+            "开始创建服务器",
+            "正在创建受审计的开服任务。",
+            vec!["查看任务详情".into()],
+            Some(task.id),
+        ));
+
+        assert!(sync_task_result(&mut data, &task));
+        assert!(!sync_task_result(&mut data, &task));
+        let assistant = data.conversations[0].messages.last().unwrap();
+        assert_eq!(assistant.task_status.as_deref(), Some("completed"));
+        assert_eq!(assistant.content.matches("任务已完成：").count(), 1);
+        assert!(assistant.content.contains("服务器已启动并通过就绪标记确认"));
     }
 }

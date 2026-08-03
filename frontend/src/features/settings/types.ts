@@ -23,6 +23,14 @@ export interface ModelBinding {
 export type ReviewMode = 'approval' | 'auto' | 'full'
 export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type AgentTransport = 'acp' | 'cli'
+export type SpeechRecognitionMode = 'browser' | 'model'
+
+export interface SpeechRecognitionSettings {
+  mode: SpeechRecognitionMode
+  language: string
+  provider_id?: string | null
+  model_id: string
+}
 
 export interface AiAgent {
   id: string
@@ -64,6 +72,7 @@ export interface AiSettingsView {
   reasoning_effort?: ReasoningEffort | null
   reasoning_effort_values?: ReasoningEffort[]
   detected_agents?: DetectedAgent[]
+  speech_recognition: SpeechRecognitionSettings
 }
 
 export interface TestResult {
@@ -117,6 +126,9 @@ export interface BackgroundSettings {
   gradient_colors: string[]
   image_url: string
   image_opacity: number
+  image_position_x: number
+  image_position_y: number
+  image_scale: number
 }
 
 export interface AppearanceSettings {
@@ -126,6 +138,9 @@ export interface AppearanceSettings {
   font_family: string
   font_size: number
   font_color: string
+  menu_font_family: string
+  menu_font_color: string
+  card_blur: number
 }
 
 export interface PersonalizationSettings {

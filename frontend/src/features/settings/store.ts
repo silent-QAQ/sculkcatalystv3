@@ -1,6 +1,6 @@
 import { ref } from 'vue'
 import { apiRequest } from '../../lib/api'
-import { applyAppearance } from '../../lib/appearance'
+import { applyAppearance, normalizeAppearance } from '../../lib/appearance'
 import type { AiSettingsView, UiSettings } from './types'
 
 export const aiSettings = ref<AiSettingsView | null>(null)
@@ -37,9 +37,10 @@ export async function loadUi() {
 }
 
 export function applyCloudUi(settings: UiSettings) {
-  uiSettings.value = settings
-  localStorage.setItem(UI_CACHE_KEY, JSON.stringify(settings))
-  applyAppearance(settings.appearance)
+  const normalized = { ...settings, appearance: normalizeAppearance(settings.appearance) }
+  uiSettings.value = normalized
+  localStorage.setItem(UI_CACHE_KEY, JSON.stringify(normalized))
+  applyAppearance(normalized.appearance)
 }
 
 export async function loadAll() {

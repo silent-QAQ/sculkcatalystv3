@@ -16,6 +16,7 @@ mod server_intelligence;
 mod skills;
 mod task_executor;
 mod workspace_fs;
+mod workspace_manifest;
 
 use axum::{
     Json, Router,
@@ -25,12 +26,12 @@ use axum::{
         rejection::JsonRejection,
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderValue, Method, StatusCode, header},
+    http::{HeaderName, HeaderValue, Method, StatusCode, header},
     response::Response,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
-use chrono::Local;
+use chrono::{Datelike, Local};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -62,6 +63,7 @@ struct AppState {
     file: PathBuf,
     _file_lock: Arc<StdFile>,
     processes: Arc<RwLock<HashMap<String, ManagedProcess>>>,
+    telemetry: Arc<RwLock<HashMap<String, TelemetryRecord>>>,
     shutting_down: Arc<AtomicBool>,
     operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     channels: Arc<RwLock<HashMap<String, broadcast::Sender<String>>>>,
@@ -69,6 +71,42 @@ struct AppState {
     runtime_install: Arc<Mutex<()>>,
     task_controls: Arc<RwLock<HashMap<Uuid, Arc<AtomicBool>>>>,
     cloud: cloud::CloudRuntime,
+}
+
+const TELEMETRY_INTERVAL: Duration = Duration::from_secs(5);
+const TELEMETRY_STALE_AFTER: Duration = Duration::from_secs(15);
+const MAX_TELEMETRY_LINE_BYTES: usize = 8 * 1024;
+const MAX_TELEMETRY_PLAYER_NAMES: usize = 100;
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct ServerTelemetry {
+    availability: String,
+    source: String,
+    collected_at: Option<String>,
+    online: Option<u32>,
+    max_players: Option<u32>,
+    player_names: Option<Vec<String>>,
+    tps_1m: Option<f32>,
+    mspt_1m: Option<f32>,
+    detail: Option<String>,
+}
+
+#[derive(Clone)]
+struct TelemetryRecord {
+    generation: Uuid,
+    observed_at: Instant,
+    value: ServerTelemetry,
+}
+
+#[derive(Debug, PartialEq)]
+enum TelemetryObservation {
+    PlayerList {
+        online: u32,
+        max_players: u32,
+        player_names: Vec<String>,
+    },
+    PaperTps(f32),
+    PaperMspt(f32),
 }
 #[derive(Clone)]
 struct ManagedProcess {
@@ -105,6 +143,11 @@ pub(crate) struct ServerInfo {
     pub(crate) kind: String,
     name: String,
     core: String,
+    /// Human-facing core name and its catalog/resource identifier are kept
+    /// separate. A fork such as `LSQFK` may resolve through a slug like
+    /// `leavesslientqaqfork` without being mislabeled as Leaves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) core_resource_id: Option<String>,
     version: String,
     pub(crate) status: String,
     players: String,
@@ -129,6 +172,89 @@ pub(crate) struct ServerInfo {
     pub(crate) core_ready: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_error: Option<String>,
+    #[serde(default = "default_lifecycle_phase")]
+    pub(crate) lifecycle_phase: String,
+    #[serde(default)]
+    pub(crate) service_settings: ServiceSettings,
+}
+
+fn default_lifecycle_phase() -> String {
+    "create".into()
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ServiceSettings {
+    #[serde(default)]
+    pub(crate) social: SocialServiceSettings,
+    #[serde(default)]
+    pub(crate) economy: bool,
+    #[serde(default)]
+    pub(crate) player_support: bool,
+    #[serde(default)]
+    pub(crate) game_operations: bool,
+    #[serde(default)]
+    pub(crate) content_improvement: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SocialServiceSettings {
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    #[serde(default)]
+    pub(crate) qq_bot: bool,
+    #[serde(default)]
+    pub(crate) bilibili_bot: bool,
+    #[serde(default)]
+    pub(crate) douyin_bot: bool,
+    #[serde(default = "default_social_interval")]
+    pub(crate) sync_interval_seconds: u32,
+    #[serde(default = "default_burst_interval")]
+    pub(crate) burst_interval_seconds: u32,
+    #[serde(default = "default_burst_recovery")]
+    pub(crate) burst_recovery_seconds: u32,
+}
+
+#[derive(Deserialize)]
+struct UpdateServerLifecycleRequest {
+    phase: String,
+}
+
+impl Default for ServiceSettings {
+    fn default() -> Self {
+        Self {
+            social: SocialServiceSettings::default(),
+            economy: false,
+            player_support: false,
+            game_operations: false,
+            content_improvement: false,
+        }
+    }
+}
+
+impl Default for SocialServiceSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            qq_bot: false,
+            bilibili_bot: false,
+            douyin_bot: false,
+            sync_interval_seconds: default_social_interval(),
+            burst_interval_seconds: default_burst_interval(),
+            burst_recovery_seconds: default_burst_recovery(),
+        }
+    }
+}
+
+fn default_social_interval() -> u32 {
+    240
+}
+
+fn default_burst_interval() -> u32 {
+    10
+}
+
+fn default_burst_recovery() -> u32 {
+    240
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct TaskEvent {
@@ -291,6 +417,7 @@ pub(crate) struct PersistedState {
 struct DashboardResponse {
     servers: Vec<ServerInfo>,
     tasks: Vec<TaskInfo>,
+    telemetry: HashMap<String, ServerTelemetry>,
     agent_status: &'static str,
     mcp_connected: bool,
 }
@@ -610,6 +737,7 @@ async fn main() {
         file,
         _file_lock: Arc::new(file_lock),
         processes: Arc::new(RwLock::new(HashMap::new())),
+        telemetry: Arc::new(RwLock::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         operation_locks: Arc::new(Mutex::new(HashMap::new())),
         channels: Arc::new(RwLock::new(HashMap::new())),
@@ -653,7 +781,14 @@ async fn main() {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers(tower_http::cors::Any);
+        .allow_headers(tower_http::cors::Any)
+        .expose_headers([
+            HeaderName::from_static("x-total-count"),
+            HeaderName::from_static("x-page"),
+            HeaderName::from_static("x-page-size"),
+            HeaderName::from_static("x-page-count"),
+            header::LINK,
+        ]);
     let static_dir = PathBuf::from(
         std::env::var("SCULK_STATIC_DIR").unwrap_or_else(|_| "../frontend/dist".into()),
     );
@@ -675,6 +810,8 @@ async fn main() {
             "/api/servers/{id}/config",
             get(get_config).put(update_config),
         )
+        .route("/api/servers/{id}/services", put(update_server_services))
+        .route("/api/servers/{id}/lifecycle", put(update_server_lifecycle))
         .route("/api/servers/{id}/logs", get(get_logs))
         .route("/api/servers/{id}/ws/logs", get(ws_logs))
         .route("/api/servers/{id}/files", get(list_files))
@@ -917,23 +1054,37 @@ async fn write_state_file(
 }
 
 async fn load_state(file: &StdPath) -> PersistedState {
+    let manage_workspace_manifests = file == runtime::state_file();
     if let Ok((mut state, data)) = read_state(file).await {
         let catalog_migrated = state.catalog.migrate();
         let skills_migrated = skills::ensure_bundled_skill(&mut state.skills)
             || skills::ensure_bundled_server_skill(&mut state.skills);
         let bots_migrated = bots::ensure_defaults(&mut state.bots);
+        let manifests_imported = if manage_workspace_manifests {
+            workspace_manifest::import_discovered(&mut state).await
+        } else {
+            false
+        };
         let runtime_reconciled = reconcile_stale_runtime_state(&mut state);
         let tasks_reconciled = task_executor::reconcile_interrupted_tasks(&mut state);
+        let conversations_reconciled = conversations::reconcile_task_results(&mut state);
         let servers_reconciled = reconcile_server_file_state(&mut state).await;
         let needs_persist = catalog_migrated
             || skills_migrated
             || bots_migrated
+            || manifests_imported
             || runtime_reconciled
             || tasks_reconciled
+            || conversations_reconciled
             || servers_reconciled
             || legacy_servers_missing_memory(&data);
         if needs_persist && let Err(error) = write_state_file(file, &state, true).await {
             eprintln!("failed to persist migrated state: {error}");
+        }
+        if manage_workspace_manifests
+            && let Err(errors) = workspace_manifest::sync_all(&state).await
+        {
+            eprintln!("failed to synchronize sculk.yml: {}", errors.join("; "));
         }
         return state;
     }
@@ -944,20 +1095,38 @@ async fn load_state(file: &StdPath) -> PersistedState {
         skills::ensure_bundled_skill(&mut state.skills);
         skills::ensure_bundled_server_skill(&mut state.skills);
         bots::ensure_defaults(&mut state.bots);
+        if manage_workspace_manifests {
+            workspace_manifest::import_discovered(&mut state).await;
+        }
         reconcile_stale_runtime_state(&mut state);
         task_executor::reconcile_interrupted_tasks(&mut state);
+        conversations::reconcile_task_results(&mut state);
         reconcile_server_file_state(&mut state).await;
         if let Err(error) = write_state_file(file, &state, false).await {
             eprintln!("failed to restore state backup: {error}");
         } else {
             eprintln!("restored state from {}", backup.display());
         }
+        if manage_workspace_manifests
+            && let Err(errors) = workspace_manifest::sync_all(&state).await
+        {
+            eprintln!(
+                "failed to synchronize restored sculk.yml: {}",
+                errors.join("; ")
+            );
+        }
         return state;
     }
 
-    let state = initial_state();
+    let mut state = initial_state();
+    if manage_workspace_manifests {
+        workspace_manifest::import_discovered(&mut state).await;
+    }
     if let Err(error) = write_state_file(file, &state, false).await {
         eprintln!("failed to initialize state: {error}");
+    }
+    if manage_workspace_manifests && let Err(errors) = workspace_manifest::sync_all(&state).await {
+        eprintln!("failed to initialize sculk.yml: {}", errors.join("; "));
     }
     state
 }
@@ -1035,8 +1204,12 @@ fn repair_server_operation_metadata(
         server.operation_state.clone(),
         server.core_ready,
         server.last_error.clone(),
+        server.lifecycle_phase.clone(),
     );
     server.core_ready = core_ready;
+    if core_ready && server.lifecycle_phase == "create" {
+        server.lifecycle_phase = "build".into();
+    }
     if active_provision {
         server.operation_state = "provisioning".into();
         server.last_error = None;
@@ -1059,10 +1232,17 @@ fn repair_server_operation_metadata(
             server.operation_state.clone(),
             server.core_ready,
             server.last_error.clone(),
+            server.lifecycle_phase.clone(),
         )
 }
 pub(crate) async fn persist(state: &AppState, data: &PersistedState) -> Result<(), String> {
-    write_state_file(&state.file, data, true).await
+    write_state_file(&state.file, data, true).await?;
+    if state.file == runtime::state_file()
+        && let Err(errors) = workspace_manifest::sync_all(data).await
+    {
+        eprintln!("failed to synchronize sculk.yml: {}", errors.join("; "));
+    }
+    Ok(())
 }
 
 pub(crate) async fn server_operation_lock(state: &AppState, id: &str) -> Arc<Mutex<()>> {
@@ -1189,6 +1369,7 @@ async fn create_server(
         kind: "server".into(),
         name,
         core: request.core,
+        core_resource_id: None,
         version: request.version,
         status: "stopped".into(),
         players: "0 / 60".into(),
@@ -1204,6 +1385,8 @@ async fn create_server(
         operation_state: "provisioning".into(),
         core_ready: false,
         last_error: None,
+        lifecycle_phase: "create".into(),
+        service_settings: ServiceSettings::default(),
     };
     data.configs.insert(id.clone(), config);
     data.logs.insert(
@@ -1270,6 +1453,7 @@ async fn create_project(
         kind: "project".into(),
         name: request.name.trim().to_string(),
         core: String::new(),
+        core_resource_id: None,
         version: String::new(),
         status: "ready".into(),
         players: "- / -".into(),
@@ -1285,6 +1469,8 @@ async fn create_project(
         operation_state: "idle".into(),
         core_ready: false,
         last_error: None,
+        lifecycle_phase: "project".into(),
+        service_settings: ServiceSettings::default(),
     };
     let mut data = state.inner.write().await;
     data.servers.push(project.clone());
@@ -1470,7 +1656,7 @@ fn validate_delete_confirmation(
         Ok(())
     }
 }
-/// 智能创建：仅登记"规划中"的服务器与开服规划对话，零文件操作，核心由后续对话决定。
+/// 智能创建：登记规划工作区并写入可迁移的 sculk.yml；核心和服务端文件由后续对话决定。
 async fn plan_server(
     State(state): State<AppState>,
     Json(request): Json<PlanServerRequest>,
@@ -1488,16 +1674,19 @@ async fn plan_server(
             .take(8)
             .collect::<String>()
     );
+    let memory_gb =
+        runtime::recommended_server_memory_gb(runtime::total_memory_bytes().await, None, false);
     let server = ServerInfo {
         id: id.clone(),
         kind: "server".into(),
         name: name.clone(),
         core: String::new(),
+        core_resource_id: None,
         version: String::new(),
         status: "planning".into(),
         players: "- / -".into(),
         memory: 0,
-        memory_gb: DEFAULT_MEMORY_GB,
+        memory_gb,
         cpu: 0,
         port: 0,
         task: "规划中 · 等待对话确定方案".into(),
@@ -1508,16 +1697,18 @@ async fn plan_server(
         operation_state: "idle".into(),
         core_ready: false,
         last_error: None,
+        lifecycle_phase: "create".into(),
+        service_settings: ServiceSettings::default(),
     };
     let mut conversation = conversations::new_conversation(&id, Some("开服规划".into()), None);
     conversation.messages.push(conversations::assistant_message(
         &format!(
-            "服务器「{name}」已进入规划模式，目前还没有创建任何文件。告诉我你的目标玩法（生存 / 插件 / 模组 / 小游戏）、预计玩家数量与版本偏好，我会为你推荐合适的服务端核心，并在方案确认后完成创建与配置。"
+            "服务器「{name}」已进入智能规划模式。当前只创建了用于迁移和接手的 sculk.yml 标识文件，尚未下载核心或生成 Minecraft 服务端文件。你只需要用自己的话描述想玩的内容，例如“和朋友玩普通生存”或“想加入更多装备和怪物”。我会自动检测这台机器的系统、内存、磁盘与 Java，先查知识库和资源中心，必要时再联网核实，并直接给出可执行方案。"
         ),
         Some(vec![
-            "推荐适合的服务端核心".into(),
-            "我想要插件生存服".into(),
-            "查看主流核心对比".into(),
+            "和朋友玩普通生存".into(),
+            "想加入更多装备和怪物".into(),
+            "我有旧地图需要迁移".into(),
         ]),
     ));
     let mut data = state.inner.write().await;
@@ -1539,6 +1730,35 @@ async fn delete_server(
     if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
         return Err((StatusCode::BAD_REQUEST, "invalid server id".into()));
     }
+    let cancellable_tasks = {
+        let data = state.inner.read().await;
+        if !data.servers.iter().any(|server| server.id == id) {
+            return Err((StatusCode::NOT_FOUND, "workspace not found".into()));
+        }
+        data.tasks
+            .iter()
+            .filter(|task| {
+                task.server_id == id
+                    && matches!(
+                        task.status.as_str(),
+                        "awaiting_approval" | "queued" | "running"
+                    )
+            })
+            .map(|task| task.id)
+            .collect::<Vec<_>>()
+    };
+    for task_id in cancellable_tasks {
+        match task_executor::request_cancel(&state, task_id).await {
+            Ok(_) => {}
+            Err((StatusCode::NOT_FOUND | StatusCode::CONFLICT, _)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if let Some(status) = state.downloads.read().await.get(&id) {
+        if download::is_active(status) {
+            status.cancel.store(true, Ordering::Release);
+        }
+    }
     let operation = server_operation_lock(&state, &id).await;
     let _guard = operation.lock().await;
     let workspace = state
@@ -1559,11 +1779,16 @@ async fn delete_server(
     {
         return Err((
             StatusCode::CONFLICT,
-            "核心下载进行中，请先取消并等待下载任务结束".into(),
+            "核心下载正在取消，请稍后重试删除".into(),
         ));
     }
     if workspace.kind == "server" && state.processes.read().await.contains_key(&id) {
         let _ = stop_server(state.clone(), id.clone(), false).await?;
+    }
+    if workspace.kind == "server" {
+        workspace_manifest::remove(&runtime::server_directory(&id))
+            .await
+            .map_err(internal)?;
     }
     {
         let mut data = state.inner.write().await;
@@ -1577,6 +1802,7 @@ async fn delete_server(
     }
     state.downloads.write().await.remove(&id);
     state.channels.write().await.remove(&id);
+    clear_telemetry(&state, &id, None).await;
     let mut removed_files = false;
     if request.delete_files {
         let base = runtime::data_root().join(if workspace.kind == "project" {
@@ -1608,11 +1834,180 @@ async fn delete_server(
     state.operation_locks.lock().await.remove(&id);
     Ok(Json(DeleteServerResponse { id, removed_files }))
 }
+fn is_paper_core(core: &str) -> bool {
+    core.trim().eq_ignore_ascii_case("paper")
+}
+
+fn unavailable_telemetry(server: &ServerInfo) -> ServerTelemetry {
+    let (availability, detail) = if server.kind != "server" {
+        ("unavailable", "通用项目不运行 Minecraft 服务器")
+    } else if server.status != "online" || server.runtime_generation.is_none() {
+        ("unavailable", "服务器未运行")
+    } else if is_paper_core(&server.core) {
+        ("unavailable", "等待受管 Java 控制台遥测")
+    } else {
+        (
+            "unsupported",
+            "等待玩家遥测；TPS 仅支持可验证的 Paper 控制台输出",
+        )
+    };
+    ServerTelemetry {
+        availability: availability.into(),
+        source: "managed_java_console".into(),
+        collected_at: None,
+        online: None,
+        max_players: None,
+        player_names: None,
+        tps_1m: None,
+        mspt_1m: None,
+        detail: Some(detail.into()),
+    }
+}
+
+fn dashboard_telemetry(server: &ServerInfo, record: Option<&TelemetryRecord>) -> ServerTelemetry {
+    let Some(generation) = server.runtime_generation else {
+        return unavailable_telemetry(server);
+    };
+    let Some(record) = record.filter(|record| record.generation == generation) else {
+        return unavailable_telemetry(server);
+    };
+    if server.kind != "server" || server.status != "online" {
+        return unavailable_telemetry(server);
+    }
+    let mut telemetry = record.value.clone();
+    if record.observed_at.elapsed() >= TELEMETRY_STALE_AFTER {
+        telemetry.availability = "stale".into();
+        telemetry.detail = Some("控制台遥测超过 15 秒未更新".into());
+    }
+    telemetry
+}
+
+async fn initialize_telemetry(state: &AppState, id: &str, generation: Uuid, core: &str) {
+    let current = state
+        .inner
+        .read()
+        .await
+        .servers
+        .iter()
+        .any(|server| server.id == id && server.runtime_generation == Some(generation));
+    if !current {
+        return;
+    }
+    let telemetry = ServerTelemetry {
+        availability: if is_paper_core(core) {
+            "unavailable".into()
+        } else {
+            "unsupported".into()
+        },
+        source: "managed_java_console".into(),
+        collected_at: None,
+        online: None,
+        max_players: None,
+        player_names: None,
+        tps_1m: None,
+        mspt_1m: None,
+        detail: Some(if is_paper_core(core) {
+            "等待受管 Java 控制台遥测".into()
+        } else {
+            "等待玩家遥测；TPS 仅支持可验证的 Paper 控制台输出".into()
+        }),
+    };
+    state.telemetry.write().await.insert(
+        id.to_string(),
+        TelemetryRecord {
+            generation,
+            observed_at: Instant::now(),
+            value: telemetry,
+        },
+    );
+}
+
+async fn record_telemetry_observation(
+    state: &AppState,
+    id: &str,
+    generation: Uuid,
+    observation: TelemetryObservation,
+) {
+    let current = state.inner.read().await.servers.iter().any(|server| {
+        server.id == id
+            && server.status == "online"
+            && server.runtime_generation == Some(generation)
+    });
+    if !current {
+        return;
+    }
+    let now = Local::now().to_rfc3339();
+    let mut telemetry = state.telemetry.write().await;
+    let record = telemetry
+        .entry(id.to_string())
+        .or_insert_with(|| TelemetryRecord {
+            generation,
+            observed_at: Instant::now(),
+            value: ServerTelemetry {
+                availability: "unavailable".into(),
+                source: "managed_java_console".into(),
+                collected_at: None,
+                online: None,
+                max_players: None,
+                player_names: None,
+                tps_1m: None,
+                mspt_1m: None,
+                detail: Some("等待受管 Java 控制台遥测".into()),
+            },
+        });
+    if record.generation != generation {
+        return;
+    }
+    record.observed_at = Instant::now();
+    record.value.availability = "available".into();
+    record.value.collected_at = Some(now);
+    match observation {
+        TelemetryObservation::PlayerList {
+            online,
+            max_players,
+            player_names,
+        } => {
+            record.value.online = Some(online);
+            record.value.max_players = Some(max_players);
+            record.value.player_names = Some(player_names);
+        }
+        TelemetryObservation::PaperTps(tps) => {
+            record.value.tps_1m = Some(tps);
+            record.value.detail = None;
+        }
+        TelemetryObservation::PaperMspt(mspt) => record.value.mspt_1m = Some(mspt),
+    }
+}
+
+async fn clear_telemetry(state: &AppState, id: &str, generation: Option<Uuid>) {
+    let mut telemetry = state.telemetry.write().await;
+    if telemetry
+        .get(id)
+        .is_some_and(|record| generation.is_none_or(|generation| record.generation == generation))
+    {
+        telemetry.remove(id);
+    }
+}
+
 async fn get_dashboard(State(state): State<AppState>) -> Json<DashboardResponse> {
-    let data = state.inner.read().await;
+    let (servers, tasks) = {
+        let data = state.inner.read().await;
+        (data.servers.clone(), data.tasks.clone())
+    };
+    let telemetry_cache = state.telemetry.read().await;
+    let telemetry = servers
+        .iter()
+        .map(|server| {
+            (
+                server.id.clone(),
+                dashboard_telemetry(server, telemetry_cache.get(&server.id)),
+            )
+        })
+        .collect();
     Json(DashboardResponse {
-        servers: data.servers.clone(),
-        tasks: data.tasks.clone(),
+        servers,
+        tasks,
+        telemetry,
         agent_status: "ready",
         mcp_connected: true,
     })
@@ -1897,6 +2292,7 @@ async fn start_server(state: AppState, id: String) -> ApiResult<ActionResponse> 
             return Err(internal(error));
         }
     };
+    initialize_telemetry(&state, &id, generation, &server.core).await;
     state
         .processes
         .write()
@@ -2039,6 +2435,8 @@ async fn stop_server(
         server.last_error = None;
         let updated = server.clone();
         persist(&state, &data).await.map_err(internal)?;
+        drop(data);
+        clear_telemetry(&state, &id, None).await;
         return Ok(Json(ActionResponse {
             server: updated,
             log: "服务器进程未运行，状态已校正为停止".into(),
@@ -2079,6 +2477,7 @@ async fn stop_server(
         data.logs.entry(id.clone()).or_default().push(line.clone());
         persist(&state, &data).await.map_err(internal)?;
     }
+    clear_telemetry(&state, &id, Some(process.generation)).await;
     let mut exit = process.exit.clone();
     if force_immediately {
         request_force_kill(&process, false).await?;
@@ -2179,6 +2578,75 @@ async fn wait_for_process_exit(
     .flatten()
 }
 
+fn parse_player_list(line: &str) -> Option<TelemetryObservation> {
+    if line.len() > MAX_TELEMETRY_LINE_BYTES {
+        return None;
+    }
+    let (_, values) = line.split_once("There are ")?;
+    let (online, values) = values.split_once(" of a max of ")?;
+    let (max_players, player_list) = values.split_once(" players online:")?;
+    let online = online.trim().parse::<u32>().ok()?;
+    let max_players = max_players.trim().parse::<u32>().ok()?;
+    if online > max_players {
+        return None;
+    }
+    let player_names = player_list
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .take(MAX_TELEMETRY_PLAYER_NAMES)
+        .filter(|name| {
+            name.len() <= 16
+                && name
+                    .bytes()
+                    .all(|character| character.is_ascii_alphanumeric() || character == b'_')
+        })
+        .map(str::to_owned)
+        .collect();
+    Some(TelemetryObservation::PlayerList {
+        online,
+        max_players,
+        player_names,
+    })
+}
+
+fn parse_paper_metric(line: &str, prefix: &str, maximum: f32) -> Option<f32> {
+    if line.len() > MAX_TELEMETRY_LINE_BYTES {
+        return None;
+    }
+    let (_, values) = line.split_once(prefix)?;
+    let value = values.split(',').next()?.trim().parse::<f32>().ok()?;
+    (value.is_finite() && (0.0..=maximum).contains(&value)).then_some(value)
+}
+
+fn parse_telemetry_observation(core: &str, line: &str) -> Option<TelemetryObservation> {
+    if let Some(observation) = parse_player_list(line) {
+        return Some(observation);
+    }
+    if !is_paper_core(core) {
+        return None;
+    }
+    if let Some(tps) = parse_paper_metric(line, "TPS from last 1m, 5m, 15m:", 20.0) {
+        return Some(TelemetryObservation::PaperTps(tps));
+    }
+    parse_paper_metric(line, "MSPT from last 1m, 5m, 15m:", 10_000.0)
+        .map(TelemetryObservation::PaperMspt)
+}
+
+async fn sample_console_telemetry(stdin: &mut ChildStdin, paper: bool) -> Result<(), String> {
+    stdin
+        .write_all(b"list\n")
+        .await
+        .map_err(|error| error.to_string())?;
+    if paper {
+        stdin
+            .write_all(b"tps\n")
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    stdin.flush().await.map_err(|error| error.to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_process_actor(
     state: AppState,
@@ -2203,6 +2671,8 @@ async fn run_process_actor(
     let started = Instant::now();
     let mut system = sysinfo::System::new();
     let mut last_metrics_at = Instant::now() - Duration::from_secs(1);
+    let mut last_telemetry_at = Instant::now() - TELEMETRY_INTERVAL;
+    let paper_core = is_paper_core(&core);
     let mut poll = tokio::time::interval(Duration::from_millis(100));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut exit_status = None;
@@ -2212,7 +2682,11 @@ async fn run_process_actor(
                 Ok(Some(line)) => {
                     let online = process_ready_line(&core, &line);
                     ready |= online;
-                    record_process_line(&state, &id, managed.generation, &line, online).await;
+                    if let Some(observation) = parse_telemetry_observation(&core, &line) {
+                        record_telemetry_observation(&state, &id, managed.generation, observation).await;
+                    } else {
+                        record_process_line(&state, &id, managed.generation, &line, online).await;
+                    }
                 }
                 Ok(None) => stdout_open = false,
                 Err(error) => {
@@ -2224,7 +2698,11 @@ async fn run_process_actor(
                 Ok(Some(line)) => {
                     let online = process_ready_line(&core, &line);
                     ready |= online;
-                    record_process_line(&state, &id, managed.generation, &line, online).await;
+                    if let Some(observation) = parse_telemetry_observation(&core, &line) {
+                        record_telemetry_observation(&state, &id, managed.generation, observation).await;
+                    } else {
+                        record_process_line(&state, &id, managed.generation, &line, online).await;
+                    }
                 }
                 Ok(None) => stderr_open = false,
                 Err(error) => {
@@ -2282,6 +2760,10 @@ async fn run_process_actor(
                                 )
                                 .await;
                             }
+                        }
+                        if ready && !requested_stop && last_telemetry_at.elapsed() >= TELEMETRY_INTERVAL {
+                            last_telemetry_at = Instant::now();
+                            let _ = sample_console_telemetry(&mut stdin, paper_core).await;
                         }
                         if !ready && !requested_stop && started.elapsed() >= Duration::from_secs(120) {
                             requested_stop = true;
@@ -2442,6 +2924,7 @@ async fn finish_process_instance(
             return;
         }
     }
+    clear_telemetry(state, id, Some(generation)).await;
     let exit_line = format!(
         "[{} {}]: Java 进程已退出，实例 {}，退出码 {:?}{}",
         Local::now().format("%H:%M:%S"),
@@ -2583,6 +3066,90 @@ async fn update_config(
         content: request.content,
         updated_at: Local::now().to_rfc3339(),
     }))
+}
+
+async fn update_server_lifecycle(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<UpdateServerLifecycleRequest>,
+) -> ApiResult<ServerInfo> {
+    let mut data = state.inner.write().await;
+    let server = data
+        .servers
+        .iter_mut()
+        .find(|server| server.id == id)
+        .ok_or((StatusCode::NOT_FOUND, "server not found".into()))?;
+    if server.kind != "server" {
+        return Err((StatusCode::CONFLICT, "通用项目没有服务器生命周期".into()));
+    }
+    validate_lifecycle_transition(server, &request.phase)?;
+    server.lifecycle_phase = request.phase;
+    let updated = server.clone();
+    persist(&state, &data).await.map_err(internal)?;
+    Ok(Json(updated))
+}
+
+fn validate_lifecycle_transition(
+    server: &ServerInfo,
+    phase: &str,
+) -> Result<(), (StatusCode, String)> {
+    if !matches!(phase, "create" | "build" | "operate") {
+        return Err((StatusCode::BAD_REQUEST, "服务器生命周期阶段无效".into()));
+    }
+    if phase == "create" && server.core_ready {
+        return Err((
+            StatusCode::CONFLICT,
+            "核心已就绪，不能返回创建阶段；可切换到建设阶段".into(),
+        ));
+    }
+    if phase != "create" && !server.core_ready {
+        return Err((
+            StatusCode::CONFLICT,
+            "首次创建完成并确认核心就绪后，才能进入建设或运营阶段".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn update_server_services(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Json(settings): Json<ServiceSettings>,
+) -> ApiResult<ServerInfo> {
+    validate_service_settings(&settings)?;
+    let mut data = state.inner.write().await;
+    let server = data
+        .servers
+        .iter_mut()
+        .find(|server| server.id == id)
+        .ok_or((StatusCode::NOT_FOUND, "server not found".into()))?;
+    if server.kind != "server" {
+        return Err((StatusCode::CONFLICT, "通用项目不支持服务器运营模块".into()));
+    }
+    server.service_settings = settings;
+    let updated = server.clone();
+    persist(&state, &data).await.map_err(internal)?;
+    Ok(Json(updated))
+}
+
+fn validate_service_settings(settings: &ServiceSettings) -> Result<(), (StatusCode, String)> {
+    let social = &settings.social;
+    if !(10..=86_400).contains(&social.sync_interval_seconds)
+        || !(1..=3_600).contains(&social.burst_interval_seconds)
+        || !(1..=86_400).contains(&social.burst_recovery_seconds)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "社交同步频率范围无效：常规 10-86400 秒、评论高峰 1-3600 秒、恢复 1-86400 秒".into(),
+        ));
+    }
+    if social.enabled && !social.qq_bot && !social.bilibili_bot && !social.douyin_bot {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "已开启社交运营时，至少选择 QQ、Bilibili 或抖音机器人之一".into(),
+        ));
+    }
+    Ok(())
 }
 async fn get_logs(
     Path(id): Path<String>,
@@ -3172,7 +3739,7 @@ fn is_protected_server_artifact(path: &StdPath) -> bool {
             })
 }
 
-fn reject_protected_server_artifact(path: &StdPath) -> Result<(), (StatusCode, String)> {
+pub(crate) fn reject_protected_server_artifact(path: &StdPath) -> Result<(), (StatusCode, String)> {
     if is_protected_server_artifact(path) {
         return Err((
             StatusCode::FORBIDDEN,
@@ -3309,7 +3876,7 @@ pub(crate) async fn ensure_provision_workspace(state: &AppState, id: &str) -> Re
         .await
         .map_err(|error| error.to_string())
 }
-fn safe_relative(value: &str) -> Result<PathBuf, (StatusCode, String)> {
+pub(crate) fn safe_relative(value: &str) -> Result<PathBuf, (StatusCode, String)> {
     if value.len() > 1024
         || value.chars().any(char::is_control)
         || value.contains('\\')
@@ -3442,7 +4009,7 @@ fn reject_workspace_symlink(workspace: &CapDir, path: &StdPath) -> std::io::Resu
     Ok(())
 }
 
-fn path_string(path: &std::path::Path) -> String {
+pub(crate) fn path_string(path: &std::path::Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 fn is_editable(path: &std::path::Path) -> bool {
@@ -3834,8 +4401,20 @@ fn internal(error: String) -> (StatusCode, String) {
 /// 这只接受明确出现的核心名称和形如 `1.12.2` 的版本号，不根据“最新”“
 /// 推荐”等模糊措辞猜测下载目标。这样开服任务可以复用规划结果，同时不
 /// 会把普通聊天误变成任意命令执行。
+#[allow(dead_code)]
 pub(crate) fn extract_server_plan(text: &str) -> Option<(String, String)> {
+    extract_server_plan_details(text).map(|(core, version, _resource_id)| (core, version))
+}
+
+/// Extract a plan while retaining an explicitly supplied resource/catalog id.
+///
+/// Core names are matched as identifier tokens rather than arbitrary
+/// substrings. This prevents a resource slug such as
+/// `leavesslientqaqfork` from being mistaken for the unrelated `Leaves` core.
+pub(crate) fn extract_server_plan_details(text: &str) -> Option<(String, String, Option<String>)> {
     const CORES: &[(&str, &str)] = &[
+        ("lsqfk", "LSQFK"),
+        ("lsfk", "LSQFK"),
         ("paper", "Paper"),
         ("purpur", "Purpur"),
         ("spigot", "Spigot"),
@@ -3845,33 +4424,130 @@ pub(crate) fn extract_server_plan(text: &str) -> Option<(String, String)> {
         ("velocity", "Velocity"),
         ("vanilla", "Vanilla"),
     ];
-    let lower = text.to_ascii_lowercase();
+    let resource_id = extract_resource_identifier(text);
     let core = CORES
         .iter()
-        .find(|(needle, _)| lower.contains(needle))
+        .find(|(needle, _)| contains_ascii_identifier_token(text, needle))
         .map(|(_, name)| (*name).to_string())?;
-    let version = text
-        .char_indices()
-        .filter_map(|(index, _)| text.get(index..).map(|tail| (index, tail)))
-        .find_map(|(_, tail)| {
-            let tail = tail.strip_prefix("1.")?;
-            let end = tail
-                .char_indices()
-                .find(|(_, character)| !character.is_ascii_digit() && *character != '.')
-                .map(|(index, _)| index)
-                .unwrap_or(tail.len());
-            let candidate = format!("1.{}", &tail[..end]);
-            let parts: Vec<_> = candidate.split('.').collect();
-            if (parts.len() == 2 || parts.len() == 3)
-                && parts[1..].iter().all(|part| !part.is_empty())
-                && parts[1..].iter().all(|part| part.parse::<u32>().is_ok())
-            {
-                Some(candidate)
-            } else {
-                None
-            }
-        })?;
-    Some((core, version))
+    let version = extract_minecraft_version(text)?;
+    Some((core, version, resource_id))
+}
+
+fn contains_ascii_identifier_token(text: &str, needle: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.match_indices(needle).any(|(start, _)| {
+        let before = lower[..start].chars().next_back();
+        let after = lower[start + needle.len()..].chars().next();
+        let is_identifier =
+            |character: char| character.is_ascii_alphanumeric() || matches!(character, '_' | '-');
+        !before.is_some_and(is_identifier) && !after.is_some_and(is_identifier)
+    })
+}
+
+fn extract_resource_identifier(text: &str) -> Option<String> {
+    const MARKERS: &[&str] = &[
+        "resource identifier",
+        "resource id",
+        "resource_id",
+        "\u{8d44}\u{6e90}\u{6807}\u{8bc6}",
+    ];
+    let lower = text.to_ascii_lowercase();
+    for marker in MARKERS {
+        let Some(start) = lower.find(marker) else {
+            continue;
+        };
+        let suffix = &text[start + marker.len()..];
+        let value = suffix.trim_start_matches(|character: char| {
+            character.is_whitespace()
+                || matches!(character, ':' | '=' | '\u{ff1a}' | '\u{ff1d}' | '(' | '（')
+        });
+        let identifier = value
+            .chars()
+            .take_while(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+            .collect::<String>();
+        if !identifier.is_empty() {
+            return Some(identifier.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+pub(crate) fn extract_minecraft_version(text: &str) -> Option<String> {
+    let latest_year_major = (Local::now().year() % 100 + 1) as u32;
+    text.split(|character: char| !character.is_ascii_digit() && character != '.')
+        .find_map(|candidate| {
+            let parts = candidate.split('.').collect::<Vec<_>>();
+            let first = parts.first()?.parse::<u32>().ok()?;
+            let supported_shape = (first == 1 && parts.len() == 3)
+                || ((20..=latest_year_major).contains(&first) && (2..=3).contains(&parts.len()));
+            (supported_shape
+                && parts.iter().all(|part| {
+                    !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
+                }))
+            .then(|| candidate.to_string())
+        })
+}
+
+pub(crate) fn is_plan_confirmation(message: &str) -> bool {
+    let command = message
+        .trim()
+        .trim_end_matches(['。', '！', '!', '？', '?'])
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let short_confirmation = matches!(
+        command.as_str(),
+        "确定"
+            | "确认"
+            | "可以"
+            | "就这样"
+            | "开始吧"
+            | "创建吧"
+            | "开始创建"
+            | "按这个方案"
+            | "按这个方案执行"
+            | "同意"
+            | "继续"
+            | "继续吧"
+            | "继续执行"
+            | "继续创建"
+            | "ok"
+            | "yes"
+    );
+    if short_confirmation {
+        return true;
+    }
+    if command.contains("不确定") || command.contains("不确认") || command.contains("取消")
+    {
+        return false;
+    }
+    let explicit_confirmation = [
+        "已确认",
+        "确认创建",
+        "确认方案",
+        "批准创建",
+        "同意创建",
+        "按这个方案",
+    ]
+    .iter()
+    .any(|marker| command.contains(marker));
+    explicit_confirmation
+        && (command.contains("创建")
+            || command.contains("开服")
+            || command.contains("执行")
+            || command.contains("安装"))
+}
+
+pub(crate) fn classify_workspace_intent(message: &str, is_planning: bool) -> &'static str {
+    let intent = classify_intent(message);
+    if is_planning && is_plan_confirmation(message) {
+        "server_bootstrap"
+    } else {
+        intent
+    }
 }
 pub(crate) fn classify_intent(message: &str) -> &'static str {
     let command = message
@@ -3884,6 +4560,8 @@ pub(crate) fn classify_intent(message: &str) -> &'static str {
         .collect::<String>();
     if compact.contains("开服")
         || compact.contains("开服务器")
+        || compact.contains("创建服务器")
+        || compact.contains("创建开服")
         || compact.contains("启动服务器")
         || compact.contains("启动这台服务器")
         || compact.contains("把服务器开起来")
@@ -3931,7 +4609,7 @@ pub(crate) fn rule_reply(intent: &str) -> &'static str {
             "我已创建只读日志诊断任务。执行器会分析最近的服务器日志并生成可下载报告，不会自动修改文件。"
         }
         "server_start" | "server_bootstrap" => {
-            "已创建真实开服任务：先从资源中心解析核心，找不到时按镜像和官方网络源回退；缺少匹配 Java 会自动安装托管运行时，然后启动服务器并等待真实就绪标记。所有阶段、日志、产物和失败补偿都会记录在任务详情中。"
+            "正在创建受审计的开服任务：它会先从资源库解析核心与 Java，缺少精确版本时调用 MSL 国内镜像 API；随后校验核心、准备工作区与 EULA、启动并等待真实就绪标记。任务状态会显示在任务执行器中；所有阶段、日志、产物和失败补偿都会记录在任务详情中。RPG 插件不会根据自然语言猜测自动安装，需要在基础服务器就绪后确认具体插件清单。"
         }
         "server_stop" => "我已创建安全停服任务。执行器会等待 Java 进程真实退出后再报告完成。",
         "vote" => {
@@ -4396,6 +5074,7 @@ mod tests {
             kind: "server".into(),
             name: format!("{id} server"),
             core: "Paper".into(),
+            core_resource_id: None,
             version: "1.21.4".into(),
             status: status.into(),
             players: "0 / 60".into(),
@@ -4411,7 +5090,39 @@ mod tests {
             operation_state: "idle".into(),
             core_ready: false,
             last_error: None,
+            lifecycle_phase: "create".into(),
+            service_settings: ServiceSettings::default(),
         }
+    }
+
+    #[test]
+    fn service_settings_require_valid_cadence_and_a_selected_social_channel() {
+        let mut settings = ServiceSettings::default();
+        assert!(validate_service_settings(&settings).is_ok());
+
+        settings.social.enabled = true;
+        let missing_channel = validate_service_settings(&settings).unwrap_err();
+        assert_eq!(missing_channel.0, StatusCode::BAD_REQUEST);
+
+        settings.social.qq_bot = true;
+        assert!(validate_service_settings(&settings).is_ok());
+
+        settings.social.sync_interval_seconds = 9;
+        let invalid_frequency = validate_service_settings(&settings).unwrap_err();
+        assert_eq!(invalid_frequency.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn lifecycle_is_independent_from_runtime_status_and_requires_a_ready_core() {
+        let mut server = test_server("server-lifecycle", "online", "running");
+        assert!(validate_lifecycle_transition(&server, "build").is_err());
+        assert!(validate_lifecycle_transition(&server, "operate").is_err());
+
+        server.core_ready = true;
+        assert!(validate_lifecycle_transition(&server, "build").is_ok());
+        assert!(validate_lifecycle_transition(&server, "operate").is_ok());
+        assert!(validate_lifecycle_transition(&server, "create").is_err());
+        assert!(validate_lifecycle_transition(&server, "unknown").is_err());
     }
 
     async fn test_state_with_workspace(id: &str, kind: &str) -> (AppState, PathBuf) {
@@ -4429,6 +5140,7 @@ mod tests {
             file,
             _file_lock: Arc::new(file_lock),
             processes: Arc::new(RwLock::new(HashMap::new())),
+            telemetry: Arc::new(RwLock::new(HashMap::new())),
             shutting_down: Arc::new(AtomicBool::new(false)),
             operation_locks: Arc::new(Mutex::new(HashMap::new())),
             channels: Arc::new(RwLock::new(HashMap::new())),
@@ -4736,6 +5448,52 @@ mod tests {
         assert!(validate_delete_confirmation(true, Some("delete all")).is_ok());
     }
 
+    #[tokio::test]
+    async fn deleting_a_planning_workspace_cleans_its_conversation_and_pending_task() {
+        let id = format!("planning-delete-{}", Uuid::new_v4().simple());
+        let (state, state_directory) = test_state_with_workspace(&id, "server").await;
+        {
+            let mut data = state.inner.write().await;
+            data.servers[0].status = "planning".into();
+            data.conversations.push(conversations::new_conversation(
+                &id,
+                Some("开服规划".into()),
+                None,
+            ));
+            data.tasks.push(new_task_record(
+                id.clone(),
+                "初始化服务器".into(),
+                "server_bootstrap".into(),
+                "awaiting_approval".into(),
+                0,
+                "medium".into(),
+                None,
+            ));
+        }
+
+        let deleted = delete_server(
+            Path(id.clone()),
+            State(state.clone()),
+            Json(DeleteServerRequest {
+                delete_files: false,
+                confirmation: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(deleted.id, id);
+        assert!(!deleted.removed_files);
+        let data = state.inner.read().await;
+        assert!(data.servers.is_empty());
+        assert!(data.tasks.is_empty());
+        assert!(data.conversations.is_empty());
+        drop(data);
+
+        drop(state);
+        fs::remove_dir_all(state_directory).await.unwrap();
+    }
+
     #[test]
     fn legacy_server_json_defaults_memory_limit_to_eight_gb() {
         let legacy = r#"{
@@ -4922,6 +5680,11 @@ mod tests {
         assert_eq!(classify_intent("请启动服务器。"), "server_bootstrap");
         assert_eq!(classify_intent("帮我开服"), "server_bootstrap");
         assert_eq!(classify_intent("把服务器开起来"), "server_bootstrap");
+        assert_eq!(classify_intent("继续帮我创建服务器"), "server_bootstrap");
+        assert_eq!(
+            classify_intent("使用lsfk帮我创建服务器"),
+            "server_bootstrap"
+        );
         assert_eq!(classify_intent("帮我安全停服"), "server_stop");
         assert_eq!(classify_intent("为什么不能停止服务器？"), "general");
         assert_eq!(classify_intent("不要停止服务器"), "general");
@@ -4938,6 +5701,63 @@ mod tests {
             extract_server_plan("Purpur 1.21.4 RPG"),
             Some(("Purpur".into(), "1.21.4".into()))
         );
+        assert_eq!(
+            extract_server_plan("按 Paper 26.2、Java 21 创建"),
+            Some(("Paper".into(), "26.2".into()))
+        );
+        assert_eq!(
+            extract_server_plan("使用 lsfk 26.2 创建"),
+            Some(("LSQFK".into(), "26.2".into()))
+        );
+        assert_eq!(extract_minecraft_version("约 10 人，Java 21"), None);
+        assert_eq!(extract_minecraft_version("数据盘可用 40.0 GB"), None);
+    }
+
+    #[test]
+    fn short_confirmation_executes_only_inside_a_planning_workspace() {
+        for confirmation in [
+            "确定",
+            "确认。",
+            "就这样",
+            "开始吧",
+            "按这个方案执行",
+            "继续",
+            "继续吧",
+            "OK",
+        ] {
+            assert!(is_plan_confirmation(confirmation));
+            assert_eq!(
+                classify_workspace_intent(confirmation, true),
+                "server_bootstrap"
+            );
+            assert_eq!(classify_workspace_intent(confirmation, false), "general");
+        }
+        assert!(!is_plan_confirmation("我不确定"));
+    }
+
+    #[test]
+    fn detailed_plan_confirmation_bypasses_model_disclaimer() {
+        let message = "已确认，按 LSQFK（资源标识：leavesslientqaqfork）26.2-r1 创建：玩法：插件生电，基础插件：LuckPerms、EssentialsX、CoreProtect";
+        assert!(is_plan_confirmation(message));
+        assert_eq!(classify_workspace_intent(message, true), "server_bootstrap");
+        assert_eq!(classify_workspace_intent(message, false), "plugin");
+        assert_eq!(
+            extract_server_plan(message),
+            Some(("LSQFK".into(), "26.2".into()))
+        );
+        assert_eq!(
+            extract_server_plan_details(message),
+            Some((
+                "LSQFK".into(),
+                "26.2".into(),
+                Some("leavesslientqaqfork".into())
+            ))
+        );
+        assert_eq!(
+            extract_server_plan("leavesslientqaqfork 26.2"),
+            None,
+            "resource slugs must not be inferred as the Leaves core"
+        );
     }
 
     #[test]
@@ -4953,6 +5773,10 @@ mod tests {
         assert_eq!(
             effective_task_start("high", "approval").0,
             "awaiting_approval"
+        );
+        assert_eq!(
+            effective_task_start("medium", "full"),
+            ("queued", 0, Some("auto"))
         );
     }
 
@@ -5188,6 +6012,96 @@ mod tests {
         command
     }
 
+    #[test]
+    fn telemetry_parser_accepts_player_counts_and_distinguishes_empty_names() {
+        assert_eq!(
+            parse_telemetry_observation(
+                "Paper",
+                "[Server thread/INFO]: There are 2 of a max of 60 players online: Alice, Bob"
+            ),
+            Some(TelemetryObservation::PlayerList {
+                online: 2,
+                max_players: 60,
+                player_names: vec!["Alice".into(), "Bob".into()],
+            })
+        );
+        assert_eq!(
+            parse_telemetry_observation("Paper", "There are 0 of a max of 60 players online:"),
+            Some(TelemetryObservation::PlayerList {
+                online: 0,
+                max_players: 60,
+                player_names: Vec::new(),
+            })
+        );
+        assert!(
+            parse_telemetry_observation(
+                "Paper",
+                "There are many of a max of 60 players online: Alice"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn telemetry_parser_accepts_paper_tps_and_mspt_only() {
+        assert_eq!(
+            parse_telemetry_observation("Paper", "TPS from last 1m, 5m, 15m: 19.98, 20.0, 20.0"),
+            Some(TelemetryObservation::PaperTps(19.98))
+        );
+        assert_eq!(
+            parse_telemetry_observation("Paper", "MSPT from last 1m, 5m, 15m: 5.25, 5.40, 5.70"),
+            Some(TelemetryObservation::PaperMspt(5.25))
+        );
+        assert!(
+            parse_telemetry_observation("Vanilla", "TPS from last 1m, 5m, 15m: 20.0, 20.0, 20.0")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dashboard_telemetry_filters_generation_and_marks_stale_values() {
+        let generation = Uuid::new_v4();
+        let mut server = test_server("telemetry-server", "online", "运行中");
+        server.runtime_generation = Some(generation);
+        let value = ServerTelemetry {
+            availability: "available".into(),
+            source: "managed_java_console".into(),
+            collected_at: Some(Local::now().to_rfc3339()),
+            online: Some(3),
+            max_players: Some(60),
+            player_names: Some(vec!["Alice".into()]),
+            tps_1m: Some(19.5),
+            mspt_1m: None,
+            detail: None,
+        };
+        let stale = dashboard_telemetry(
+            &server,
+            Some(&TelemetryRecord {
+                generation,
+                observed_at: Instant::now() - TELEMETRY_STALE_AFTER - Duration::from_secs(1),
+                value: value.clone(),
+            }),
+        );
+        assert_eq!(stale.availability, "stale");
+        assert_eq!(stale.online, Some(3));
+
+        let other_generation = dashboard_telemetry(
+            &server,
+            Some(&TelemetryRecord {
+                generation: Uuid::new_v4(),
+                observed_at: Instant::now(),
+                value,
+            }),
+        );
+        assert_eq!(other_generation.availability, "unavailable");
+
+        server.core = "Vanilla".into();
+        assert_eq!(
+            dashboard_telemetry(&server, None).availability,
+            "unsupported"
+        );
+    }
+
     #[tokio::test]
     async fn process_actor_gracefully_stops_a_real_child_and_clears_runtime_state() {
         let directory =
@@ -5232,6 +6146,7 @@ mod tests {
                 "actor-test".into(),
                 managed.clone(),
             )]))),
+            telemetry: Arc::new(RwLock::new(HashMap::new())),
             shutting_down: Arc::new(AtomicBool::new(false)),
             operation_locks: Arc::new(Mutex::new(HashMap::new())),
             channels: Arc::new(RwLock::new(HashMap::new())),

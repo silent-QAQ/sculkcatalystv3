@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { ChevronDown, ChevronRight, FlaskConical, LoaderCircle, Pencil, Plus, RefreshCw, Trash2, X } from 'lucide-vue-next'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { BrainCircuit, Check, ChevronDown, ChevronRight, FlaskConical, LoaderCircle, Pencil, Plus, RefreshCw, Trash2, X } from 'lucide-vue-next'
 import { apiRequest } from '../../../lib/api'
+import { reasoningEffortFromScale, reasoningEffortToScale } from '../../../lib/reasoning-scale'
 import { REASONING_EFFORTS, SCENARIOS } from '../types'
 import type { AiProviderView, AiSettingsView, ModelBinding, TestResult } from '../types'
 import { aiSettings, flash, friendly, loadAi } from '../store'
@@ -12,7 +13,7 @@ const togglingModel = ref('')
 const testing = ref('')
 const testResults = ref<Record<string, TestResult>>({})
 const addingModel = ref<Record<string, string>>({})
-const savingReasoning = ref(false)
+const bindingMenu = ref('')
 
 const providerModal = ref(false)
 const modalMode = ref<'create' | 'edit'>('create')
@@ -137,34 +138,46 @@ function bindingValue(scenario: string) {
   const binding = bindingOf(scenario)
   return binding ? modelKey(binding.provider_id, binding.model_id) : ''
 }
+function bindingLabel(scenario: string) {
+  const binding = bindingOf(scenario)
+  if (!binding) return scenario === 'default' ? '未设置' : '跟随默认模型'
+  const provider = providers.value.find(item => item.id === binding.provider_id)
+  return `${provider?.name ?? '未知提供商'} / ${binding.model_id}`
+}
+function bindingReasoningLabel(scenario: string) {
+  const effort = bindingOf(scenario)?.reasoning_effort
+  return effort ? REASONING_EFFORTS.find(item => item.key === effort)?.label ?? effort : '自动'
+}
+function sameBindingValue(scenario: string, value: string) { return bindingValue(scenario) === value }
+function bindingReasoningIndex(scenario: string, value: string) {
+  if (!sameBindingValue(scenario, value)) return 0
+  const effort = bindingOf(scenario)?.reasoning_effort
+  return reasoningEffortToScale(effort, REASONING_EFFORTS)
+}
+function toggleBindingMenu(scenario: string) { bindingMenu.value = bindingMenu.value === scenario ? '' : scenario }
+function closeBindingMenu(event: MouseEvent) { if (!(event.target as HTMLElement).closest('.s-model-binding')) bindingMenu.value = '' }
+onMounted(() => document.addEventListener('click', closeBindingMenu))
+onUnmounted(() => document.removeEventListener('click', closeBindingMenu))
 function bindingInvalid(scenario: string) {
   const binding = bindingOf(scenario)
   if (!binding) return false
   const provider = providers.value.find(item => item.id === binding.provider_id)
   return !provider || !provider.enabled
 }
-async function setBinding(scenario: string, value: string) {
+async function setBinding(scenario: string, value: string, reasoningEffort: ModelBinding['reasoning_effort'] = null) {
   let binding: ModelBinding | null = null
   if (value) {
     const [providerId, ...rest] = value.split('::')
-    binding = { provider_id: providerId, model_id: rest.join('::') }
+    binding = { provider_id: providerId, model_id: rest.join('::'), reasoning_effort: reasoningEffort }
   }
+  bindingMenu.value = ''
   try {
     aiSettings.value = await apiRequest<AiSettingsView>('/api/ai/scenarios', { method: 'PUT', body: JSON.stringify({ scenario, binding }) })
-    flash(binding ? '情景模型已更新' : '已恢复为默认模型')
+    flash(binding ? `情景模型已更新 · 思考${bindingReasoningLabel(scenario)}` : '已恢复为默认模型')
   } catch (error) { flash('绑定失败：' + friendly(error)) }
 }
-
-async function setDefaultReasoning(value: string) {
-  savingReasoning.value = true
-  try {
-    aiSettings.value = await apiRequest<AiSettingsView>('/api/ai/reasoning-effort', {
-      method: 'PUT',
-      body: JSON.stringify({ reasoning_effort: value || null }),
-    })
-    flash(value ? '默认思考强度已更新' : '已改为跟随模型默认值')
-  } catch (error) { flash('设置失败：' + friendly(error)) }
-  finally { savingReasoning.value = false }
+function changeBindingReasoning(scenario: string, value: string, event: Event) {
+  void setBinding(scenario, value, reasoningEffortFromScale(Number((event.target as HTMLInputElement).value), REASONING_EFFORTS))
 }
 </script>
 
@@ -206,42 +219,31 @@ async function setDefaultReasoning(value: string) {
   </div>
 
   <div class="s-group">
-    <h2>默认思考强度</h2>
-    <p class="desc">控制新对话默认投入的推理量。你仍可在每个对话的输入框中临时覆盖此设置。</p>
-    <div class="s-card">
-      <div class="s-row">
-        <p><b>模型思考强度</b><small>强度越高，复杂任务通常更稳，但响应时间和用量也会增加；实际可用级别取决于模型或 CLI。</small></p>
-        <select class="s-select" :disabled="savingReasoning" :value="aiSettings?.reasoning_effort ?? ''" @change="setDefaultReasoning(($event.target as HTMLSelectElement).value)">
-          <option value="">跟随模型默认值</option>
-          <option v-for="effort in REASONING_EFFORTS.filter(item => !aiSettings?.reasoning_effort_values || aiSettings.reasoning_effort_values.includes(item.key))" :key="effort.key" :value="effort.key">{{ effort.label }} · {{ effort.hint }}</option>
-        </select>
-      </div>
-    </div>
-  </div>
-
-  <div class="s-group">
-    <h2>情景模型绑定</h2>
-    <p class="desc">为不同工作情景选择合适的模型；未单独绑定的情景会回退到默认模型。</p>
+    <h2>情景模型与思考强度</h2>
+    <p class="desc">模型和推理量在同一个面板中配置。拖动某个模型后的滑块会同时选择该模型并保存该情景的思考强度。</p>
     <div class="s-card">
       <div class="s-row">
         <p><b>对话默认模型</b><small>所有未单独绑定的情景使用此模型</small></p>
         <span v-if="bindingInvalid('default')" class="stale">绑定已失效</span>
-        <select class="s-select" :value="bindingValue('default')" @change="setBinding('default',($event.target as HTMLSelectElement).value)">
-          <option value="">未设置（回退本地规则回复）</option>
-          <optgroup v-for="provider in enabledProviders" :key="provider.id" :label="provider.name">
-            <option v-for="model in provider.models.filter(m=>m.enabled)" :key="model.id" :value="modelKey(provider.id,model.id)">{{ model.id }}</option>
-          </optgroup>
-        </select>
+        <div class="s-model-binding" @click.stop>
+          <button class="s-model-binding-trigger" :class="{open:bindingMenu==='default'}" @click="toggleBindingMenu('default')"><span><b>{{bindingLabel('default')}}</b><small>思考 {{bindingReasoningLabel('default')}}</small></span><ChevronDown/></button>
+          <div v-if="bindingMenu==='default'" class="s-model-binding-menu">
+            <button class="s-binding-fallback" :class="{picked:!bindingOf('default')}" @click="setBinding('default','')"><span><b>未设置</b><small>回退到本地规则回复</small></span><Check v-if="!bindingOf('default')"/></button>
+            <template v-for="provider in enabledProviders" :key="provider.id"><small class="group">{{provider.name}}</small><div v-for="model in provider.models.filter(m=>m.enabled)" :key="model.id" class="s-binding-option" :class="{picked:sameBindingValue('default',modelKey(provider.id,model.id))}"><button @click="setBinding('default',modelKey(provider.id,model.id))"><code>{{model.id}}</code><Check v-if="sameBindingValue('default',modelKey(provider.id,model.id))"/></button><label title="拖动后选择该模型并保存思考强度" @click.stop><BrainCircuit/><input type="range" min="0" :max="REASONING_EFFORTS.length" step="1" :value="bindingReasoningIndex('default',modelKey(provider.id,model.id))" @change="changeBindingReasoning('default',modelKey(provider.id,model.id),$event)"/><em>{{sameBindingValue('default',modelKey(provider.id,model.id))?bindingReasoningLabel('default'):'自动'}}</em></label></div></template>
+            <small v-if="!enabledProviders.some(provider=>provider.models.some(model=>model.enabled))" class="empty-hint">尚无可用模型，请先启用提供商和模型。</small>
+          </div>
+        </div>
       </div>
       <div v-for="scenario in SCENARIOS" :key="scenario.key" class="s-row">
         <p><b>{{ scenario.label }}</b><small>{{ scenario.hint }}</small></p>
         <span v-if="bindingInvalid(scenario.key)" class="stale">绑定已失效</span>
-        <select class="s-select" :value="bindingValue(scenario.key)" @change="setBinding(scenario.key,($event.target as HTMLSelectElement).value)">
-          <option value="">跟随默认模型</option>
-          <optgroup v-for="provider in enabledProviders" :key="provider.id" :label="provider.name">
-            <option v-for="model in provider.models.filter(m=>m.enabled)" :key="model.id" :value="modelKey(provider.id,model.id)">{{ model.id }}</option>
-          </optgroup>
-        </select>
+        <div class="s-model-binding" @click.stop>
+          <button class="s-model-binding-trigger" :class="{open:bindingMenu===scenario.key}" @click="toggleBindingMenu(scenario.key)"><span><b>{{bindingLabel(scenario.key)}}</b><small>思考 {{bindingReasoningLabel(scenario.key)}}</small></span><ChevronDown/></button>
+          <div v-if="bindingMenu===scenario.key" class="s-model-binding-menu">
+            <button class="s-binding-fallback" :class="{picked:!bindingOf(scenario.key)}" @click="setBinding(scenario.key,'')"><span><b>跟随默认模型</b><small>使用上方默认绑定及其思考强度</small></span><Check v-if="!bindingOf(scenario.key)"/></button>
+            <template v-for="provider in enabledProviders" :key="provider.id"><small class="group">{{provider.name}}</small><div v-for="model in provider.models.filter(m=>m.enabled)" :key="model.id" class="s-binding-option" :class="{picked:sameBindingValue(scenario.key,modelKey(provider.id,model.id))}"><button @click="setBinding(scenario.key,modelKey(provider.id,model.id))"><code>{{model.id}}</code><Check v-if="sameBindingValue(scenario.key,modelKey(provider.id,model.id))"/></button><label title="拖动后选择该模型并保存思考强度" @click.stop><BrainCircuit/><input type="range" min="0" :max="REASONING_EFFORTS.length" step="1" :value="bindingReasoningIndex(scenario.key,modelKey(provider.id,model.id))" @change="changeBindingReasoning(scenario.key,modelKey(provider.id,model.id),$event)"/><em>{{sameBindingValue(scenario.key,modelKey(provider.id,model.id))?bindingReasoningLabel(scenario.key):'自动'}}</em></label></div></template>
+          </div>
+        </div>
       </div>
     </div>
   </div>

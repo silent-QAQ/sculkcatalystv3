@@ -490,7 +490,7 @@ API：
 - GET /api/servers/{id}/file/download?path=...
 - POST /api/servers/{id}/directory
 
-编辑器允许的扩展名包括 properties、YAML、JSON、TOML、INI、CFG、TXT、Markdown、PowerShell、Shell 和日志文件。单文件读写上限约 2 MB；二进制文件不进入文本编辑器。
+编辑器默认信任工作区内的安全路径，支持无扩展名文件、LICENSE、EULA 和项目自定义扩展名，不再用扩展名白名单阻止创建。单文件读写上限约 2 MB；无法按 UTF-8 解码的二进制文件不会进入文本编辑器，但仍可通过下载/上传功能管理。
 
 ### 8.2 路径安全
 

@@ -474,6 +474,9 @@ mod tests {
     #[test]
     fn bundled_server_skill_contains_intelligent_lookup_protocol() {
         assert!(SERVER_SKILL_MD.contains("res.mcmy.love"));
+        assert!(SERVER_SKILL_MD.contains("api.mslmc.cn/v4"));
+        assert!(SERVER_SKILL_MD.contains("api.modrinth.com/v2/search"));
+        assert!(SERVER_SKILL_MD.contains("www.spigotmc.org/resources"));
         assert!(SERVER_SKILL_MD.contains("QQ/NapCat"));
     }
 }

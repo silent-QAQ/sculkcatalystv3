@@ -21,14 +21,14 @@ Linux 版使用 musl 静态链接，不依赖目标主机安装特定版本的 g
 Windows PowerShell（下载版文件名）：
 
 ```powershell
-.\sculk-agent-windows-x86_64.exe pair --cloud "https://sculk.mcmy.love" --code "scp_..." --name "mc-host" --workspace "minecraft" --workspace-root "D:\minecraft" --permissions "full" --capabilities "heartbeat,tasks-v1,task-checkpoints-v1,shell-v1,terminal-v1"
+.\sculk-agent-windows-x86_64.exe pair --cloud "https://sculk.mcmy.love" --code "scp_..." --name "mc-host" --workspace "minecraft" --workspace-root "D:\minecraft" --permissions "full" --capabilities "heartbeat,tasks-v1,task-checkpoints-v1,shell-v1,terminal-v1,mcp-v1"
 ```
 
 Linux：
 
 ```bash
 chmod +x ./sculk-agent-linux-x86_64
-./sculk-agent-linux-x86_64 pair --cloud "https://sculk.mcmy.love" --code "scp_..." --name "mc-host" --workspace "minecraft" --workspace-root "/srv/minecraft" --permissions "full" --capabilities "heartbeat,tasks-v1,task-checkpoints-v1,shell-v1,terminal-v1"
+./sculk-agent-linux-x86_64 pair --cloud "https://sculk.mcmy.love" --code "scp_..." --name "mc-host" --workspace "minecraft" --workspace-root "/srv/minecraft" --permissions "full" --capabilities "heartbeat,tasks-v1,task-checkpoints-v1,shell-v1,terminal-v1,mcp-v1"
 ```
 
 4. 对照 Agent 终端和 Cloud 控制台显示的指纹。

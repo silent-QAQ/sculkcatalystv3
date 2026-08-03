@@ -1654,6 +1654,27 @@ pub(crate) fn resolve_core_download(
         .cloned()
 }
 
+pub(crate) fn recommended_minecraft_version(
+    catalog: &CatalogState,
+    project: &str,
+) -> Option<String> {
+    let project = catalog
+        .core_projects
+        .iter()
+        .find(|item| {
+            item.slug.eq_ignore_ascii_case(project) || item.name.eq_ignore_ascii_case(project)
+        })?
+        .slug
+        .as_str();
+    latest_published(catalog.core_versions.iter().filter(|version| {
+        version.project.eq_ignore_ascii_case(project)
+            && version.channel.eq_ignore_ascii_case("stable")
+            && validate_version(CatalogKind::Core, version).is_ok()
+    }))
+    .and_then(|version| version.minecraft_versions.first())
+    .cloned()
+}
+
 pub(crate) fn record_core_download(
     catalog: &mut CatalogState,
     version_id: &str,
@@ -3003,6 +3024,21 @@ mod tests {
         let resolved = resolve_version(&versions, "paper", Some("1.21.4"), "stable").unwrap();
         assert_eq!(resolved.version, "1.1.0");
         assert_ne!(resolved.status, "draft");
+    }
+
+    #[test]
+    fn recommends_the_latest_valid_stable_minecraft_version() {
+        let mut catalog = seed_catalog();
+        catalog.core_versions = vec![
+            published_version("paper", "1.0.0", "1.21.4", "2026-01-01T00:00:00Z"),
+            published_version("paper", "1.1.0", "26.2", "2026-02-01T00:00:00Z"),
+        ];
+
+        assert_eq!(
+            recommended_minecraft_version(&catalog, "Paper"),
+            Some("26.2".into())
+        );
+        assert_eq!(recommended_minecraft_version(&catalog, "unknown"), None);
     }
 
     #[test]

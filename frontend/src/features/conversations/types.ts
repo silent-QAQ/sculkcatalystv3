@@ -7,6 +7,7 @@ export interface ConversationMessage {
   time: string
   actions?: string[]
   task_id?: string
+  task_status?: string
 }
 
 export interface ConversationSummary {

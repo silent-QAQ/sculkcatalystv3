@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod executor;
+mod mcp;
 mod terminal;
 
-use executor::{ExecutionContext, ExecutionResult, TaskArtifact, execute};
+use executor::{
+    ExecutionContext, ExecutionResult, TaskArtifact, execute, workspace_manifest_identity,
+};
 use rand::{RngCore, rngs::OsRng};
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
@@ -62,6 +65,8 @@ struct AgentConfig {
     permissions: Vec<String>,
     #[serde(default)]
     workspace_root: Option<PathBuf>,
+    #[serde(default)]
+    mcp_servers: Vec<mcp::McpServerConfig>,
 }
 
 /// A short-lived configuration distributed with a newly downloaded Agent.
@@ -547,6 +552,7 @@ async fn pair(options: HashMap<String, String>) -> Result<(), String> {
         capabilities,
         permissions,
         workspace_root,
+        mcp_servers: Vec::new(),
     };
     write_config(&path, &config)?;
     println!(
@@ -602,6 +608,7 @@ fn validate_bootstrap_config(config: BootstrapConfig) -> Result<BootstrapConfig,
                 "task-checkpoints-v1".into(),
                 "shell-v1".into(),
                 "terminal-v1".into(),
+                "mcp-v1".into(),
             ]
         } else {
             vec!["heartbeat".into()]
@@ -679,6 +686,7 @@ async fn claim_bootstrap(bootstrap: BootstrapConfig) -> Result<AgentConfig, Stri
         capabilities: bootstrap.capabilities,
         permissions: bootstrap.permissions,
         workspace_root: bootstrap.workspace_root,
+        mcp_servers: Vec::new(),
     })
 }
 
@@ -779,6 +787,19 @@ async fn run_agent(options: HashMap<String, String>) -> Result<(), String> {
         }
     };
     config.cloud_url = normalize_cloud_url(&config.cloud_url)?;
+    if let Some(root) = config.workspace_root.as_deref() {
+        match workspace_manifest_identity(root) {
+            Ok(Some(identity)) => {
+                println!(
+                    "已读取 sculk.yml：{}（{}），状态 {}，计划 {}。实时进程将在任务执行时重新验证。",
+                    identity.name, identity.id, identity.status, identity.plan_status
+                );
+                config.workspace_label = identity.name;
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("Sculk Agent: 忽略无效的 sculk.yml：{error}"),
+        }
+    }
     let client = Client::builder()
         .timeout(Duration::from_secs(15))
         .pool_max_idle_per_host(1)
@@ -1100,6 +1121,24 @@ async fn execute_leased_operation(
             return failed_result("该 Agent 未由主机安装者启用 Full Shell");
         }
         return execute_shell(client, config, task).await;
+    }
+    if matches!(
+        task.operation.as_str(),
+        "platform.mcp.read" | "platform.mcp.reply"
+    ) {
+        if !config.capabilities.iter().any(|item| item == "mcp-v1") {
+            return failed_result("Agent 未启用 mcp-v1 能力");
+        }
+        return match mcp::call_tool(&config.mcp_servers, &task.operation, &task.input).await {
+            Ok(output) => CachedTaskResult {
+                status: "succeeded".into(),
+                output,
+                error: String::new(),
+                rollback_available: false,
+                artifacts: vec![],
+            },
+            Err(error) => failed_result(&error),
+        };
     }
     let Some(workspace_root) = config.workspace_root.as_deref() else {
         return failed_result("Agent 没有配置任务工作区");
@@ -2076,6 +2115,7 @@ mod tests {
                 capabilities: vec!["heartbeat".into()],
                 permissions: vec!["read".into()],
                 workspace_root: None,
+                mcp_servers: Vec::new(),
             },
         )
         .unwrap();

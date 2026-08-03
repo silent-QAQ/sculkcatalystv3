@@ -12,6 +12,7 @@ use std::{
 
 const MAX_FILE_BYTES: u64 = 1_048_576;
 const MAX_OUTPUT_BYTES: usize = 262_144;
+const MAX_SCULK_MANIFEST_BYTES: u64 = 64 * 1024;
 const ALLOWED_PROPERTIES: [&str; 8] = [
     "motd",
     "max-players",
@@ -47,6 +48,14 @@ pub struct ExecutionContext<'a> {
     pub state_dir: &'a Path,
     pub workspace_label: &'a str,
     pub permissions: &'a [String],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkspaceManifestIdentity {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub plan_status: String,
 }
 
 #[derive(Deserialize)]
@@ -240,6 +249,7 @@ fn host_inspect(context: &ExecutionContext<'_>, root: &Path) -> Result<Execution
     let entries = fs::read_dir(root)
         .map_err(|error| format!("无法读取 Agent 工作区：{error}"))?
         .count();
+    let manifest = read_workspace_manifest(root)?;
     Ok(ExecutionResult {
         output: json!({
             "os": std::env::consts::OS,
@@ -248,10 +258,67 @@ fn host_inspect(context: &ExecutionContext<'_>, root: &Path) -> Result<Execution
             "workspace_label": context.workspace_label,
             "workspace_entries": entries,
             "permissions": context.permissions,
+            "server_status_source": if manifest.is_some() { "sculk.yml" } else { "filesystem" },
+            "sculk_manifest": manifest,
         }),
         rollback_available: false,
         artifacts: vec![],
     })
+}
+
+fn read_workspace_manifest(root: &Path) -> Result<Option<Value>, String> {
+    let path = root.join("sculk.yml");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("无法检查 sculk.yml：{error}")),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("sculk.yml 必须是普通文件，不能是符号链接".into());
+    }
+    if metadata.len() > MAX_SCULK_MANIFEST_BYTES {
+        return Err("sculk.yml 超过 64 KiB 限制".into());
+    }
+    let text = fs::read_to_string(&path).map_err(|error| format!("无法读取 sculk.yml：{error}"))?;
+    let value: Value =
+        serde_yaml::from_str(&text).map_err(|error| format!("sculk.yml 无效：{error}"))?;
+    if value.get("schema_version").and_then(Value::as_u64) != Some(1) {
+        return Err("sculk.yml schema_version 不受支持".into());
+    }
+    for (pointer, label) in [
+        ("/server/id", "服务器编号"),
+        ("/server/name", "服务器名"),
+        ("/server/status", "服务器状态"),
+        ("/plan/status", "服务器计划状态"),
+    ] {
+        if value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(format!("sculk.yml 缺少{label}"));
+        }
+    }
+    Ok(Some(value))
+}
+
+/// Agent 启动时优先读取工作区身份；实时进程状态仍需由具体任务重新验证。
+pub fn workspace_manifest_identity(
+    root: &Path,
+) -> Result<Option<WorkspaceManifestIdentity>, String> {
+    let canonical = canonical_workspace(root)?;
+    let Some(value) = read_workspace_manifest(&canonical)? else {
+        return Ok(None);
+    };
+    Ok(Some(WorkspaceManifestIdentity {
+        id: value["server"]["id"].as_str().unwrap_or_default().into(),
+        name: value["server"]["name"].as_str().unwrap_or_default().into(),
+        status: value["server"]["status"]
+            .as_str()
+            .unwrap_or_default()
+            .into(),
+        plan_status: value["plan"]["status"].as_str().unwrap_or_default().into(),
+    }))
 }
 
 fn workspace_list(root: &Path, input: Value) -> Result<ExecutionResult, String> {
@@ -899,6 +966,36 @@ Authorization: Bearer bearer-secret secret='hidden value'"#,
         assert!(!json.contains("json-secret"));
         assert!(!json.contains("json-key"));
         assert_eq!(json.matches("[REDACTED]").count(), 2);
+    }
+
+    #[test]
+    fn workspace_identity_prefers_a_valid_sculk_manifest() {
+        let root = test_root();
+        fs::write(
+            root.join("sculk.yml"),
+            "schema_version: 1\nserver:\n  id: server-12345678\n  name: 深暗生存服\n  status: stopped\nplan:\n  status: completed\n",
+        )
+        .unwrap();
+
+        let identity = workspace_manifest_identity(&root).unwrap().unwrap();
+        assert_eq!(identity.id, "server-12345678");
+        assert_eq!(identity.name, "深暗生存服");
+        assert_eq!(identity.status, "stopped");
+        assert_eq!(identity.plan_status, "completed");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_identity_rejects_an_unknown_manifest_schema() {
+        let root = test_root();
+        fs::write(
+            root.join("sculk.yml"),
+            "schema_version: 2\nserver:\n  id: server-12345678\n  name: test\n  status: stopped\nplan:\n  status: completed\n",
+        )
+        .unwrap();
+
+        assert!(workspace_manifest_identity(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

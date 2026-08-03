@@ -4,7 +4,8 @@
 .files-view > aside > header > button:hover { color:#d4dbe2; background:rgba(255,255,255,.05); }
 .files-view > aside > button > span { overflow:hidden; flex:1; text-align:left; text-overflow:ellipsis; white-space:nowrap; }
 .files-view > aside > button > small { margin-left:auto; color:#505c68; font-size:7px; }
-.new-folder { display:flex; gap:4px; margin:0 0 8px; padding:0 3px; }
-.new-folder input { min-width:0; height:27px; flex:1; padding:0 7px; border:1px solid rgba(50,213,176,.18); border-radius:5px; outline:0; color:#cbd2da; background:#0c1116; font-size:8px; }
-.new-folder button { height:27px; padding:0 7px; border:0; border-radius:5px; color:#08241e; background:#32d5b0; font-size:7px; }
+.new-entry-form { display:flex; width:100%; margin:0 0 8px; padding:0 3px; }
+.new-entry-form input { box-sizing:border-box; width:100%; min-width:0; height:36px; padding:0 10px; border:1px solid rgba(50,213,176,.42); border-radius:6px; outline:0; color:#e4edf0; background:#0c1116; font:11px 'Cascadia Code',Consolas,monospace; box-shadow:0 0 0 2px rgba(50,213,176,.06); }
+.new-entry-form input::placeholder { color:#64737e; font:10px 'Segoe UI',Microsoft YaHei,sans-serif; }
+.new-entry-form input:focus { border-color:rgba(50,213,176,.78); box-shadow:0 0 0 3px rgba(50,213,176,.12); }
 .config-editor[readonly] { color:#74808c; cursor:not-allowed; }

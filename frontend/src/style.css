@@ -43,3 +43,84 @@
 .bg-rich .metrics>div{background:linear-gradient(135deg,rgba(18,25,33,.62),rgba(8,13,19,.42))}
 .logo{background:linear-gradient(145deg,color-mix(in srgb,var(--accent) 70%,white),color-mix(in srgb,var(--accent) 78%,black))}
 .portable-template-import{display:flex;align-items:center;gap:11px;padding:12px 13px;border:1px solid rgba(156,140,255,.15);border-radius:9px;background:rgba(156,140,255,.045)}.portable-template-import>svg{width:19px;color:#aa9cff}.portable-template-import p{display:flex;min-width:0;flex:1;flex-direction:column;margin:0}.portable-template-import b{font-size:9px}.portable-template-import small{margin-top:4px;color:#687582;font-size:8px}.portable-template-import button{height:29px;padding:0 10px;border:1px solid rgba(156,140,255,.2);border-radius:6px;color:#bbb2ff;background:rgba(156,140,255,.08);font-size:8px}.portable-template-import input{display:none}
+
+/* Runtime background and acrylic surface system. The image layer itself is never blurred. */
+:root{--card-blur:18px;--glass-surface:rgba(17,25,34,.34);--glass-surface-strong:rgba(17,25,34,.46);--glass-border:rgba(255,255,255,.14)}
+.app{position:relative;isolation:isolate;background:var(--app-bg,var(--bg))}
+.app::before{position:fixed;inset:-20%;z-index:0;content:'';pointer-events:none;background-image:linear-gradient(var(--app-bg-image-overlay,rgba(8,10,14,0)),var(--app-bg-image-overlay,rgba(8,10,14,0))),var(--app-bg-image,none);background-position:center,var(--app-bg-image-position,50% 50%);background-size:cover,cover;background-repeat:no-repeat;transform:scale(var(--app-bg-image-scale,1));transform-origin:var(--app-bg-image-position,50% 50%);opacity:0;transition:transform .18s ease,opacity .18s ease}
+html[data-background-mode='image'] .app{background:var(--app-bg-color,var(--bg))}
+html[data-background-mode='image'] .app::before{opacity:1}
+.app>*{z-index:1}.app>.sidebar,.app>.chat-panel,.app>.work-panel{position:relative}
+
+/* All workspace surfaces use translucent acrylic instead of opaque black cards. */
+.app .sidebar,.app .chat-panel,.app .work-panel,.app .chat-panel>header,.app .work-header,.app .compose-wrap,.app .settings-nav,.app .card,.app .server-hero,.app .metrics>div,.app .workflow,.app .activity,.app .mission,.app .composer,.app .files-view>aside,.app .files-view>section,.app .terminal-view,.app .bootstrap-card,.app .workspace-state,.app .surface-state,.app .s-card,.app .s-pick-card,.app .s-modal,.app .mirror-center,.app .catalog-rail,.app .catalog-detail,.app .version-table-wrap,.app .endpoint{border-color:var(--glass-border);background:var(--glass-surface)!important;box-shadow:inset 0 1px rgba(255,255,255,.08),0 18px 46px rgba(0,0,0,.16);-webkit-backdrop-filter:blur(var(--card-blur)) saturate(145%);backdrop-filter:blur(var(--card-blur)) saturate(145%)}
+.app .sidebar,.app .chat-panel,.app .work-panel,.app .chat-panel>header,.app .work-header,.app .compose-wrap,.app .settings-nav,.app .files-view>aside,.app .files-view>section,.app .terminal-view,.app .mirror-center,.app .catalog-rail,.app .catalog-detail{-webkit-backdrop-filter:none!important;backdrop-filter:none!important}
+
+/* 菜单字体独立于正文与编辑器；交互态继续使用原有语义颜色。 */
+.app .sidebar nav,.app .settings,.app .create,.app .work-header nav,.app .files-view>aside{font-family:var(--menu-font-family,inherit)}
+.app .sidebar nav i{font-family:var(--menu-font-family,inherit)}
+.app .sidebar nav button,.app .settings{color:var(--menu-font-color,#929ca9)}
+.app .sidebar nav button:hover,.app .sidebar nav button.active,.app .settings:hover{color:#eef2f6}
+.app .work-header nav button{color:var(--menu-font-color,#6f7a88)}
+.app .work-header nav button.active{color:#e7ecf1}
+.app .files-view>aside button{color:var(--menu-font-color,#7d8997)}
+.app .files-view>aside button:hover,.app .files-view>aside button.active{color:#cfd5dc}
+
+/* 可调工作台分隔：分隔柄属于对话栏，避免影响设置和资源中心的双栏布局。 */
+#app .app.resizable-layout:not(.mirror-mode){grid-template-columns:244px minmax(0,var(--chat-panel-width)) minmax(0,1fr)}#app .app.collapsed.resizable-layout:not(.mirror-mode){grid-template-columns:68px minmax(0,var(--chat-panel-width)) minmax(0,1fr)}.chat-panel{position:relative}.workspace-resizer{position:absolute;z-index:20;top:0;right:-7px;bottom:0;width:14px;padding:0;border:0;outline:0;background:transparent;cursor:col-resize;touch-action:none}.workspace-resizer:before{position:absolute;top:0;bottom:0;left:6px;width:2px;content:'';border-radius:2px;background:rgba(50,213,176,.78);box-shadow:0 0 12px rgba(50,213,176,.36);opacity:0;transition:opacity .14s ease}.workspace-resizer:hover:before,.workspace-resizer:focus-visible:before,.workspace-resizer.dragging:before{opacity:1}.workspace-resizer:focus-visible{box-shadow:inset 0 0 0 1px rgba(50,213,176,.42)}body.workspace-resize-active,body.workspace-resize-active *{cursor:col-resize!important;user-select:none}@media(max-width:1180px){#app .app.resizable-layout:not(.mirror-mode),#app .app.collapsed.resizable-layout:not(.mirror-mode){grid-template-columns:68px minmax(0,var(--chat-panel-width)) minmax(0,1fr)}}@media(max-width:900px){#app .app.resizable-layout:not(.mirror-mode),#app .app.collapsed.resizable-layout:not(.mirror-mode){grid-template-columns:58px minmax(0,1fr);grid-template-rows:minmax(650px,100%) minmax(650px,auto);height:auto}.workspace-resizer{display:none}}
+
+/* 文件编辑是高频动作：编辑器靠近工作区左侧，目录置于右侧。 */
+#app .files-view{grid-template-columns:minmax(0,1fr) 190px;grid-template-areas:'editor tree'}#app .files-view>aside{grid-area:tree;min-height:0;overflow-y:auto;border-right:0;border-left:1px solid var(--line)}#app .files-view>section{grid-area:editor;min-height:0}#app .files-view>section>header{border-right:0}@media(max-width:560px){#app .files-view{grid-template-columns:minmax(0,1fr) 144px}}
+
+/*
+ * Viewport-safe appearance scaling.
+ *
+ * The previous implementation zoomed <html>, while the shell itself still
+ * used 100% height. At scales above 100% that made the rendered bottom live
+ * outside the scrollable layout. Give #app the inverse logical size first,
+ * then scale it to exactly fill the physical viewport.
+ */
+:root{--ui-scale:1;--ui-scale-inverse:100%}
+html,body{width:100%;height:100%;margin:0;overflow:hidden}
+#app{position:fixed;top:0;left:0;width:var(--ui-scale-inverse);height:var(--ui-scale-inverse);overflow:hidden;transform:scale(var(--ui-scale));transform-origin:top left}
+#app .app{grid-template-columns:244px minmax(0,1fr) minmax(0,1.28fr);width:100%;height:100%;min-height:0}
+#app .app.collapsed{grid-template-columns:68px minmax(0,1fr) minmax(0,1.28fr)}
+#app .app.mirror-mode{grid-template-columns:244px minmax(0,1fr)}
+#app .app.mirror-mode.collapsed{grid-template-columns:68px minmax(0,1fr)}
+#app .app.mirror-mode .mirror-work{grid-column:2;min-width:0;min-height:0}
+#app .chat-scroll,#app .work-scroll{min-height:0;overflow-y:auto;overscroll-behavior:contain}
+
+/* Dialog headers and actions stay visible; only their content areas scroll. */
+#app .create-modal{width:min(650px,calc(100% - 48px));max-height:calc(100% - 40px);display:flex;flex-direction:column}
+#app .create-modal>header,#app .create-modal>footer,#app .create-modal>.wizard-steps{flex:0 0 auto}
+#app .create-modal>.wizard-page{min-height:0;overflow-y:auto;overscroll-behavior:contain}
+#app .action-modal{width:min(440px,calc(100% - 40px));max-height:calc(100% - 40px);display:flex;flex-direction:column}
+#app .action-modal>header,#app .action-modal>footer{flex:0 0 auto}
+#app .action-modal>main{min-height:0;overflow-y:auto;overscroll-behavior:contain}
+#app .s-modal{width:min(460px,calc(100% - 32px));max-height:calc(100% - 32px);overscroll-behavior:contain}
+#app .mirror-modal{width:min(700px,calc(100% - 48px));max-height:calc(100% - 56px)}
+#app .mirror-modal.version-modal{width:min(760px,calc(100% - 48px))}
+#app .mirror-confirm{width:min(400px,calc(100% - 48px));max-height:calc(100% - 48px);overflow-y:auto;overscroll-behavior:contain}
+#app .resource-admin .mirror-modal{width:min(820px,calc(100% - 48px))}
+
+@media(max-width:1180px){
+  #app .app{grid-template-columns:68px minmax(0,.88fr) minmax(0,1.12fr)}
+  #app .app.mirror-mode,#app .app.mirror-mode.collapsed{grid-template-columns:68px minmax(0,1fr)}
+}
+@media(max-width:900px){
+  #app{overflow:auto}
+  #app .app,#app .app.collapsed{grid-template-columns:58px minmax(0,1fr);grid-template-rows:minmax(650px,100%) minmax(650px,auto);height:auto;min-height:100%}
+  #app .work-panel{min-height:0}
+  #app .app.mirror-mode,#app .app.mirror-mode.collapsed{grid-template-columns:58px minmax(0,1fr);grid-template-rows:minmax(0,100%);height:100%;min-height:0}
+  #app .app.mirror-mode .sidebar{grid-row:1}
+  #app .app.mirror-mode .mirror-work{grid-column:2;min-height:0;border-top:0}
+}
+.cloud-app .cloud-panel,.cloud-app [class*='-panel'],.cloud-app [class*='-card'],.cloud-app [class*='-hero']{border-color:var(--glass-border)!important;background:var(--glass-surface-strong)!important;-webkit-backdrop-filter:blur(var(--card-blur)) saturate(145%);backdrop-filter:blur(var(--card-blur)) saturate(145%);box-shadow:inset 0 1px rgba(255,255,255,.08),0 18px 46px rgba(0,0,0,.16)}
+.app .creation-mode article,.app .inline-task,.app .chat-queue,.app .chat-queue article,.app .composer-assist,.app .task-details,.app .result-grid p,.app .artifact-list>a,.app .connection-grid>article,.app .economy-grid>article,.app .stats article,.app .quick-grid button,.app .poll-card>article>button{border-color:var(--glass-border)!important;background:var(--glass-surface-strong)!important;-webkit-backdrop-filter:blur(var(--card-blur)) saturate(145%);backdrop-filter:blur(var(--card-blur)) saturate(145%)}
+.app .sidebar,.app .chat-panel,.app .work-panel,.app .mirror-center{background:rgba(8,14,20,.28)!important}
+.app .files-view>section,.app .terminal-view{background:rgba(7,12,18,.3)!important}
+.app .workflow,.app .activity,.app .card,.app .server-hero,.app .mission,.app .s-card,.app .s-pick-card,.app .version-table-wrap,.app .endpoint{background:var(--glass-surface-strong)!important}
+.app .s-modal-backdrop,.app .modal-backdrop{background:rgba(2,5,8,.48)}
+.app .bg-rich .workflow,.app .bg-rich .activity,.app .bg-rich .composer,.app .bg-rich .mission.empty-mission,.app .bg-rich .server-hero,.app .bg-rich .metrics>div{-webkit-backdrop-filter:blur(var(--card-blur)) saturate(145%);backdrop-filter:blur(var(--card-blur)) saturate(145%)}
+.app [class*='-card'],.app [class*='-hero'],.app [class*='-section'],.app [class*='-workspace'],.app [class*='-modal'],.app [class*='-menu']{border-color:var(--glass-border)!important;background:var(--glass-surface-strong)!important;-webkit-backdrop-filter:blur(var(--card-blur)) saturate(145%);backdrop-filter:blur(var(--card-blur)) saturate(145%)}
+.app .sidebar,.app .chat-panel,.app .work-panel,.app .chat-panel>header,.app .work-header,.app .compose-wrap,.app .settings-nav,.app .files-view>aside,.app .files-view>section,.app .terminal-view,.app .mirror-center,.app .catalog-rail,.app .catalog-detail{-webkit-backdrop-filter:none!important;backdrop-filter:none!important}

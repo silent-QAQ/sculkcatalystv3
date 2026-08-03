@@ -14,6 +14,8 @@ type ApiResult<T> = Result<Json<T>, ApiError>;
 
 const LANGUAGES: [&str; 3] = ["auto", "zh-CN", "en-US"];
 const BACKGROUND_MODES: [&str; 3] = ["solid", "gradient", "image"];
+const FONT_FAMILIES: [&str; 4] = ["default", "system", "serif", "mono"];
+const MENU_FONT_FAMILIES: [&str; 5] = ["inherit", "default", "system", "serif", "mono"];
 const PROTOCOLS: [&str; 2] = ["ssh", "sftp"];
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -26,23 +28,41 @@ pub(crate) struct BackgroundSettings {
     pub(crate) image_url: String,
     /// 背景图之上遮罩的不透明度（0-95），值越大界面越沉、图片越淡。
     pub(crate) image_opacity: u8,
+    /// 鑳屾櫙鍥剧墖鐨勪腑蹇冧綅缃笌缂╂斁锛屽潎涓?0-100 鐧惧垎姣斻€?    #[serde(default = "default_image_position")]
+    #[serde(default = "default_image_position")]
+    pub(crate) image_position_x: u8,
+    #[serde(default = "default_image_position")]
+    pub(crate) image_position_y: u8,
+    #[serde(default = "default_image_scale")]
+    pub(crate) image_scale: u8,
 }
 
 impl Default for BackgroundSettings {
     fn default() -> Self {
         Self {
-            mode: "solid".into(),
-            solid: "#0b0e12".into(),
+            mode: "gradient".into(),
+            solid: "#e4c8e1".into(),
             gradient: "mesh".into(),
             gradient_colors: default_gradient_colors(),
             image_url: String::new(),
             image_opacity: 72,
+            image_position_x: default_image_position(),
+            image_position_y: default_image_position(),
+            image_scale: default_image_scale(),
         }
     }
 }
 
 fn default_gradient_colors() -> Vec<String> {
-    vec!["#071a17".into(), "#0b0e12".into(), "#21183d".into()]
+    vec!["#f9a9d0".into(), "#a8e5ff".into(), "#5cb3ff".into()]
+}
+
+fn default_image_position() -> u8 {
+    50
+}
+
+fn default_image_scale() -> u8 {
+    100
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -58,14 +78,28 @@ pub(crate) struct AppearanceSettings {
     #[serde(default = "default_font_size")]
     pub(crate) font_size: u16,
     pub(crate) font_color: String,
+    #[serde(default = "default_menu_font_family")]
+    pub(crate) menu_font_family: String,
+    #[serde(default)]
+    pub(crate) menu_font_color: String,
+    #[serde(default = "default_card_blur")]
+    pub(crate) card_blur: u8,
 }
 
 fn default_accent() -> String {
-    "#32d5b0".into()
+    "#5cb3ff".into()
 }
 
 fn default_font_size() -> u16 {
-    100
+    130
+}
+
+fn default_menu_font_family() -> String {
+    "inherit".into()
+}
+
+fn default_card_blur() -> u8 {
+    6
 }
 
 impl Default for AppearanceSettings {
@@ -76,7 +110,10 @@ impl Default for AppearanceSettings {
             background: BackgroundSettings::default(),
             font_family: "default".into(),
             font_size: default_font_size(),
-            font_color: "#e9edf2".into(),
+            font_color: "#85baff".into(),
+            menu_font_family: default_menu_font_family(),
+            menu_font_color: String::new(),
+            card_blur: default_card_blur(),
         }
     }
 }
@@ -260,6 +297,19 @@ fn validate_appearance(appearance: &AppearanceSettings) -> Result<(), ApiError> 
             "image_opacity 取值范围 0-95".into(),
         ));
     }
+    if appearance.background.image_position_x > 100 || appearance.background.image_position_y > 100
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "image_position_x/image_position_y 取值范围 0-100".into(),
+        ));
+    }
+    if !(75..=200).contains(&appearance.background.image_scale) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "image_scale 取值范围 75-200".into(),
+        ));
+    }
     if !(2..=5).contains(&appearance.background.gradient_colors.len()) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -269,7 +319,27 @@ fn validate_appearance(appearance: &AppearanceSettings) -> Result<(), ApiError> 
     if !(70..=150).contains(&appearance.font_size) {
         return Err((StatusCode::BAD_REQUEST, "font_size 取值范围 70-150".into()));
     }
+    if !FONT_FAMILIES.contains(&appearance.font_family.as_str()) {
+        return Err((StatusCode::BAD_REQUEST, "invalid font_family".into()));
+    }
+    if !MENU_FONT_FAMILIES.contains(&appearance.menu_font_family.as_str()) {
+        return Err((StatusCode::BAD_REQUEST, "invalid menu_font_family".into()));
+    }
+    if !appearance.menu_font_color.is_empty() && !is_hex_color(&appearance.menu_font_color) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "menu_font_color 需要使用 #RRGGBB 格式".into(),
+        ));
+    }
+    if appearance.card_blur > 40 {
+        return Err((StatusCode::BAD_REQUEST, "card_blur 取值范围 0-40".into()));
+    }
     Ok(())
+}
+
+fn is_hex_color(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 7 && bytes[0] == b'#' && bytes[1..].iter().all(u8::is_ascii_hexdigit)
 }
 
 async fn get_settings(State(state): State<AppState>) -> Json<UiSettings> {
@@ -432,4 +502,62 @@ async fn test_connection(
         },
     };
     Ok(Json(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_default_appearance_matches_the_star_blue_theme() {
+        let appearance = AppearanceSettings::default();
+        assert_eq!(appearance.preset, "sculk");
+        assert_eq!(appearance.accent, "#5cb3ff");
+        assert_eq!(appearance.background.mode, "gradient");
+        assert_eq!(appearance.background.gradient, "mesh");
+        assert_eq!(
+            appearance.background.gradient_colors,
+            ["#f9a9d0", "#a8e5ff", "#5cb3ff"]
+        );
+        assert!(appearance.background.image_url.is_empty());
+        assert_eq!(appearance.font_family, "default");
+        assert_eq!(appearance.font_size, 130);
+        assert_eq!(appearance.font_color, "#85baff");
+        assert_eq!(appearance.menu_font_family, "inherit");
+        assert!(appearance.menu_font_color.is_empty());
+        assert_eq!(appearance.card_blur, 6);
+    }
+
+    #[test]
+    fn legacy_appearance_defaults_menu_typography_without_losing_other_values() {
+        let value = serde_json::json!({
+            "preset": "custom",
+            "accent": "#5cb3ff",
+            "background": BackgroundSettings::default(),
+            "font_family": "serif",
+            "font_size": 120,
+            "font_color": "#abcdef",
+            "card_blur": 8
+        });
+        let appearance: AppearanceSettings = serde_json::from_value(value).unwrap();
+
+        assert_eq!(appearance.font_family, "serif");
+        assert_eq!(appearance.font_size, 120);
+        assert_eq!(appearance.menu_font_family, "inherit");
+        assert!(appearance.menu_font_color.is_empty());
+    }
+
+    #[test]
+    fn menu_typography_rejects_unknown_font_and_invalid_color() {
+        let mut appearance = AppearanceSettings::default();
+        appearance.menu_font_family = "unknown".into();
+        assert!(validate_appearance(&appearance).is_err());
+
+        appearance.menu_font_family = "mono".into();
+        appearance.menu_font_color = "red".into();
+        assert!(validate_appearance(&appearance).is_err());
+
+        appearance.menu_font_color = "#a1B2c3".into();
+        assert!(validate_appearance(&appearance).is_ok());
+    }
 }

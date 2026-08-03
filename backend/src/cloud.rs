@@ -241,12 +241,13 @@ const AGENT_ONLINE_SECONDS: i64 = 90;
 const AGENT_MAX_CAPABILITIES: usize = 32;
 const AGENT_MAX_PERMISSIONS: usize = 4;
 const AGENT_PERMISSIONS: [&str; 4] = ["read", "write", "process", "full"];
-const AGENT_BOOTSTRAP_CAPABILITIES: [&str; 5] = [
+const AGENT_BOOTSTRAP_CAPABILITIES: [&str; 6] = [
     "heartbeat",
     "tasks-v1",
     "shell-v1",
     "terminal-v1",
     "task-checkpoints-v1",
+    "mcp-v1",
 ];
 const AGENT_BOOTSTRAP_PERMISSIONS: [&str; 4] = ["read", "write", "process", "full"];
 const AGENT_TASK_INPUT_BYTES: usize = 256 * 1024;
@@ -1364,6 +1365,18 @@ fn agent_task_operation(value: &str, allow_rollback: bool) -> CloudResult<AgentT
             approval_required: true,
             additional_capability: Some("shell-v1"),
         },
+        "platform.mcp.read" => AgentTaskOperation {
+            permission: "read",
+            risk: "low",
+            approval_required: false,
+            additional_capability: Some("mcp-v1"),
+        },
+        "platform.mcp.reply" => AgentTaskOperation {
+            permission: "write",
+            risk: "high",
+            approval_required: true,
+            additional_capability: Some("mcp-v1"),
+        },
         "task.rollback" if allow_rollback => AgentTaskOperation {
             permission: "write",
             risk: "high",
@@ -1555,6 +1568,94 @@ fn validate_server_properties_changes(value: &Value) -> CloudResult<()> {
     Ok(())
 }
 
+fn validate_platform_mcp_input(
+    object: &serde_json::Map<String, Value>,
+    reply_operation: bool,
+) -> CloudResult<()> {
+    require_exact_task_keys(object, &["server", "tool", "arguments"], &[])?;
+    let server = object["server"]
+        .as_str()
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .ok_or_else(|| CloudError::bad_request("MCP server must be a non-empty short string"))?;
+    if !server
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+    {
+        return Err(CloudError::bad_request(
+            "MCP server contains invalid characters",
+        ));
+    }
+    let tool = object["tool"]
+        .as_str()
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .ok_or_else(|| CloudError::bad_request("MCP tool must be a non-empty short string"))?;
+    let allowed = if reply_operation {
+        ["reply_comment"].as_slice()
+    } else {
+        ["platform_status", "list_comments"].as_slice()
+    };
+    if !allowed.contains(&tool) {
+        return Err(CloudError::bad_request(
+            "MCP tool is not allowed for this task operation",
+        ));
+    }
+    let arguments = object["arguments"]
+        .as_object()
+        .ok_or_else(|| CloudError::bad_request("MCP arguments must be a JSON object"))?;
+    match tool {
+        "platform_status" => {
+            if !arguments.is_empty() {
+                return Err(CloudError::bad_request(
+                    "platform_status does not accept arguments",
+                ));
+            }
+        }
+        "list_comments" => {
+            require_exact_task_keys(arguments, &["video_id"], &["cursor", "limit"])?;
+            let video_id = arguments["video_id"]
+                .as_str()
+                .filter(|value| !value.is_empty() && value.len() <= 256)
+                .ok_or_else(|| CloudError::bad_request("video_id must be a non-empty string"))?;
+            let _ = video_id;
+            if let Some(cursor) = arguments.get("cursor")
+                && (cursor
+                    .as_str()
+                    .is_none_or(|value| value.len() > 256 || value.chars().any(char::is_control)))
+            {
+                return Err(CloudError::bad_request("cursor is invalid"));
+            }
+            if arguments.contains_key("limit") {
+                bounded_task_integer(arguments, "limit", 1, 100)?;
+            }
+        }
+        "reply_comment" => {
+            require_exact_task_keys(
+                arguments,
+                &["video_id", "comment_id", "content"],
+                &["dry_run"],
+            )?;
+            for key in ["video_id", "comment_id", "content"] {
+                let value = arguments[key]
+                    .as_str()
+                    .filter(|value| {
+                        !value.is_empty()
+                            && value.len() <= if key == "content" { 500 } else { 256 }
+                            && !value.chars().any(char::is_control)
+                    })
+                    .ok_or_else(|| CloudError::bad_request(format!("{key} is invalid")))?;
+                let _ = value;
+            }
+            if let Some(dry_run) = arguments.get("dry_run")
+                && !dry_run.is_boolean()
+            {
+                return Err(CloudError::bad_request("dry_run must be a boolean"));
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
 fn validate_agent_task_input(
     operation: &str,
     input: &Value,
@@ -1617,6 +1718,9 @@ fn validate_agent_task_input(
             if object.contains_key("timeout_seconds") {
                 bounded_task_integer(object, "timeout_seconds", 1, 1800)?;
             }
+        }
+        "platform.mcp.read" | "platform.mcp.reply" => {
+            validate_platform_mcp_input(object, operation == "platform.mcp.reply")?;
         }
         "task.rollback" => {
             require_exact_task_keys(object, &["source_task_id"], &[])?;
@@ -8675,7 +8779,8 @@ mod tests {
                 "tasks-v1",
                 "shell-v1",
                 "terminal-v1",
-                "task-checkpoints-v1"
+                "task-checkpoints-v1",
+                "mcp-v1"
             ]
         );
         assert_eq!(
@@ -8783,8 +8888,47 @@ mod tests {
         assert_eq!(shell.additional_capability, Some("shell-v1"));
         assert!(shell.approval_required);
 
+        let mcp_read = agent_task_operation("platform.mcp.read", false).unwrap();
+        assert_eq!(mcp_read.permission, "read");
+        assert_eq!(mcp_read.risk, "low");
+        assert_eq!(mcp_read.additional_capability, Some("mcp-v1"));
+        assert!(!mcp_read.approval_required);
+
+        let mcp_reply = agent_task_operation("platform.mcp.reply", false).unwrap();
+        assert_eq!(mcp_reply.permission, "write");
+        assert_eq!(mcp_reply.risk, "high");
+        assert_eq!(mcp_reply.additional_capability, Some("mcp-v1"));
+        assert!(mcp_reply.approval_required);
+
         assert!(agent_task_operation("task.rollback", false).is_err());
         assert!(agent_task_operation("shell.raw", false).is_err());
+    }
+
+    #[test]
+    fn platform_mcp_task_input_is_strict_and_separates_reply_risk() {
+        let read = json!({
+            "server": "douyin",
+            "tool": "list_comments",
+            "arguments": {
+                "video_id": "item-1",
+                "limit": 20
+            }
+        });
+        assert!(validate_agent_task_input("platform.mcp.read", &read, false).is_ok());
+        assert!(validate_agent_task_input("platform.mcp.reply", &read, false).is_err());
+
+        let reply = json!({
+            "server": "bilibili",
+            "tool": "reply_comment",
+            "arguments": {
+                "video_id": "video-1",
+                "comment_id": "comment-1",
+                "content": "测试回复",
+                "dry_run": true
+            }
+        });
+        assert!(validate_agent_task_input("platform.mcp.reply", &reply, false).is_ok());
+        assert!(validate_agent_task_input("platform.mcp.read", &reply, false).is_err());
     }
 
     #[test]

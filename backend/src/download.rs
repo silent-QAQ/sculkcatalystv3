@@ -69,6 +69,12 @@ enum Source {
         name: String,
         url: String,
     },
+    MslApi {
+        project: String,
+    },
+    ResourceCenter {
+        identifier: String,
+    },
     PaperApi {
         project: &'static str,
     },
@@ -88,15 +94,44 @@ fn collect_sources(
     mirror_ids: &[String],
 ) -> Vec<Source> {
     let mut sources = Vec::new();
-    if let Some(version) =
-        catalog::resolve_core_download(&data.catalog, &server.core, &server.version, "stable")
+    let mut core_identifiers = Vec::new();
+    if let Some(resource_id) = server
+        .core_resource_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|resource_id| !resource_id.is_empty())
     {
+        core_identifiers.push(resource_id.to_string());
+    }
+    if !core_identifiers
+        .iter()
+        .any(|identifier| identifier.eq_ignore_ascii_case(&server.core))
+    {
+        core_identifiers.push(server.core.clone());
+    }
+    for identifier in &core_identifiers {
+        let Some(version) =
+            catalog::resolve_core_download(&data.catalog, identifier, &server.version, "stable")
+        else {
+            continue;
+        };
         sources.push(Source::Catalog {
             version_id: version.id,
             version: version.version,
             url: version.download_url,
             expected_size: version.size,
             expected_sha256: version.sha256,
+        });
+        break;
+    }
+    for identifier in &core_identifiers {
+        sources.push(Source::ResourceCenter {
+            identifier: identifier.clone(),
+        });
+    }
+    for identifier in &core_identifiers {
+        sources.push(Source::MslApi {
+            project: identifier.to_ascii_lowercase(),
         });
     }
     let mut mirrors: Vec<_> = data
@@ -1079,6 +1114,53 @@ async fn resolve_source(
             expected_sha256: None,
             catalog_version_id: None,
         }),
+        Source::ResourceCenter { identifier } => {
+            let base = crate::resource_sync::resource_base_url()
+                .ok_or_else(|| "资源中心地址未配置".to_string())?;
+            let (project, catalog_version) =
+                resolve_resource_center_version(client, &base, identifier, version).await?;
+            let download_url = resource_center_download_url(
+                &base,
+                &project.slug,
+                &catalog_version.version,
+                &catalog_version.download_url,
+            )?;
+            let expected_sha256 =
+                resource_integrity_sha256(&catalog_version.sha256, &catalog_version.version)?;
+            Ok(Resolved {
+                label: format!(
+                    "资源中心（{} {}）",
+                    project.display_name(),
+                    catalog_version.version
+                ),
+                url: download_url,
+                expected_size: (catalog_version.size > 0).then_some(catalog_version.size),
+                expected_sha256,
+                catalog_version_id: Some(catalog_version.id),
+            })
+        }
+        Source::MslApi { project } => {
+            let payload: Value = client
+                .get(format!(
+                    "https://api.mslmc.cn/v4/download/server/{project}/{version}"
+                ))
+                .query(&[("build", "latest")])
+                .send()
+                .await
+                .and_then(|response| response.error_for_status())
+                .map_err(|error| format!("MSL 镜像 API 请求失败：{error}"))?
+                .json()
+                .await
+                .map_err(|error| format!("MSL 镜像 API 响应异常：{error}"))?;
+            let (url, sha256) = parse_msl_download_payload(&payload)?;
+            Ok(Resolved {
+                label: format!("MSL 镜像（{project} {version}）"),
+                url,
+                expected_size: None,
+                expected_sha256: Some(sha256),
+                catalog_version_id: None,
+            })
+        }
         Source::PaperApi { project } => {
             // PaperMC v2 API 已停用（410 Gone），使用 Fill v3 API
             let build: Value = client
@@ -1134,13 +1216,251 @@ async fn resolve_source(
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ResourceCenterProject {
+    #[serde(default)]
+    slug: String,
+    #[serde(default)]
+    name: String,
+}
+
+impl ResourceCenterProject {
+    fn display_name(&self) -> &str {
+        if self.name.trim().is_empty() {
+            &self.slug
+        } else {
+            &self.name
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ResourceCenterVersion {
+    #[serde(default)]
+    id: String,
+    version: String,
+    #[serde(default)]
+    channel: String,
+    #[serde(default)]
+    minecraft_versions: Vec<String>,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    sha256: String,
+    #[serde(default)]
+    download_url: String,
+    #[serde(default)]
+    status: String,
+}
+
+async fn resolve_resource_center_version(
+    client: &reqwest::Client,
+    base: &str,
+    identifier: &str,
+    minecraft: &str,
+) -> Result<(ResourceCenterProject, ResourceCenterVersion), String> {
+    let mut search_url = resource_api_url(
+        base,
+        &["api", "catalog", "cores"],
+        &[
+            ("search", identifier),
+            ("minecraft", minecraft),
+            ("channel", "stable"),
+        ],
+    )?;
+    let response = client
+        .get(search_url.clone())
+        .send()
+        .await
+        .map_err(|error| format!("资源中心项目查询失败：{error}"))?
+        .error_for_status()
+        .map_err(|error| format!("资源中心项目查询失败：{error}"))?;
+    let payload: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("资源中心项目响应异常：{error}"))?;
+    let projects = parse_resource_center_projects(&payload)?;
+    let normalized = identifier.trim().to_ascii_lowercase();
+    let project = projects
+        .iter()
+        .find(|project| {
+            project.slug.eq_ignore_ascii_case(&normalized)
+                || project.name.eq_ignore_ascii_case(&normalized)
+        })
+        .cloned()
+        .ok_or_else(|| format!("资源中心未找到核心 {identifier}"))?;
+    if project.slug.trim().is_empty() {
+        return Err(format!("资源中心返回的核心 {identifier} 缺少 slug"));
+    }
+
+    search_url = resource_api_url(
+        base,
+        &["api", "catalog", "cores", &project.slug, "versions"],
+        &[("minecraft", minecraft), ("channel", "stable")],
+    )?;
+    let response = client
+        .get(search_url)
+        .send()
+        .await
+        .map_err(|error| format!("资源中心版本查询失败：{error}"))?
+        .error_for_status()
+        .map_err(|error| format!("资源中心版本查询失败：{error}"))?;
+    let payload: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("资源中心版本响应异常：{error}"))?;
+    let versions = parse_resource_center_versions(&payload)?;
+    let selected = versions
+        .into_iter()
+        .filter(|item| item.status.is_empty() || item.status.eq_ignore_ascii_case("published"))
+        .filter(|item| item.channel.is_empty() || item.channel.eq_ignore_ascii_case("stable"))
+        .find(|item| {
+            item.minecraft_versions.is_empty()
+                || item
+                    .minecraft_versions
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(minecraft))
+        })
+        .ok_or_else(|| {
+            format!(
+                "资源中心未找到核心 {} 兼容 Minecraft {} 的已发布版本",
+                project.slug, minecraft
+            )
+        })?;
+    Ok((project, selected))
+}
+
+fn parse_resource_center_projects(payload: &Value) -> Result<Vec<ResourceCenterProject>, String> {
+    let items = payload
+        .get("items")
+        .and_then(Value::as_array)
+        .or_else(|| payload.get("value").and_then(Value::as_array))
+        .or_else(|| payload.as_array())
+        .ok_or_else(|| "资源中心项目响应缺少列表".to_string())?;
+    serde_json::from_value(Value::Array(items.clone()))
+        .map_err(|error| format!("资源中心项目响应格式异常：{error}"))
+}
+
+fn parse_resource_center_versions(payload: &Value) -> Result<Vec<ResourceCenterVersion>, String> {
+    let items = payload
+        .get("items")
+        .and_then(Value::as_array)
+        .or_else(|| payload.get("value").and_then(Value::as_array))
+        .or_else(|| payload.as_array())
+        .ok_or_else(|| "资源中心版本响应缺少列表".to_string())?;
+    serde_json::from_value(Value::Array(items.clone()))
+        .map_err(|error| format!("资源中心版本响应格式异常：{error}"))
+}
+
+fn resource_api_url(base: &str, path: &[&str], query: &[(&str, &str)]) -> Result<Url, String> {
+    let mut url = Url::parse(base).map_err(|error| format!("资源中心地址无效：{error}"))?;
+    if !allowed_resource_url(&url) {
+        return Err("资源中心地址必须使用 HTTPS（本机回环地址可使用 HTTP）".into());
+    }
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| "资源中心地址不支持路径拼接".to_string())?;
+        segments.pop_if_empty();
+        for segment in path {
+            segments.push(segment);
+        }
+    }
+    url.query_pairs_mut()
+        .clear()
+        .extend_pairs(query.iter().copied());
+    Ok(url)
+}
+
+fn resource_center_download_url(
+    base: &str,
+    project: &str,
+    version: &str,
+    advertised_url: &str,
+) -> Result<String, String> {
+    if !advertised_url.trim().is_empty() {
+        let url =
+            Url::parse(advertised_url).map_err(|error| format!("资源中心下载地址无效：{error}"))?;
+        if !allowed_resource_url(&url) {
+            return Err("资源中心下载地址必须使用 HTTPS（本机回环地址可使用 HTTP）".into());
+        }
+        return Ok(url.to_string());
+    }
+    Ok(resource_api_url(
+        base,
+        &["api", "v1", "download", "core", project, version],
+        &[],
+    )?
+    .to_string())
+}
+
+fn allowed_resource_url(url: &Url) -> bool {
+    if url.scheme() == "https" {
+        return url.host_str().is_some();
+    }
+    url.scheme() == "http"
+        && url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+}
+
+fn valid_sha256(value: &str) -> Option<String> {
+    let value = value.trim();
+    (value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| value.to_ascii_lowercase())
+}
+
+fn resource_integrity_sha256(value: &str, version: &str) -> Result<Option<String>, String> {
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    valid_sha256(value)
+        .map(Some)
+        .ok_or_else(|| format!("资源中心版本 {version} 返回了无效 SHA-256"))
+}
+
 fn source_label(source: &Source) -> String {
     match source {
         Source::Catalog { version, .. } => format!("资源目录（{version}）"),
         Source::Mirror { name, .. } => name.clone(),
+        Source::ResourceCenter { identifier } => format!("资源中心（{identifier}）"),
+        Source::MslApi { project } => format!("MSL 镜像（{project}）"),
         Source::PaperApi { project } => format!("PaperMC 官方源（{project}）"),
         Source::PurpurApi => "PurpurMC 官方源".into(),
     }
+}
+
+fn parse_msl_download_payload(payload: &Value) -> Result<(String, String), String> {
+    if payload.get("code").and_then(Value::as_i64) != Some(200) {
+        return Err(payload
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or("MSL 镜像没有可用构建")
+            .into());
+    }
+    let data = payload
+        .get("data")
+        .ok_or_else(|| "MSL 镜像响应缺少 data".to_string())?;
+    let url = data
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|url| !url.trim().is_empty())
+        .ok_or_else(|| "MSL 镜像响应缺少下载地址".to_string())?;
+    let parsed = Url::parse(url).map_err(|error| format!("MSL 下载地址无效：{error}"))?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        return Err("MSL 下载地址必须使用 HTTPS".into());
+    }
+    let sha256 = data
+        .get("sha256")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|sha256| sha256.len() == 64 && sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| "MSL 镜像响应缺少有效 SHA-256".to_string())?;
+    Ok((url.to_string(), sha256.to_ascii_lowercase()))
 }
 
 fn placeholder_url(value: &str) -> bool {
@@ -1533,6 +1853,89 @@ mod tests {
         assert!(!is_retryable_failure(FailureKind::Integrity));
         assert!(!is_retryable_failure(FailureKind::Protocol));
         assert!(!is_retryable_failure(FailureKind::LocalIo));
+    }
+
+    #[test]
+    fn msl_payload_requires_https_and_sha256() {
+        let payload = serde_json::json!({
+            "code": 200,
+            "data": {
+                "url": "https://file.mslmc.cn/servers/paper/paper-26.2.jar",
+                "sha256": "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789"
+            }
+        });
+        let (url, sha256) = parse_msl_download_payload(&payload).unwrap();
+        assert_eq!(url, "https://file.mslmc.cn/servers/paper/paper-26.2.jar");
+        assert_eq!(
+            sha256,
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        );
+
+        let mut insecure = payload.clone();
+        insecure["data"]["url"] = serde_json::json!("http://file.mslmc.cn/server.jar");
+        assert!(parse_msl_download_payload(&insecure).is_err());
+    }
+
+    #[test]
+    fn resource_center_payloads_keep_branch_slug_and_integrity_metadata() {
+        let projects = serde_json::json!([
+            {
+                "slug": "lsqfk",
+                "name": "leavesslientqaqfork"
+            }
+        ]);
+        let projects = parse_resource_center_projects(&projects).unwrap();
+        assert_eq!(projects[0].slug, "lsqfk");
+        assert_eq!(projects[0].display_name(), "leavesslientqaqfork");
+
+        let versions = serde_json::json!([
+            {
+                "id": "remote-lsqfk-26.2-r1",
+                "version": "26.2-r1",
+                "channel": "stable",
+                "minecraft_versions": ["26.2"],
+                "size": 62847572,
+                "sha256": "7373464cda4f004bbb1d12886e0a56467a9416c564b78ba5c749848ead57e185",
+                "download_url": "https://res.mcmy.love/objects/cores/lsqfk/26.2-r1/server.jar",
+                "status": "published"
+            }
+        ]);
+        let versions = parse_resource_center_versions(&versions).unwrap();
+        assert_eq!(versions[0].version, "26.2-r1");
+        assert_eq!(valid_sha256(&versions[0].sha256).unwrap().len(), 64);
+        assert!(
+            resource_integrity_sha256(&versions[0].sha256, "26.2-r1")
+                .unwrap()
+                .is_some()
+        );
+        assert!(resource_integrity_sha256("not-a-sha", "26.2-r1").is_err());
+        let url = resource_center_download_url(
+            "https://res.mcmy.love",
+            "lsqfk",
+            "26.2-r1",
+            &versions[0].download_url,
+        )
+        .unwrap();
+        assert!(url.ends_with("/server.jar"));
+    }
+
+    #[test]
+    fn resource_center_urls_encode_queries_and_reject_insecure_public_hosts() {
+        let url = resource_api_url(
+            "https://res.mcmy.love",
+            &["api", "catalog", "cores"],
+            &[("search", "leaves silent"), ("minecraft", "26.2")],
+        )
+        .unwrap();
+        assert_eq!(url.path(), "/api/catalog/cores");
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "search")
+                .map(|(_, value)| value.into_owned()),
+            Some("leaves silent".to_string())
+        );
+        assert!(resource_api_url("http://resource.example.com", &["api"], &[]).is_err());
+        assert!(resource_api_url("http://127.0.0.1:8787", &["api"], &[]).is_ok());
     }
 
     #[tokio::test]

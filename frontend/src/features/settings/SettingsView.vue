@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { Bot, Cloud, GitBranch, Globe, Palette, PlugZap, Search, Settings, Sparkles, BrainCircuit } from 'lucide-vue-next'
+import { Bot, Cloud, GitBranch, Globe, Mic, Palette, PlugZap, Search, Settings, Sparkles, BrainCircuit } from 'lucide-vue-next'
 import { loadAll, notice } from './store'
 import GeneralSection from './sections/GeneralSection.vue'
 import AppearanceSection from './sections/AppearanceSection.vue'
 import ModelsSection from './sections/ModelsSection.vue'
+import SpeechRecognitionSection from './sections/SpeechRecognitionSection.vue'
 import AgentsSection from './sections/AgentsSection.vue'
 import PersonalizationSection from './sections/PersonalizationSection.vue'
 import AccountSection from './sections/AccountSection.vue'
@@ -13,7 +14,7 @@ import GitSection from './sections/GitSection.vue'
 import ConnectionsSection from './sections/ConnectionsSection.vue'
 import type { ServerTemplate } from '../portable/server-manifest'
 
-type SectionKey = 'general' | 'appearance' | 'models' | 'agents' | 'personalization' | 'account' | 'plugins' | 'git' | 'connections'
+type SectionKey = 'general' | 'appearance' | 'models' | 'speech' | 'agents' | 'personalization' | 'account' | 'plugins' | 'git' | 'connections'
 
 const props = withDefaults(defineProps<{
   initialSection?: SectionKey
@@ -25,6 +26,7 @@ const SECTIONS: { key: SectionKey; label: string; icon: any; group: string; keyw
   { key: 'general', label: '常规', icon: Settings, group: '个人', keywords: '常规 语言 language 审批 权限 审核 review approval' },
   { key: 'appearance', label: '外观', icon: Palette, group: '个人', keywords: '外观 主题 背景 颜色 字体 透明 theme appearance font color background' },
   { key: 'models', label: '模型', icon: BrainCircuit, group: '个人', keywords: '模型 提供商 api key 默认模型 语音 开服 报错 修复 管理 model provider' },
+  { key: 'speech', label: '语音识别', icon: Mic, group: '个人', keywords: '语音 录音 麦克风 识别 转写 asr whisper speech recognition microphone' },
   { key: 'agents', label: '智能体管理', icon: Bot, group: '个人', keywords: '智能体 agent acp codex claude openclaw hermes sculkagent' },
   { key: 'personalization', label: '个性化', icon: Sparkles, group: '个人', keywords: '个性化 风格 语气 上下文 style context persona' },
   { key: 'account', label: 'Sculk Cloud', icon: Cloud, group: '云服务', keywords: '云账号 账户 account 同步 团队 审批 token api cloud' },
@@ -56,6 +58,7 @@ const COMPONENTS: Record<SectionKey, any> = {
   general: GeneralSection,
   appearance: AppearanceSection,
   models: ModelsSection,
+  speech: SpeechRecognitionSection,
   agents: AgentsSection,
   personalization: PersonalizationSection,
   account: AccountSection,

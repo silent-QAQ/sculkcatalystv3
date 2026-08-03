@@ -22,6 +22,10 @@ const MAX_EVENTS: usize = 200;
 const MAX_SERVER_LOGS: usize = 1000;
 const PROVISION_CANCELLED: &str = "server provisioning cancelled";
 
+fn is_provisioning_kind(kind: &str) -> bool {
+    matches!(kind, "server_provision" | "server_bootstrap")
+}
+
 pub(crate) fn is_executable_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -30,6 +34,7 @@ pub(crate) fn is_executable_kind(kind: &str) -> bool {
             | "server_stop"
             | "rollback_server_state"
             | "server_provision"
+            | "server_bootstrap"
     )
 }
 
@@ -38,6 +43,7 @@ pub(crate) fn normalize_requested_kind(kind: &str) -> Option<&'static str> {
         "diagnostic" | "repair" => Some("diagnostic"),
         "server_start" | "start" => Some("server_start"),
         "server_stop" | "stop" => Some("server_stop"),
+        "server_bootstrap" | "bootstrap" | "open" | "开服" => Some("server_bootstrap"),
         _ => None,
     }
 }
@@ -64,7 +70,7 @@ pub(crate) fn reconcile_interrupted_tasks(state: &mut PersistedState) -> bool {
             changed = true;
             continue;
         }
-        if task.kind == "server_provision"
+        if is_provisioning_kind(&task.kind)
             && matches!(task.status.as_str(), "running" | "cancelling")
         {
             task.status = "queued".into();
@@ -164,7 +170,7 @@ pub(crate) async fn request_cancel(
     let mut settle_cancelled_provision = false;
     match task.status.as_str() {
         "awaiting_approval" | "queued" => {
-            settle_cancelled_provision = task.kind == "server_provision";
+            settle_cancelled_provision = is_provisioning_kind(&task.kind);
             task.status = "cancelled".into();
             task.progress = 0;
             task.finished_at = Some(Local::now().to_rfc3339());
@@ -279,8 +285,10 @@ async fn run_task(state: AppState, id: Uuid, cancellation: Arc<AtomicBool>) {
         return;
     };
 
-    if matches!(task.kind.as_str(), "server_start" | "server_stop")
-        && let Err(error) = prepare_compensation(&state, id, &previous_status).await
+    if matches!(
+        task.kind.as_str(),
+        "server_start" | "server_stop" | "server_bootstrap"
+    ) && let Err(error) = prepare_compensation(&state, id, &previous_status).await
     {
         finish_failed(&state, id, &error, None).await;
         return;
@@ -291,11 +299,12 @@ async fn run_task(state: AppState, id: Uuid, cancellation: Arc<AtomicBool>) {
         "server_stop" => execute_server_target(&state, &task, false, &cancellation).await,
         "rollback_server_state" => execute_scheduled_rollback(&state, &task, &cancellation).await,
         "server_provision" => execute_server_provision(&state, &task, &cancellation).await,
+        "server_bootstrap" => execute_server_bootstrap(&state, &task, &cancellation).await,
         _ => Err(format!("任务类型 {} 未接入执行器", task.kind)),
     };
     match outcome {
         Ok(summary) if cancellation.load(Ordering::Acquire) => {
-            if task.kind == "server_provision" {
+            if is_provisioning_kind(&task.kind) {
                 settle_provision_server(&state, &task.server_id, false, Some(PROVISION_CANCELLED))
                     .await;
             }
@@ -318,7 +327,7 @@ async fn run_task(state: AppState, id: Uuid, cancellation: Arc<AtomicBool>) {
                 finish_completed(&state, id, &summary).await;
             }
         }
-        Err(error) if task.kind == "server_provision" && error == PROVISION_CANCELLED => {
+        Err(error) if is_provisioning_kind(&task.kind) && error == PROVISION_CANCELLED => {
             settle_provision_server(&state, &task.server_id, false, Some(PROVISION_CANCELLED))
                 .await;
             finish_cancelled(
@@ -330,10 +339,13 @@ async fn run_task(state: AppState, id: Uuid, cancellation: Arc<AtomicBool>) {
             .await;
         }
         Err(error) => {
-            if task.kind == "server_provision" {
+            if is_provisioning_kind(&task.kind) {
                 settle_provision_server(&state, &task.server_id, false, Some(&error)).await;
             }
-            let rollback = if matches!(task.kind.as_str(), "server_start" | "server_stop") {
+            let rollback = if matches!(
+                task.kind.as_str(),
+                "server_start" | "server_stop" | "server_bootstrap"
+            ) {
                 Some(compensate_to(&state, &task.server_id, &previous_status).await)
             } else if task.kind == "rollback_server_state" && error.starts_with("补偿失败") {
                 Some(error.clone())
@@ -348,7 +360,7 @@ async fn run_task(state: AppState, id: Uuid, cancellation: Arc<AtomicBool>) {
 fn task_changes_server(kind: &str) -> bool {
     matches!(
         kind,
-        "server_start" | "server_stop" | "rollback_server_state"
+        "server_start" | "server_stop" | "server_bootstrap" | "rollback_server_state"
     )
 }
 
@@ -459,20 +471,52 @@ async fn execute_server_provision(
     if cancellation.load(Ordering::Acquire) {
         return Err(PROVISION_CANCELLED.into());
     }
-    record_event(state, task.id, "info", "Checking the Java runtime", 90).await?;
-    let java = runtime::detect_java(&runtime::data_root()).await;
-    if !java.java_installed {
-        return Err(format!(
-            "Java is not installed; install managed Java {} and retry provisioning",
-            runtime::RECOMMENDED_JAVA
-        ));
-    }
+    let minecraft_version = state
+        .inner
+        .read()
+        .await
+        .servers
+        .iter()
+        .find(|server| server.id == task.server_id)
+        .map(|server| server.version.clone())
+        .ok_or_else(|| "目标服务器不存在".to_string())?;
+    let required_java = runtime::required_java_major(&minecraft_version);
+    record_event(
+        state,
+        task.id,
+        "info",
+        &format!("检查 Java {required_java} 运行时（Minecraft {minecraft_version}）"),
+        90,
+    )
+    .await?;
+    let mut java = runtime::detect_java_for_major(&runtime::data_root(), required_java).await;
     if !java.java_compatible {
-        return Err(format!(
-            "Detected Java {:?}, but Java {} or newer is required",
-            java.java_major,
-            runtime::RECOMMENDED_JAVA
-        ));
+        record_event(
+            state,
+            task.id,
+            "info",
+            &format!("未找到匹配的 Java {required_java}，正在安装托管运行时"),
+            92,
+        )
+        .await?;
+        let _install_guard = state.runtime_install.lock().await;
+        java = runtime::install_java(&runtime::data_root(), required_java)
+            .await
+            .map_err(|error| format!("Java {required_java} 自动安装失败：{error}"))?;
+        if !java.java_compatible {
+            return Err(format!(
+                "Java {required_java} 安装后校验失败，检测到 {:?}",
+                java.java_major
+            ));
+        }
+        record_event(
+            state,
+            task.id,
+            "info",
+            &format!("Java {required_java} 已安装并通过运行校验"),
+            96,
+        )
+        .await?;
     }
     if cancellation.load(Ordering::Acquire) {
         return Err(PROVISION_CANCELLED.into());
@@ -482,11 +526,38 @@ async fn execute_server_provision(
         state,
         task.id,
         "info",
-        "Server provisioning completed and the server is ready to start",
+        &format!("服务器环境、核心、EULA 与 Java {required_java} 已就绪"),
         98,
     )
     .await?;
-    Ok("Server workspace, core, EULA, and Java runtime are ready".into())
+    Ok(format!(
+        "服务器工作区、核心、EULA 与 Java {required_java} 运行时已就绪"
+    ))
+}
+
+async fn execute_server_bootstrap(
+    state: &AppState,
+    task: &TaskInfo,
+    cancellation: &Arc<AtomicBool>,
+) -> Result<String, String> {
+    let provision = execute_server_provision(state, task, cancellation).await?;
+    if cancellation.load(Ordering::Acquire) {
+        return Err(PROVISION_CANCELLED.into());
+    }
+    let already_online = state
+        .inner
+        .read()
+        .await
+        .servers
+        .iter()
+        .find(|server| server.id == task.server_id)
+        .is_some_and(|server| server.status == "online");
+    if already_online {
+        record_event(state, task.id, "info", "服务器已经在线，无需重复启动", 100).await?;
+        return Ok(format!("{provision}；服务器已经在线"));
+    }
+    let started = execute_server_target(state, task, true, cancellation.as_ref()).await?;
+    Ok(format!("{provision}；{started}"))
 }
 
 async fn settle_provision_server(
@@ -509,6 +580,9 @@ async fn settle_provision_server(
     {
         server.operation_state = "idle".into();
         server.core_ready = core_ready;
+        if ready && core_ready && server.lifecycle_phase == "create" {
+            server.lifecycle_phase = "build".into();
+        }
         server.last_error = error.map(str::to_string);
         server.task = if ready {
             "Ready to start".into()
@@ -968,8 +1042,19 @@ where
     update(task);
     task.updated_at = Local::now().to_rfc3339();
     let result = task.clone();
+    let terminal = matches!(
+        result.status.as_str(),
+        "completed" | "failed" | "cancelled" | "interrupted" | "rollback_failed"
+    );
+    let previous_conversations = terminal.then(|| data.conversations.clone());
+    if terminal {
+        crate::conversations::sync_task_result(&mut data, &result);
+    }
     if let Err(error) = persist(state, &data).await {
         data.tasks[index] = previous;
+        if let Some(previous_conversations) = previous_conversations {
+            data.conversations = previous_conversations;
+        }
         return Err(error);
     }
     Ok(result)
@@ -1049,6 +1134,8 @@ mod tests {
         assert_eq!(normalize_requested_kind("economy"), None);
         assert!(!is_executable_kind("general"));
         assert!(is_executable_kind("server_provision"));
+        assert!(is_executable_kind("server_bootstrap"));
+        assert_eq!(normalize_requested_kind("开服"), Some("server_bootstrap"));
     }
 
     #[test]
@@ -1131,6 +1218,7 @@ mod tests {
         assert!(!task_changes_server("diagnostic"));
         assert!(task_changes_server("server_start"));
         assert!(task_changes_server("server_stop"));
+        assert!(task_changes_server("server_bootstrap"));
         assert!(task_changes_server("rollback_server_state"));
     }
 }

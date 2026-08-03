@@ -4,12 +4,16 @@ node_modules/
 # Frontend build output
 frontend/dist/
 frontend/dist-cloud/
+frontend/dist-website/
 
 # Rust build output
 backend/target/
 backend/target-cloud/
 backend/target-*/
 agent/target/
+agent/target-*/
+platform-bots/target/
+target-*/
 
 # Local package caches and generated bundles
 .npm-cache/
@@ -44,3 +48,4 @@ Thumbs.db
 !frontend/package-lock.json
 !backend/Cargo.lock
 !agent/Cargo.lock
+!platform-bots/Cargo.lock

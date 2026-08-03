@@ -104,6 +104,7 @@ pub struct SystemInfo {
     pub data_dir_free_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_memory_bytes: Option<u64>,
+    pub logical_cpu_count: usize,
     pub recommended_java: u32,
     pub java_install_supported: bool,
     pub java_install_hint: String,
@@ -158,6 +159,20 @@ struct AdoptiumPackage {
     checksum: String,
     link: String,
     size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MslJavaResponse {
+    code: i64,
+    #[serde(default)]
+    message: String,
+    data: Option<MslJavaPackage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MslJavaPackage {
+    url: String,
+    sha256: String,
 }
 
 pub fn data_root() -> PathBuf {
@@ -228,7 +243,7 @@ pub async fn collect_system_info(data_root: &Path) -> SystemInfo {
     let java = detect_java(data_root).await;
     let data_dir_writable = probe_directory_writable(&server_data_dir).await;
     let data_dir_free_bytes = available_space(server_data_dir.clone()).await;
-    let total_memory_bytes = total_memory().await;
+    let total_memory_bytes = total_memory_bytes().await;
     let java_install_supported =
         java_package_platform(std::env::consts::OS, std::env::consts::ARCH).is_some();
 
@@ -240,6 +255,9 @@ pub async fn collect_system_info(data_root: &Path) -> SystemInfo {
         data_dir_writable,
         data_dir_free_bytes,
         total_memory_bytes,
+        logical_cpu_count: std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1),
         recommended_java: RECOMMENDED_JAVA,
         java_install_supported,
         java_install_hint: if java_install_supported {
@@ -478,6 +496,80 @@ async fn install_java_inner(
 }
 
 async fn fetch_package_metadata(
+    client: &reqwest::Client,
+    major: u32,
+    platform: JavaPackagePlatform,
+) -> Result<AdoptiumPackage, InstallError> {
+    match fetch_msl_package_metadata(client, major, platform).await {
+        Ok(package) => return Ok(package),
+        Err(msl_error) => match fetch_adoptium_package_metadata(client, major, platform).await {
+            Ok(package) => return Ok(package),
+            Err(adoptium_error) => {
+                return Err(InstallError::new(
+                    adoptium_error.kind,
+                    format!(
+                        "MSL 镜像未提供 Java {major} {}：{}；Eclipse Adoptium 回退也失败：{}",
+                        platform.label, msl_error.message, adoptium_error.message
+                    ),
+                ));
+            }
+        },
+    }
+}
+
+fn msl_java_metadata_url(major: u32, platform: JavaPackagePlatform) -> String {
+    format!(
+        "https://api.mslmc.cn/v4/download/jdk/{major}?os={}&arch={}",
+        platform.api_os, platform.api_arch
+    )
+}
+
+async fn fetch_msl_package_metadata(
+    client: &reqwest::Client,
+    major: u32,
+    platform: JavaPackagePlatform,
+) -> Result<AdoptiumPackage, InstallError> {
+    let response = client
+        .get(msl_java_metadata_url(major, platform))
+        .header("User-Agent", "MSL API Test")
+        .send()
+        .await
+        .map_err(|error| InstallError::new(InstallErrorKind::Network, error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(InstallError::new(
+            InstallErrorKind::Network,
+            format!("MSL Java API HTTP {}", response.status().as_u16()),
+        ));
+    }
+    let payload: MslJavaResponse = response.json().await.map_err(|error| {
+        InstallError::new(
+            InstallErrorKind::Network,
+            format!("MSL Java API 响应格式无效：{error}"),
+        )
+    })?;
+    if payload.code != 200 {
+        return Err(InstallError::new(
+            InstallErrorKind::Network,
+            if payload.message.trim().is_empty() {
+                "MSL Java API 没有可用版本".into()
+            } else {
+                payload.message
+            },
+        ));
+    }
+    let package = payload
+        .data
+        .ok_or_else(|| InstallError::new(InstallErrorKind::Network, "MSL Java API 缺少下载信息"))?;
+    let package = AdoptiumPackage {
+        checksum: package.sha256,
+        link: package.url,
+        size: None,
+    };
+    validate_package_metadata(&package)?;
+    Ok(package)
+}
+
+async fn fetch_adoptium_package_metadata(
     client: &reqwest::Client,
     major: u32,
     platform: JavaPackagePlatform,
@@ -1206,7 +1298,7 @@ async fn available_space(directory: PathBuf) -> Option<u64> {
         .flatten()
 }
 
-async fn total_memory() -> Option<u64> {
+pub(crate) async fn total_memory_bytes() -> Option<u64> {
     task::spawn_blocking(|| {
         let mut system = System::new();
         system.refresh_memory();
@@ -1216,6 +1308,44 @@ async fn total_memory() -> Option<u64> {
     .await
     .ok()
     .flatten()
+}
+
+/// 给新手开服流程提供保守的初始堆大小；后续仍可依据真实 TPS/GC 调整。
+/// 始终为宿主系统保留内存，不会因为用户不了解 JVM 而把整机内存全部分给服务器。
+pub(crate) fn recommended_server_memory_gb(
+    total_memory_bytes: Option<u64>,
+    expected_players: Option<u32>,
+    modded: bool,
+) -> u8 {
+    let players = expected_players.unwrap_or(12);
+    let desired = if modded {
+        match players {
+            0..=10 => 6,
+            11..=30 => 8,
+            31..=60 => 12,
+            _ => 16,
+        }
+    } else {
+        match players {
+            0..=12 => 4,
+            13..=30 => 6,
+            31..=60 => 8,
+            _ => 12,
+        }
+    };
+    let Some(total_bytes) = total_memory_bytes else {
+        return desired;
+    };
+    let total_gb = (total_bytes / (1024 * 1024 * 1024)).clamp(1, u8::MAX as u64) as u8;
+    let reserve = match total_gb {
+        0..=4 => 1,
+        5..=8 => 2,
+        9..=16 => 3,
+        _ => 4,
+    };
+    desired
+        .min(total_gb.saturating_sub(reserve).max(2))
+        .clamp(2, 64)
 }
 
 async fn remove_file_if_present(path: &Path) {
@@ -1309,6 +1439,28 @@ mod tests {
     }
 
     #[test]
+    fn memory_recommendation_preserves_host_capacity_for_novice_defaults() {
+        let gib = 1024_u64 * 1024 * 1024;
+        assert_eq!(
+            recommended_server_memory_gb(Some(8 * gib), Some(10), false),
+            4
+        );
+        assert_eq!(
+            recommended_server_memory_gb(Some(4 * gib), Some(10), false),
+            3
+        );
+        assert_eq!(
+            recommended_server_memory_gb(Some(16 * gib), Some(40), false),
+            8
+        );
+        assert_eq!(
+            recommended_server_memory_gb(Some(8 * gib), Some(10), true),
+            6
+        );
+        assert_eq!(recommended_server_memory_gb(None, None, false), 4);
+    }
+
+    #[test]
     fn managed_java_packages_cover_supported_windows_and_linux_architectures() {
         let windows = java_package_platform("windows", "x86_64").unwrap();
         assert_eq!(windows.api_os, "windows");
@@ -1327,6 +1479,20 @@ mod tests {
         assert!(java_package_platform("windows", "aarch64").is_none());
         assert!(java_package_platform("linux", "arm").is_none());
         assert!(java_package_platform("macos", "aarch64").is_none());
+    }
+
+    #[test]
+    fn msl_java_metadata_uses_supported_platform_query_shape() {
+        let windows = java_package_platform("windows", "x86_64").unwrap();
+        assert_eq!(
+            msl_java_metadata_url(21, windows),
+            "https://api.mslmc.cn/v4/download/jdk/21?os=windows&arch=x64"
+        );
+        let linux = java_package_platform("linux", "aarch64").unwrap();
+        assert_eq!(
+            msl_java_metadata_url(17, linux),
+            "https://api.mslmc.cn/v4/download/jdk/17?os=linux&arch=aarch64"
+        );
     }
 
     #[test]

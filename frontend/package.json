@@ -6,8 +6,10 @@
   "scripts": {
     "dev": "vite",
     "dev:cloud": "vite --mode cloud",
+    "dev:website": "vite --mode website",
     "build": "vue-tsc -b && vite build",
     "build:cloud": "vue-tsc -b && vite build --mode cloud --outDir dist-cloud",
+    "build:website": "vue-tsc -b && vite build --mode website --outDir dist-website",
     "preview": "vite preview"
   },
   "dependencies": {

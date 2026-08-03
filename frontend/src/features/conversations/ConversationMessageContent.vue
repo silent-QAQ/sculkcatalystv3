@@ -55,12 +55,12 @@ async function copyCode(content: string, index: number) {
 <style scoped>
 .message-content{min-width:0;color:#bec6d1;font-size:12px;line-height:1.72}
 .message-content p{margin:0;white-space:pre-wrap;overflow-wrap:anywhere}
-.code-block{margin:10px 0;overflow:hidden;border:1px solid rgba(255,255,255,.09);border-radius:9px;background:#0b1015}
-.code-block>header{height:31px;display:flex;align-items:center;justify-content:space-between;padding:0 10px;border-bottom:1px solid rgba(255,255,255,.07);background:#11171e}
+.code-block{margin:10px 0;overflow:hidden;border:1px solid color-mix(in srgb,var(--accent) 14%,rgba(255,255,255,.12));border-radius:9px;background:color-mix(in srgb,var(--panel) 48%,transparent);box-shadow:0 10px 26px rgba(0,0,0,.1);backdrop-filter:blur(12px) saturate(120%)}
+.code-block>header{height:31px;display:flex;align-items:center;justify-content:space-between;padding:0 10px;border-bottom:1px solid rgba(255,255,255,.09);background:rgba(255,255,255,.045)}
 .code-block>header span{color:#697684;font-size:9px;font-weight:600;text-transform:uppercase}
 .code-block button{height:24px;display:flex;align-items:center;gap:5px;padding:0 7px;border:0;border-radius:5px;color:#7f8b97;background:transparent;font-size:8px}
 .code-block button:hover{color:#d6dde4;background:rgba(255,255,255,.05)}
 .code-block button svg{width:12px}
-.code-block pre{max-width:100%;margin:0;padding:13px 14px;overflow:auto;color:#b9d9d0;font:10px/1.7 'Cascadia Code',Consolas,monospace;tab-size:2}
+.code-block pre{max-width:100%;margin:0;padding:13px 14px;overflow:auto;color:#c5e4db;background:transparent;font:10px/1.7 'Cascadia Code',Consolas,monospace;tab-size:2}
 .code-block code{font:inherit;white-space:pre}
 </style>

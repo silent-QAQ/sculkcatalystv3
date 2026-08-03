@@ -1,2 +1,2 @@
-c45e1a3f1d4db9c78b9ced24b74e795b98bc0bc80e5ff97dc77c432b70eeb46e  sculk-agent-linux-x86_64
-7ce492e4ab5a559fddb9f916f17f37df38f0ca20d0fb8ce1a6ab16bf3b4866ad  sculk-agent-windows-x86_64.exe
+eb527761f340d82c404b6234b9a711d24466c02614228f25f81982b9b567e842  sculk-agent-linux-x86_64
+a7b6d93c4e5ce7a728fc417915c64db9db171d903b80fbda96408cf682e61015  sculk-agent-windows-x86_64.exe

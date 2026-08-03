@@ -5,6 +5,8 @@ import { Box, ShieldCheck } from 'lucide-vue-next'
 import AccountSection from './features/settings/sections/AccountSection.vue'
 import './cloud-app.css'
 
+const initialAuthMode = new URLSearchParams(window.location.search).get('mode') === 'register' ? 'register' : 'login'
+
 document.title = 'Sculk Cloud — 云端协作控制台'
 document.querySelector('meta[name="description"]')?.setAttribute(
   'content',
@@ -23,7 +25,7 @@ document.querySelector('meta[name="description"]')?.setAttribute(
     </header>
 
     <main class="cloud-app-main">
-      <AccountSection context="web"/>
+      <AccountSection context="web" :initial-auth-mode="initialAuthMode"/>
     </main>
 
     <footer class="cloud-app-footer">

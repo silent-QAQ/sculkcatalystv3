@@ -10,8 +10,11 @@ import './readability.css'
 
 async function bootstrap() {
   const cloudMode = import.meta.env.VITE_APP_MODE === 'cloud'
+  const websiteMode = import.meta.env.MODE === 'website' || import.meta.env.VITE_APP_MODE === 'website'
   const pathname = window.location.pathname.replace(/\/$/, '')
-  const rootComponent = cloudMode
+  const rootComponent = websiteMode
+    ? (await import('./WebsiteApp.vue')).default
+    : cloudMode
     ? (await import('./CloudApp.vue')).default
     : pathname === '/resource-admin'
       ? (await import('./ResourceAdminApp.vue')).default
