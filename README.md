@@ -2,8 +2,13 @@
 
 [![CI](https://github.com/silent-QAQ/sculkcatalystv3/actions/workflows/ci.yml/badge.svg)](https://github.com/silent-QAQ/sculkcatalystv3/actions/workflows/ci.yml)
 广告：此参考代码版本会落后最新版本3个版本，添加作者qq群点击链接加入群聊【我的世界younimc综合网站】：https://qm.qq.com/q/isbVXXHnkQ 获取最新构建
+
 广告2：赔钱云 全网最低价！（本项目使用赔钱云机器开发，120元8h40g云服务器，正好安装codex使用）
 https://www.peiqianyun.com/aff/TJOEKQKN
+
+广告3：广告招租
+
+
 无需任何基础，java不会装都能帮您全自动开服加管理的新时代aimc开服器。
 
 从服务器创建，java安装，到插件选择和配置编写，小白也有开服梦。
