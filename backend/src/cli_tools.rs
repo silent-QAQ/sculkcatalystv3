@@ -173,14 +173,10 @@ fn executable_candidates(directory: &Path, command: &str) -> Vec<PathBuf> {
             })
             .filter(|items| !items.is_empty())
             .unwrap_or_else(|| vec![".com".into(), ".exe".into(), ".bat".into(), ".cmd".into()]);
-        let mut candidates = Vec::with_capacity(extensions.len() + 1);
-        candidates.push(direct);
-        candidates.extend(
-            extensions
-                .into_iter()
-                .map(|extension| directory.join(format!("{command}{extension}"))),
-        );
-        candidates
+        extensions
+            .into_iter()
+            .map(|extension| directory.join(format!("{command}{extension}")))
+            .collect()
     }
     #[cfg(not(windows))]
     {
@@ -259,6 +255,11 @@ mod tests {
                 .to_string_lossy()
                 .to_ascii_lowercase();
             name == "codex" || name == "codex.cmd" || name == "codex.exe"
+        }));
+        #[cfg(windows)]
+        assert!(!candidates.iter().any(|path| {
+            path.file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("codex"))
         }));
     }
 

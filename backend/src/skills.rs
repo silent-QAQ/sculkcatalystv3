@@ -49,6 +49,19 @@ const SERVER_REFERENCES_PERFORMANCE: &str =
 const SERVER_REFERENCES_RECOVERY: &str = include_str!(
     "../resources/skills/minecraft-server-operations/references/recovery-and-migration.md"
 );
+const SERVER_ANALYSIS_SKILL_MD: &str =
+    include_str!("../resources/skills/minecraft-server-operations/analysis-SKILL.md");
+const SERVER_ANALYSIS_DIAGNOSTICS: &str = include_str!(
+    "../resources/skills/minecraft-server-operations/references/analysis/diagnostics.md"
+);
+const SERVER_ANALYSIS_SAFETY: &str =
+    include_str!("../resources/skills/minecraft-server-operations/references/analysis/safety.md");
+const SERVER_ANALYSIS_PLUGINS: &str = include_str!(
+    "../resources/skills/minecraft-server-operations/references/analysis/plugin-ecosystem.md"
+);
+const SERVER_ANALYSIS_APPROVAL: &str = include_str!(
+    "../resources/skills/minecraft-server-operations/references/analysis/approval-policy.md"
+);
 
 pub(crate) fn builtin_skill_info() -> SkillInfo {
     SkillInfo {
@@ -156,6 +169,17 @@ pub(crate) fn is_minecraft_server_request(query: &str) -> bool {
         "生电",
         "空岛",
         "基岩版",
+        "服务器日志",
+        "服务器崩溃",
+        "服务器诊断",
+        "服务器审计",
+        "服务器取证",
+        "插件生态",
+        "server logs",
+        "server crash",
+        "server diagnosis",
+        "server audit",
+        "plugin ecosystem",
     ]
     .iter()
     .any(|term| lower.contains(term))
@@ -361,6 +385,25 @@ pub(crate) fn server_context_for_request(query: &str) -> String {
         ));
     }
 
+    let analysis_request = contains_any(
+        &lower,
+        &[
+            "$manage-minecraft-server",
+            "manage-minecraft-server",
+            "服务器日志",
+            "服务器崩溃",
+            "服务器诊断",
+            "服务器审计",
+            "服务器取证",
+            "插件生态",
+            "server logs",
+            "server crash",
+            "server diagnosis",
+            "server audit",
+            "plugin ecosystem",
+        ],
+    );
+
     let mut context = String::from(
         "已启用内置 Minecraft 服务器运维 Skill。以下内容是当前请求的服务器决策约束和按需参考文档；请先保护数据，再按证据执行变更并验证回滚路径。\n\n[SKILL.md]\n",
     );
@@ -370,6 +413,18 @@ pub(crate) fn server_context_for_request(query: &str) -> String {
         context.push_str(path);
         context.push_str("]\n");
         context.push_str(content);
+    }
+    if analysis_request {
+        context.push_str("\n\n[analysis-SKILL.md]\n");
+        context.push_str(SERVER_ANALYSIS_SKILL_MD);
+        context.push_str("\n\n[analysis/references/safety.md]\n");
+        context.push_str(SERVER_ANALYSIS_SAFETY);
+        context.push_str("\n\n[analysis/references/diagnostics.md]\n");
+        context.push_str(SERVER_ANALYSIS_DIAGNOSTICS);
+        context.push_str("\n\n[analysis/references/plugin-ecosystem.md]\n");
+        context.push_str(SERVER_ANALYSIS_PLUGINS);
+        context.push_str("\n\n[analysis/references/approval-policy.md]\n");
+        context.push_str(SERVER_ANALYSIS_APPROVAL);
     }
     context
 }
@@ -455,6 +510,17 @@ mod tests {
         let technical_context = server_context_for_request("我想要和5个朋友一起开一个插件生电服");
         assert!(technical_context.contains("plugins-and-content.md"));
         assert!(technical_context.contains("worlds-and-modes.md"));
+    }
+
+    #[test]
+    fn merged_server_skill_routes_read_only_analysis_guidance() {
+        assert!(is_minecraft_server_request(
+            "$manage-minecraft-server 分析服务器日志"
+        ));
+        let context = server_context_for_request("审计服务器插件生态和崩溃日志");
+        assert!(context.contains("analysis-SKILL.md"));
+        assert!(context.contains("analysis/references/safety.md"));
+        assert!(context.contains("execution_performed=false"));
     }
 
     #[test]

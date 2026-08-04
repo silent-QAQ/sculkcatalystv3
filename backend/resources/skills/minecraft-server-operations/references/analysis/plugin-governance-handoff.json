@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "minecraft-plugin-governance-handoff/v1",
+  "type": "object",
+  "required": ["schema", "domain", "evidence", "findings", "proposal", "approval", "executor_contract", "execution_performed", "writes_performed", "integrity"],
+  "properties": {
+    "schema": {"const": "minecraft-plugin-governance-handoff/v1"},
+    "domain": {"enum": ["ecosystem", "economy", "permissions", "tasks", "mobs", "npc", "presentation"]},
+    "evidence": {"type": "array"},
+    "findings": {"type": "array"},
+    "proposal": {"type": "object"},
+    "approval": {
+      "type": "object",
+      "required": ["risk_level", "status", "approval_authoritative", "scope_id", "plan_hash"],
+      "properties": {
+        "risk_level": {"enum": ["L0", "L1", "L2", "L3", "L4"]},
+        "status": {"enum": ["manual_review_required", "eligible_for_external_auto_approval", "rejected", "not_requested"]},
+        "approval_authoritative": {"const": false},
+        "scope_id": {"type": ["string", "null"]},
+        "plan_hash": {"type": "string"}
+      }
+    },
+    "executor_contract": {
+      "type": "object",
+      "required": ["may_execute", "handoff_is_authorization", "must_revalidate_evidence"],
+      "properties": {
+        "may_execute": {"const": false},
+        "handoff_is_authorization": {"const": false},
+        "must_revalidate_evidence": {"const": true}
+      }
+    },
+    "execution_performed": {"const": false},
+    "writes_performed": {"const": false},
+    "integrity": {"type": "object"}
+  },
+  "additionalProperties": false
+}

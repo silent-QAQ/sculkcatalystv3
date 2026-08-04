@@ -1,11 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 
+<#
+.SYNOPSIS
+Starts the local production backend and frontend bundle.
+
+.PARAMETER EnableCodexFullAccess
+Enables full host access only for the trusted native Codex CLI in this newly
+started loopback backend. Codex still needs the application's "full" review mode.
+
+.PARAMETER CodexCommand
+Absolute path to the same Codex .exe, .cmd, or .bat command configured for the
+native Codex agent. Required with EnableCodexFullAccess.
+
+.EXAMPLE
+$codexCommand = (Get-Command codex.cmd -CommandType Application).Path
+.\scripts\start-local.ps1 -EnableCodexFullAccess -CodexCommand $codexCommand
+#>
 param(
     [int]$Port = 8787,
     [switch]$Quiet,
     [switch]$KeepAlive,
     [string]$NapCatApiUrl = '',
-    [string]$NapCatConfigPath = ''
+    [string]$NapCatConfigPath = '',
+    [switch]$EnableCodexFullAccess,
+    [string]$CodexCommand = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,6 +36,77 @@ $staticDir = Join-Path $root 'frontend\dist'
 $backendDir = Join-Path $root 'backend'
 $pidFile = Join-Path $runtime 'backend.pid'
 $backendPid = $null
+
+function Resolve-CodexFullAccessCommand([bool]$Enabled, [string]$Command) {
+    if (-not $Enabled) {
+        if (-not [string]::IsNullOrWhiteSpace($Command)) {
+            throw '-CodexCommand can only be used with -EnableCodexFullAccess.'
+        }
+        return $null
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Command)) {
+        throw '-EnableCodexFullAccess requires -CodexCommand with an absolute native Codex CLI path.'
+    }
+    if ($Command -notmatch '^(?:[A-Za-z]:[\\/]|\\\\)') {
+        throw '-CodexCommand must be an absolute path.'
+    }
+
+    $resolved = (Resolve-Path -LiteralPath $Command -ErrorAction Stop).ProviderPath
+    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+        throw "Codex command does not exist: $resolved"
+    }
+    $extension = [System.IO.Path]::GetExtension($resolved).ToLowerInvariant()
+    if ($extension -notin @('.exe', '.cmd', '.bat')) {
+        throw '-CodexCommand must point to a native Windows Codex .exe, .cmd, or .bat command.'
+    }
+    return $resolved
+}
+
+function Start-BackendWithCodexAccess(
+    [string]$FilePath,
+    [string]$WorkingDirectory,
+    [string]$StandardOutput,
+    [string]$StandardError,
+    [bool]$EnableFullAccess,
+    [string]$TrustedCodexCommand
+) {
+    $previousFullAccess = [Environment]::GetEnvironmentVariable('SCULK_ALLOW_CODEX_FULL', 'Process')
+    $previousTrustedCommand = [Environment]::GetEnvironmentVariable('SCULK_CODEX_TRUSTED_COMMAND', 'Process')
+    $previousCloudDisabled = [Environment]::GetEnvironmentVariable('SCULK_DISABLE_CLOUD', 'Process')
+    $cloudEnvironment = @{}
+    foreach ($entry in Get-ChildItem Env:) {
+        if ($entry.Name -match '^(?:DATABASE_URL|REDIS_URL|SCULK_MASTER_KEY|SCULK_ALLOWED_ORIGINS|SCULK_CLOUD_|SCULK_POSTGRES_|SCULK_REDIS_)') {
+            $cloudEnvironment[$entry.Name] = $entry.Value
+            [Environment]::SetEnvironmentVariable($entry.Name, $null, 'Process')
+        }
+    }
+    try {
+        # Do not inherit an accidental opt-in from the shell running this script.
+        [Environment]::SetEnvironmentVariable('SCULK_ALLOW_CODEX_FULL', $null, 'Process')
+        [Environment]::SetEnvironmentVariable('SCULK_CODEX_TRUSTED_COMMAND', $null, 'Process')
+        [Environment]::SetEnvironmentVariable('SCULK_DISABLE_CLOUD', 'true', 'Process')
+        if ($EnableFullAccess) {
+            [Environment]::SetEnvironmentVariable('SCULK_ALLOW_CODEX_FULL', 'true', 'Process')
+            [Environment]::SetEnvironmentVariable('SCULK_CODEX_TRUSTED_COMMAND', $TrustedCodexCommand, 'Process')
+        }
+        return Start-Process -FilePath $FilePath `
+            -WorkingDirectory $WorkingDirectory `
+            -RedirectStandardOutput $StandardOutput `
+            -RedirectStandardError $StandardError `
+            -WindowStyle Hidden `
+            -PassThru
+    } finally {
+        [Environment]::SetEnvironmentVariable('SCULK_ALLOW_CODEX_FULL', $previousFullAccess, 'Process')
+        [Environment]::SetEnvironmentVariable('SCULK_CODEX_TRUSTED_COMMAND', $previousTrustedCommand, 'Process')
+        [Environment]::SetEnvironmentVariable('SCULK_DISABLE_CLOUD', $previousCloudDisabled, 'Process')
+        foreach ($name in $cloudEnvironment.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $cloudEnvironment[$name], 'Process')
+        }
+    }
+}
+
+$trustedCodexCommand = Resolve-CodexFullAccessCommand ([bool]$EnableCodexFullAccess) $CodexCommand
 
 if (-not (Test-Path -LiteralPath $backend)) {
     throw 'Rust release backend is not built.'
@@ -88,14 +177,17 @@ if (-not $backendPid) {
         [EnvironmentVariableTarget]::Process
     )
 
-    $backendProcess = Start-Process -FilePath $backend `
+    $backendProcess = Start-BackendWithCodexAccess `
+        -FilePath $backend `
         -WorkingDirectory $backendDir `
-        -RedirectStandardOutput (Join-Path $runtime 'backend.log') `
-        -RedirectStandardError (Join-Path $runtime 'backend.err.log') `
-        -WindowStyle Hidden `
-        -PassThru
+        -StandardOutput (Join-Path $runtime 'backend.log') `
+        -StandardError (Join-Path $runtime 'backend.err.log') `
+        -EnableFullAccess ([bool]$EnableCodexFullAccess) `
+        -TrustedCodexCommand $trustedCodexCommand
     $backendPid = $backendProcess.Id
     Set-Content -LiteralPath $pidFile -Value $backendPid -Encoding ASCII
+} elseif ($EnableCodexFullAccess) {
+    throw 'Codex full access only applies when starting a new backend. Stop the existing local backend and run this command again.'
 }
 
 $ready = $false

@@ -447,7 +447,9 @@ POST /api/chat/stream 请求可包含：
 | 替我审核 auto | 自动运行 | AI 自动批准 | 等待批准 | 中风险记为 ai |
 | 完全访问 full | 自动运行 | 自动运行 | 自动运行 | 自动执行记为 auto |
 
-审核模式全局持久化，也会影响 ACP Agent 收到权限请求时的自动应答。full 模式会在 UI 中显示高风险提示。
+审核模式全局持久化，只影响本项目受管自动化任务的审批流。外部 ACP Agent 的权限请求始终拒绝，不能由审核模式隐式授予能力。full 模式会在 UI 中显示高风险提示。
+
+原生 Codex CLI 复用当前对话的 Agent 选择与 SSE 流程，但权限单独受控：`approval` 与 `auto` 固定使用只读沙盒；`full` 只有在后端仅监听回环地址、启动环境设置 `SCULK_ALLOW_CODEX_FULL=true`，并通过 `SCULK_CODEX_TRUSTED_COMMAND` 指定与当前 Agent 命令一致的绝对 Codex 可执行文件时才会启用。完整权限使用 `--ask-for-approval never` 与 `--sandbox danger-full-access`，不会使用全局 bypass 标志；它以运行后端的本机账户访问宿主机，当前项目或服务器目录只作为初始工作目录。完全访问模式下仅允许受信任的原生 Codex CLI，其他外部 Agent 会被拒绝执行。
 
 ### 7.3 当前执行边界
 
@@ -747,10 +749,9 @@ AI 设置可通过 ACP（Agent Client Protocol）接入外部命令：
 6. 转换为主工作台 SSE delta。
 7. 结束后清理 Agent 进程。
 
-权限行为：
+ACP 权限行为：
 
-- approval 模式拒绝 Agent 的权限选项。
-- auto/full 模式选择 Agent 提供的 allow 选项。
+- 所有审核模式都拒绝 ACP Agent 请求的权限选项。
 - 文件读写等未支持的反向请求一律拒绝。
 - Agent 启动或握手失败时回退到内置模型，再回退到本地规则。
 
@@ -1123,7 +1124,7 @@ npm run build
 
 ### 17.2 本地生产构建
 
-scripts/start-local.ps1 使用 backend/target-cloud/release/backend.exe 和 frontend/dist，默认端口 8787，并设置：
+scripts/start-local.ps1 使用 backend/target-local/release/backend.exe 和 frontend/dist，默认端口 8787，并设置：
 
 ~~~text
 SCULK_BIND_ADDRESS=127.0.0.1:8787
@@ -1133,6 +1134,16 @@ SCULK_STATE_FILE=backend/data/state.json
 ~~~
 
 脚本会等待 /api/dashboard 就绪，并以隐藏窗口运行后端。
+
+默认启动会清除子进程继承的 `SCULK_ALLOW_CODEX_FULL` 和 `SCULK_CODEX_TRUSTED_COMMAND`，保持 Codex 只读沙盒。需要将本地回环服务作为 Codex WebUI 并明确授予完整权限时，先停止正在运行的后端，然后指定与原生 Codex CLI Agent 命令相同的绝对路径：
+
+~~~powershell
+.\scripts\stop-local.ps1
+$codexCommand = (Get-Command codex.cmd -CommandType Application).Path
+.\scripts\start-local.ps1 -EnableCodexFullAccess -CodexCommand $codexCommand
+~~~
+
+`-CodexCommand` 必须是存在的 `.exe`、`.cmd` 或 `.bat` 文件；npm 安装的 Windows Codex 应使用 `codex.cmd` 而非 PowerShell shim `codex.ps1`。该参数只配置新启动的后端，不会改变已经运行的进程。即使脚本已启用，后端仍要求回环监听、当前 Agent 命令与该路径 canonical 后完全一致，并且对话选择 `full` 审核模式；完整权限以运行后端的宿主机账户执行，项目/服务器目录仅作为初始工作目录。
 
 Linux 使用 `scripts/start-local.sh` 和 `scripts/stop-local.sh`。停止脚本向后端发送 SIGTERM，后端停止接受新启动任务并并行安全停服；超时才强制退出。生产部署模板 `deploy/sculk-catalyst.service` 使用 `KillMode=mixed`，先让主进程处理安全停服，再由 systemd/cgroup 清理超时后的剩余进程。
 
@@ -1158,7 +1169,7 @@ SCULK_CLOUD_RATE_LIMIT=60
 SCULK_STATE_FILE=data/state-cloud.json
 ~~~
 
-Windows 原生 scripts/start-cloud.ps1 是另一条运行链路：PostgreSQL 使用 127.0.0.1:55432，Redis 使用 127.0.0.1:56379，后端使用 127.0.0.1:8788 和 target-cloud/debug/backend.exe。不要混用 Docker 配置中的端口与原生脚本配置。
+Windows 原生 scripts/start-cloud.ps1 是另一条运行链路：PostgreSQL 使用 127.0.0.1:55432，Redis 使用 127.0.0.1:56379，后端使用 127.0.0.1:8788 和 target-cloud/debug/backend.exe。不要混用 Docker 配置中的端口与原生脚本配置。它也支持 `-EnableCodexFullAccess -CodexCommand $codexCommand`，具有与本地生产脚本相同的显式授权、路径校验和重启要求。
 
 ### 17.4 独立资源中心
 
@@ -1197,6 +1208,8 @@ SCULK_CATALOG_ADMIN_BASIC_AUTH=账号:密码的 Base64 编码
 | SCULK_DATA_DIR | 状态、服务器工作区和托管 Java 的统一数据根目录 |
 | SCULK_STATE_FILE | 本地状态文件路径 |
 | SCULK_ALLOWED_ORIGINS | 允许的额外 CORS 来源 |
+| SCULK_ALLOW_CODEX_FULL | 设为 true 时允许回环监听的后端启用 Codex 完整权限 |
+| SCULK_CODEX_TRUSTED_COMMAND | 启用 Codex 完整权限时必须指定的绝对 Codex 可执行文件路径 |
 | SCULK_JAVA_BIN | 指定 Java 可执行文件 |
 | SCULK_CATALOG_ADMIN_TOKEN | 资源目录写操作令牌 |
 | SCULK_CATALOG_ADMIN_USERNAME | 浏览器管理账号 |

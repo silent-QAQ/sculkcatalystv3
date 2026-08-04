@@ -203,7 +203,7 @@ flowchart LR
 - Agent CRUD、启停、握手测试（`initialize` 往返，返回协议版本与延迟）。
 - 可将任一 Agent 设为默认对话 Agent；对话栏将 Agent、模型与审核模式拆为独立快捷选择器，选择按对话持久化；ACP Agent 启用时隐藏不生效的直连模型选择。
 - Agent 对话走 `session/new` + `session/prompt`，`session/update` 的 `agent_message_chunk` 转为 SSE delta 流式转发。
-- Agent 发来的 `session/request_permission` 按审核模式自动应答：替我审核/完全访问选择放行选项，请求批准模式拒绝；文件读写等其他反向请求一律拒绝（当前不授予 Agent 工作区权限）。
+- Agent 发来的 `session/request_permission` 在所有审核模式下均明确取消；文件读写等其他反向请求一律拒绝（当前不授予 Agent 工作区权限）。
 - Agent 启动失败或握手失败时自动回退内置模型直连 → 本地规则，链路不中断。
 
 ## 5. 后端 API 概览

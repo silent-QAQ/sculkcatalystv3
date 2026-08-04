@@ -1,0 +1,4 @@
+interface:
+  display_name: "Minecraft Server Analysis"
+  short_description: "Analyze Minecraft servers and plugin ecosystems"
+  default_prompt: "Use $manage-minecraft-server to analyze my Minecraft server and plugin ecosystem read-only, then prepare evidence-based recommendations for a separate execution role."

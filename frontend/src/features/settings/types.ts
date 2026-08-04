@@ -67,6 +67,8 @@ export interface AiSettingsView {
   scenarios: Record<string, ModelBinding>
   default_binding?: ModelBinding | null
   review_mode: ReviewMode
+  codex_full_access_available: boolean
+  codex_full_access_ready_agent_ids: string[]
   agents: AiAgent[]
   active_agent?: string | null
   reasoning_effort?: ReasoningEffort | null
@@ -95,7 +97,7 @@ export const SCENARIOS: { key: string; label: string; hint: string }[] = [
 export const REVIEW_MODES: { key: ReviewMode; label: string; hint: string }[] = [
   { key: 'approval', label: '请求批准', hint: '中高风险任务都需要你人工批准后才会执行' },
   { key: 'auto', label: '替我审核', hint: 'AI 自动批准中风险任务，高风险仍需你确认' },
-  { key: 'full', label: '完全访问权限', hint: '所有任务自动执行，不做审批拦截' },
+  { key: 'full', label: '完全访问权限', hint: 'Sculk 任务不再等待审批；Codex 完整权限需在本机启动时显式授权' },
 ]
 
 export const REASONING_EFFORTS: { key: ReasoningEffort; label: string; hint: string }[] = [
@@ -108,7 +110,7 @@ export const REASONING_EFFORTS: { key: ReasoningEffort; label: string; hint: str
 ]
 
 export const AGENT_KINDS: { key: string; label: string; commandHint: string }[] = [
-  { key: 'codex', label: 'Codex CLI', commandHint: '原生 CLI 通常填写 codex；如使用 ACP，请填写对应适配器命令与参数' },
+  { key: 'codex', label: 'Codex CLI', commandHint: '原生 CLI 优先使用检测到的绝对路径；完整权限必须与启动时授权的 Codex 路径一致' },
   { key: 'claude-code', label: 'Claude Code CLI', commandHint: '原生 CLI 通常填写 claude；如使用 ACP，请填写对应适配器命令与参数' },
   { key: 'openclaw', label: 'OpenClaw', commandHint: 'openclaw（以 ACP stdio 模式启动的命令）' },
   { key: 'hermes', label: 'Hermes', commandHint: 'hermes（以 ACP stdio 模式启动的命令）' },

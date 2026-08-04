@@ -20,6 +20,7 @@ import {
   Trash2,
 } from 'lucide-vue-next'
 import type { ConversationAction, ConversationSummary } from '../features/conversations/types'
+import type { AiAgent } from '../features/settings/types'
 
 interface ServerItem {
   id: string
@@ -41,6 +42,7 @@ const props = defineProps<{
   servers: ServerItem[]
   mode: 'server' | 'project'
   conversations: Record<string, ConversationSummary[]>
+  agents: AiAgent[]
   selectedServerId: string
   selectedConversationId: string
   runningConversationIds: string[]
@@ -91,7 +93,9 @@ function serverSubtitle(server: ServerItem) {
 }
 
 function conversationRuntime(conversation: ConversationSummary) {
-  if (conversation.agent_override && conversation.agent_override !== 'default') return 'ACP Agent'
+  if (conversation.agent_override && conversation.agent_override !== 'default') {
+    return props.agents.find(agent => agent.id === conversation.agent_override)?.name ?? '外部 Agent'
+  }
   if (conversation.model_binding) return conversation.model_binding.model_id
   return '自动模型'
 }

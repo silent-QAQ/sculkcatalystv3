@@ -16,15 +16,20 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     convert::Infallible,
+    fs,
     io::Read,
     path::{Path as FsPath, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::Command,
-    sync::mpsc,
+    process::{Child, Command},
+    sync::{mpsc, watch},
 };
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use url::Url;
@@ -50,6 +55,34 @@ const CHAT_HISTORY_TURN_LIMIT: usize = crate::conversations::MAX_MESSAGES;
 const ACP_MAX_TEXT_FILE_BYTES: u64 = 2_000_000;
 const MAX_ASR_AUDIO_BYTES: usize = 25 * 1024 * 1024;
 const SPEECH_RECOGNITION_MODES: [&str; 2] = ["browser", "model"];
+const CLI_MAX_TOTAL_OUTPUT_BYTES: usize = 1024 * 1024;
+const CLI_MAX_VISIBLE_OUTPUT_BYTES: usize = CLI_MAX_TOTAL_OUTPUT_BYTES;
+const CLI_MAX_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
+const CLI_OUTPUT_READ_CHUNK_BYTES: usize = 8 * 1024;
+const CLI_MAX_REDACTION_SECRET_BYTES: usize = 4 * 1024;
+const CODEX_FULL_ACCESS_ENV: &str = "SCULK_ALLOW_CODEX_FULL";
+const CODEX_TRUSTED_COMMAND_ENV: &str = "SCULK_CODEX_TRUSTED_COMMAND";
+const CLI_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+];
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct AiProvider {
@@ -204,6 +237,8 @@ struct AiSettingsView {
     scenarios: HashMap<String, ModelBinding>,
     default_binding: Option<ModelBinding>,
     review_mode: String,
+    codex_full_access_available: bool,
+    codex_full_access_ready_agent_ids: Vec<String>,
     agents: Vec<AiAgent>,
     active_agent: Option<String>,
     reasoning_effort: Option<String>,
@@ -214,11 +249,28 @@ struct AiSettingsView {
 
 impl AiSettingsView {
     fn new(settings: &AiSettings, detected_agents: Vec<crate::cli_tools::DetectedAgent>) -> Self {
+        let codex_full_access_available = codex_full_access_allowed();
+        let codex_full_access_ready_agent_ids = if codex_full_access_available {
+            settings
+                .agents
+                .iter()
+                .filter(|agent| {
+                    agent.kind == "codex"
+                        && agent.transport == "cli"
+                        && codex_command_is_trusted(&agent.command)
+                })
+                .map(|agent| agent.id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             providers: settings.providers.iter().map(Into::into).collect(),
             scenarios: settings.scenarios.clone(),
             default_binding: settings.default_binding.clone(),
             review_mode: settings.review_mode.clone(),
+            codex_full_access_available,
+            codex_full_access_ready_agent_ids,
             agents: settings.agents.clone(),
             active_agent: settings.active_agent.clone(),
             reasoning_effort: settings.reasoning_effort.clone(),
@@ -1211,6 +1263,12 @@ fn validate_agent_request(
             "原生 CLI 传输仅支持 codex 与 claude-code".into(),
         ))?;
         validate_effort(request.reasoning_effort.as_deref(), efforts)?;
+        if request.kind == "codex" && !request.args.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "原生 Codex CLI 参数由受控运行时管理，不能自定义".into(),
+            ));
+        }
     } else if request.reasoning_effort.is_some() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1384,6 +1442,7 @@ enum StreamOutcome {
     Completed,
     FailedBeforeOutput(String),
     FailedMidway(String),
+    PolicyDenied(String),
     ClientGone,
 }
 
@@ -1690,6 +1749,7 @@ async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::
         settings,
         server_context,
         workspace_directory,
+        workspace_kind,
         language,
         persona,
         is_planning,
@@ -1705,6 +1765,7 @@ async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::
         let is_planning = server.map(|s| s.status == "planning").unwrap_or(false);
         let workspace_directory =
             server.map(|server| workspace_directory(&server.id, &server.kind));
+        let workspace_kind = server.map(|server| server.kind.clone());
         let latest_task = latest_task_for_chat(
             &data,
             &request.server_id,
@@ -1716,6 +1777,7 @@ async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::
             data.ai.clone(),
             context,
             workspace_directory,
+            workspace_kind,
             crate::prefs::language_directive(&data.ui.language).to_string(),
             crate::prefs::persona_directive(&data.ui.personalization),
             is_planning,
@@ -1847,6 +1909,10 @@ async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::
     };
 
     if !handled && let Some(agent) = agent_choice {
+        if let Err(reason) = validate_full_access_agent(&agent, &settings.review_mode) {
+            let _ = send_event(&tx, "error", &json!({ "message": reason })).await;
+            return;
+        }
         let agent_effort = request
             .reasoning_effort
             .as_deref()
@@ -1869,8 +1935,11 @@ async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::
             stream_cli_agent(
                 &agent,
                 agent_effort,
+                &settings.review_mode,
+                codex_full_access_allowed(),
                 &request,
                 workspace_directory.as_ref(),
+                workspace_kind.as_deref(),
                 &server_context,
                 &language,
                 &persona,
@@ -1916,12 +1985,25 @@ async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::
                 }
             }
             StreamOutcome::FailedBeforeOutput(reason) => {
-                eprintln!("[ai] Agent {} 调用失败，回退内置模型：{reason}", agent.name);
+                // 外部 Agent 已被选中时，不能悄悄切换到内置模型，更不能继续
+                // 进入后续任务推断路径；回复显示的执行者必须与实际执行者一致。
+                eprintln!("[ai] Agent {} 调用失败：{reason}", agent.name);
+                let _ = send_event(
+                    &tx,
+                    "error",
+                    &json!({ "message": format!("{} 调用失败：{reason}", agent.name) }),
+                )
+                .await;
+                return;
             }
             StreamOutcome::FailedMidway(reason) => {
                 let _ = send_event(&tx, "error", &json!({ "message": reason })).await;
                 handled = true;
                 fallback = false;
+            }
+            StreamOutcome::PolicyDenied(reason) => {
+                let _ = send_event(&tx, "error", &json!({ "message": reason })).await;
+                return;
             }
             StreamOutcome::ClientGone => return,
         }
@@ -1962,6 +2044,10 @@ async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::
             }
             StreamOutcome::FailedMidway(reason) => {
                 let _ = send_event(&tx, "error", &json!({ "message": reason })).await;
+            }
+            StreamOutcome::PolicyDenied(reason) => {
+                let _ = send_event(&tx, "error", &json!({ "message": reason })).await;
+                return;
             }
             StreamOutcome::ClientGone => return,
         }
@@ -2232,25 +2318,148 @@ async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::
     let _ = send_event(&tx, "done", &done).await;
 }
 
-/// 通过 ACP 协议驱动外部 Agent 完成一轮对话。
-/// 权限请求按审核模式自动应答：full/auto 选择放行选项，approval 拒绝（工具型操作需在自动化面板批准）。
+/// 原生 CLI 复用现有对话链路。Codex 的权限由已持久化的审核档位决定，
+/// 而不是由前端或 Agent 配置中的任意参数决定。
 struct CliInvocation {
     args: Vec<String>,
+    codex_full_access: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodexPermissionProfile {
+    ReadOnly,
+    FullAccess,
+}
+
+fn codex_full_access_allowed() -> bool {
+    environment_opt_in(CODEX_FULL_ACCESS_ENV)
+        && backend_listens_on_loopback()
+        && trusted_codex_command().is_some()
+}
+
+fn environment_opt_in(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|value| parse_opt_in_value(&value))
+}
+
+fn parse_opt_in_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn backend_listens_on_loopback() -> bool {
+    let bind_address =
+        std::env::var("SCULK_BIND_ADDRESS").unwrap_or_else(|_| "127.0.0.1:8787".into());
+    let bind_address = bind_address.trim();
+    if bind_address.starts_with("localhost:") {
+        return true;
+    }
+    bind_address
+        .parse::<std::net::SocketAddr>()
+        .map(|address| address.ip().is_loopback())
+        .unwrap_or(false)
+}
+
+fn trusted_codex_command() -> Option<PathBuf> {
+    let configured = std::env::var_os(CODEX_TRUSTED_COMMAND_ENV)?;
+    let path = PathBuf::from(configured);
+    if !path.is_absolute() {
+        return None;
+    }
+    let canonical = fs::canonicalize(path).ok()?;
+    canonical.is_file().then_some(canonical)
+}
+
+fn codex_command_is_trusted(command: &str) -> bool {
+    let Some(trusted) = trusted_codex_command() else {
+        return false;
+    };
+    let configured = PathBuf::from(command);
+    configured.is_absolute() && fs::canonicalize(configured).ok().as_ref() == Some(&trusted)
+}
+
+fn codex_full_access_requirement_message() -> String {
+    "Codex 完全访问已拒绝。仅可在回环监听下设置 SCULK_ALLOW_CODEX_FULL=true，且将 SCULK_CODEX_TRUSTED_COMMAND 设置为已存在的绝对 Codex 可执行路径后重启后端。".into()
+}
+
+fn codex_permission_profile(
+    review_mode: &str,
+    full_access_allowed: bool,
+) -> Result<CodexPermissionProfile, String> {
+    match review_mode {
+        // The HTTP SSE contract has no command-approval round trip. Until that exists,
+        // neither approval nor auto can safely turn into a writable Codex session.
+        "approval" | "auto" => Ok(CodexPermissionProfile::ReadOnly),
+        "full" if full_access_allowed => Ok(CodexPermissionProfile::FullAccess),
+        "full" => Err(codex_full_access_requirement_message()),
+        _ => Err("无效的 Codex 审核模式".into()),
+    }
+}
+
+fn validate_full_access_agent(agent: &AiAgent, review_mode: &str) -> Result<(), String> {
+    if review_mode != "full" || (agent.kind == "codex" && agent.transport == "cli") {
+        return Ok(());
+    }
+    Err(
+        "完全访问仅支持原生 Codex CLI。请在当前对话中选择 Codex CLI，或切回请求批准/替我审核模式。"
+            .into(),
+    )
 }
 
 fn cli_invocation(
     agent: &AiAgent,
     reasoning_effort: Option<&str>,
+    review_mode: &str,
+    full_access_allowed: bool,
 ) -> Result<CliInvocation, String> {
-    let mut args = agent.args.clone();
+    let mut args = if agent.kind == "codex" {
+        if !agent.args.is_empty() {
+            return Err("原生 Codex CLI 参数由受控运行时管理，不能自定义".into());
+        }
+        Vec::new()
+    } else {
+        agent.args.clone()
+    };
     match agent.kind.as_str() {
         "codex" => {
+            let profile = codex_permission_profile(review_mode, full_access_allowed)?;
+            args.extend([
+                "--ask-for-approval".into(),
+                match profile {
+                    CodexPermissionProfile::ReadOnly => "never",
+                    CodexPermissionProfile::FullAccess => "never",
+                }
+                .into(),
+            ]);
+            if profile == CodexPermissionProfile::FullAccess {
+                args.push("--search".into());
+            }
             args.push("exec".into());
             if let Some(effort) = reasoning_effort {
                 validate_effort(Some(effort), CODEX_EFFORTS).map_err(|(_, error)| error)?;
-                args.extend(["-c".into(), format!("model_reasoning_effort=\"{effort}\"")]);
+                args.extend(["-c".into(), format!("model_reasoning_effort='{effort}'")]);
+            }
+            args.extend([
+                "--sandbox".into(),
+                match profile {
+                    CodexPermissionProfile::ReadOnly => "read-only",
+                    CodexPermissionProfile::FullAccess => "danger-full-access",
+                }
+                .into(),
+            ]);
+            args.push("--skip-git-repo-check".into());
+            args.push("--ephemeral".into());
+            if profile == CodexPermissionProfile::ReadOnly {
+                args.extend(["--ignore-user-config".into(), "--ignore-rules".into()]);
             }
             args.extend(["--color".into(), "never".into(), "-".into()]);
+            return Ok(CliInvocation {
+                args,
+                codex_full_access: profile == CodexPermissionProfile::FullAccess,
+            });
         }
         "claude-code" => {
             args.extend(["-p".into(), "--output-format".into(), "text".into()]);
@@ -2261,7 +2470,10 @@ fn cli_invocation(
         }
         _ => return Err("该 Agent 类型没有原生 CLI 调用契约".into()),
     }
-    Ok(CliInvocation { args })
+    Ok(CliInvocation {
+        args,
+        codex_full_access: false,
+    })
 }
 
 fn build_cli_prompt(
@@ -2314,23 +2526,228 @@ fn build_cli_prompt(
 enum CliOutputRead {
     Eof,
     ClientGone,
+    OutputLimit,
     TimedOut(String),
     Failed(String),
+}
+
+struct CliOutputBudget {
+    limit: usize,
+    consumed: AtomicUsize,
+}
+
+impl CliOutputBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            consumed: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_consume(&self, bytes: usize) -> bool {
+        let mut current = self.consumed.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return false;
+            };
+            if next > self.limit {
+                return false;
+            }
+            match self.consumed.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+struct CliOutputRedactor {
+    secrets: Vec<String>,
+    utf8_tail: Vec<u8>,
+    text_tail: String,
+    tail_chars: usize,
+}
+
+impl CliOutputRedactor {
+    fn new(secrets: &[String]) -> Self {
+        let secrets = normalized_cli_redaction_secrets(secrets.iter().cloned());
+        let tail_chars = secrets
+            .iter()
+            .map(|secret| secret.chars().count().saturating_sub(1))
+            .max()
+            .unwrap_or_default();
+        Self {
+            secrets,
+            utf8_tail: Vec::new(),
+            text_tail: String::new(),
+            tail_chars,
+        }
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) -> String {
+        let text = self.decode_utf8(bytes, false);
+        self.push_text(&text)
+    }
+
+    fn finish(&mut self) -> String {
+        let text = self.decode_utf8(&[], true);
+        let mut output = self.push_text(&text);
+        output.push_str(&self.flush_text_tail());
+        output
+    }
+
+    fn decode_utf8(&mut self, bytes: &[u8], finish: bool) -> String {
+        let mut input = std::mem::take(&mut self.utf8_tail);
+        input.extend_from_slice(bytes);
+
+        let mut output = String::new();
+        let mut offset = 0;
+        loop {
+            match std::str::from_utf8(&input[offset..]) {
+                Ok(valid) => {
+                    output.push_str(valid);
+                    break;
+                }
+                Err(error) => {
+                    let valid_bytes = error.valid_up_to();
+                    if valid_bytes > 0 {
+                        let valid = std::str::from_utf8(&input[offset..offset + valid_bytes])
+                            .expect("UTF-8 valid prefix");
+                        output.push_str(valid);
+                        offset += valid_bytes;
+                    }
+                    match error.error_len() {
+                        Some(invalid_bytes) => {
+                            output.push('\u{fffd}');
+                            offset += invalid_bytes;
+                        }
+                        None if finish => {
+                            output.push_str(&String::from_utf8_lossy(&input[offset..]));
+                            break;
+                        }
+                        None => {
+                            self.utf8_tail.extend_from_slice(&input[offset..]);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        output
+    }
+
+    fn push_text(&mut self, text: &str) -> String {
+        self.text_tail.push_str(text);
+        let safe_end = prefix_before_last_chars(&self.text_tail, self.tail_chars);
+        self.drain_text_tail(safe_end)
+    }
+
+    fn flush_text_tail(&mut self) -> String {
+        let safe_end = self.text_tail.len();
+        self.drain_text_tail(safe_end)
+    }
+
+    fn drain_text_tail(&mut self, safe_end: usize) -> String {
+        let text = std::mem::take(&mut self.text_tail);
+        let mut output = String::new();
+        let mut cursor = 0;
+        while cursor < safe_end {
+            if let Some(secret) = self
+                .secrets
+                .iter()
+                .find(|secret| text[cursor..].starts_with(secret.as_str()))
+            {
+                output.push_str("[REDACTED]");
+                cursor += secret.len();
+            } else {
+                let character = text[cursor..]
+                    .chars()
+                    .next()
+                    .expect("cursor remains at a UTF-8 character boundary");
+                output.push(character);
+                cursor += character.len_utf8();
+            }
+        }
+        self.text_tail = text[cursor..].to_string();
+        output
+    }
+}
+
+#[derive(Default)]
+struct CliStderrRead {
+    output: Vec<u8>,
+    output_limit_exceeded: bool,
+}
+
+enum CliExitWait {
+    Exited(ExitStatus),
+    OutputLimit,
+    Failed(String),
+    TimedOut,
+}
+
+fn prefix_before_last_chars(text: &str, chars_to_keep: usize) -> usize {
+    if chars_to_keep == 0 {
+        return text.len();
+    }
+    text.char_indices()
+        .rev()
+        .nth(chars_to_keep.saturating_sub(1))
+        .map(|(index, _)| index)
+        .unwrap_or_default()
+}
+
+fn append_cli_output(full_reply: &mut String, piece: &str) -> bool {
+    if full_reply.len().saturating_add(piece.len()) > CLI_MAX_VISIBLE_OUTPUT_BYTES {
+        return false;
+    }
+    full_reply.push_str(piece);
+    true
+}
+
+fn cli_output_limit_message() -> String {
+    format!(
+        "CLI 输出超过 {} MiB 上限，已终止",
+        CLI_MAX_TOTAL_OUTPUT_BYTES / 1024 / 1024
+    )
 }
 
 async fn read_cli_output<R: AsyncRead + Unpin>(
     reader: R,
     tx: &mpsc::Sender<Event>,
     full_reply: &mut String,
+    secrets: &[String],
+    output_budget: Arc<CliOutputBudget>,
+    mut output_limit: watch::Receiver<bool>,
     idle_timeout: Duration,
 ) -> CliOutputRead {
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::with_capacity(CLI_OUTPUT_READ_CHUNK_BYTES, reader);
+    let mut redactor = CliOutputRedactor::new(secrets);
+    let mut output_limit_open = true;
     loop {
+        if *output_limit.borrow() {
+            return CliOutputRead::OutputLimit;
+        }
         let next = tokio::select! {
             _ = tx.closed() => return CliOutputRead::ClientGone,
-            result = tokio::time::timeout(idle_timeout, lines.next_line()) => result,
+            changed = output_limit.changed(), if output_limit_open => {
+                match changed {
+                    Ok(()) if *output_limit.borrow() => return CliOutputRead::OutputLimit,
+                    Ok(()) => continue,
+                    Err(_) => {
+                        output_limit_open = false;
+                        continue;
+                    }
+                }
+            }
+            result = tokio::time::timeout(idle_timeout, reader.fill_buf()) => result,
         };
-        let line = match next {
+        let (consumed, piece, eof) = match next {
             Err(_) => {
                 return CliOutputRead::TimedOut(format!(
                     "CLI 连续 {} 秒没有输出，已终止",
@@ -2338,35 +2755,176 @@ async fn read_cli_output<R: AsyncRead + Unpin>(
                 ));
             }
             Ok(Err(error)) => return CliOutputRead::Failed(error.to_string()),
-            Ok(Ok(None)) => return CliOutputRead::Eof,
-            Ok(Ok(Some(line))) => line,
+            Ok(Ok(bytes)) if bytes.is_empty() => (0, redactor.finish(), true),
+            Ok(Ok(bytes)) => {
+                if !output_budget.try_consume(bytes.len()) {
+                    return CliOutputRead::OutputLimit;
+                }
+                (bytes.len(), redactor.push_bytes(bytes), false)
+            }
         };
-        let piece = if full_reply.is_empty() {
-            line
-        } else {
-            format!("\n{line}")
-        };
-        full_reply.push_str(&piece);
-        if send_event(tx, "delta", &json!({ "content": piece }))
-            .await
-            .is_err()
-        {
-            return CliOutputRead::ClientGone;
+        if consumed > 0 {
+            reader.consume(consumed);
+        }
+        if !piece.is_empty() {
+            if !append_cli_output(full_reply, &piece) {
+                return CliOutputRead::OutputLimit;
+            }
+            if send_event(tx, "delta", &json!({ "content": piece }))
+                .await
+                .is_err()
+            {
+                return CliOutputRead::ClientGone;
+            }
+        }
+        if eof {
+            return CliOutputRead::Eof;
         }
     }
 }
 
-async fn read_limited<R: AsyncRead + Unpin>(mut reader: R, limit: usize) -> Vec<u8> {
-    let mut output = Vec::new();
-    let mut buffer = [0u8; 4096];
-    while output.len() < limit {
-        let remaining = (limit - output.len()).min(buffer.len());
-        match reader.read(&mut buffer[..remaining]).await {
-            Ok(0) | Err(_) => break,
-            Ok(read) => output.extend_from_slice(&buffer[..read]),
+async fn read_cli_last_message_file(
+    child: &mut Child,
+    path: &FsPath,
+    tx: &mpsc::Sender<Event>,
+    full_reply: &mut String,
+    secrets: &[String],
+    output_budget: Arc<CliOutputBudget>,
+    output_limit: &mut watch::Receiver<bool>,
+) -> CliOutputRead {
+    let mut previous_length = None;
+    let mut exited_at = None;
+    loop {
+        if *output_limit.borrow() {
+            return CliOutputRead::OutputLimit;
+        }
+
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return CliOutputRead::Failed("Codex CLI 输出文件不是普通文件".into());
+            }
+            Ok(_) => match tokio::fs::read(path).await {
+                Ok(bytes) if bytes.is_empty() => {
+                    previous_length = Some(0);
+                }
+                Ok(bytes) if previous_length == Some(bytes.len()) => {
+                    if !output_budget.try_consume(bytes.len()) {
+                        return CliOutputRead::OutputLimit;
+                    }
+                    let mut redactor = CliOutputRedactor::new(secrets);
+                    let mut text = redactor.push_bytes(&bytes);
+                    text.push_str(&redactor.finish());
+                    if text.is_empty() {
+                        return CliOutputRead::Failed("Codex CLI 未返回文本".into());
+                    }
+                    for chunk in text.chars().collect::<Vec<_>>().chunks(2_048) {
+                        let chunk = chunk.iter().collect::<String>();
+                        if !append_cli_output(full_reply, &chunk) {
+                            return CliOutputRead::OutputLimit;
+                        }
+                        if send_event(tx, "delta", &json!({ "content": chunk }))
+                            .await
+                            .is_err()
+                        {
+                            return CliOutputRead::ClientGone;
+                        }
+                    }
+                    return CliOutputRead::Eof;
+                }
+                Ok(bytes) => {
+                    previous_length = Some(bytes.len());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    previous_length = None;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+                Err(error) => return CliOutputRead::Failed(error.to_string()),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                previous_length = None;
+            }
+            Err(error) => return CliOutputRead::Failed(error.to_string()),
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let observed = exited_at.get_or_insert_with(Instant::now);
+                if observed.elapsed() >= Duration::from_secs(1) {
+                    return CliOutputRead::Failed(format!(
+                        "Codex CLI 已退出但未写入最终回复：{status}"
+                    ));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => return CliOutputRead::Failed(error.to_string()),
+        }
+
+        tokio::select! {
+            _ = tx.closed() => return CliOutputRead::ClientGone,
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
         }
     }
-    output
+}
+
+async fn read_cli_stderr<R: AsyncRead + Unpin>(
+    mut reader: R,
+    output_budget: Arc<CliOutputBudget>,
+    output_limit: watch::Sender<bool>,
+) -> CliStderrRead {
+    let mut output = Vec::new();
+    let mut buffer = [0u8; CLI_OUTPUT_READ_CHUNK_BYTES];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => {
+                return CliStderrRead {
+                    output,
+                    output_limit_exceeded: false,
+                };
+            }
+            Ok(read) => {
+                if !output_budget.try_consume(read) {
+                    let _ = output_limit.send(true);
+                    return CliStderrRead {
+                        output,
+                        output_limit_exceeded: true,
+                    };
+                }
+                let retained = (CLI_MAX_STDERR_CAPTURE_BYTES - output.len()).min(read);
+                output.extend_from_slice(&buffer[..retained]);
+            }
+        }
+    }
+}
+
+async fn wait_for_cli_exit(
+    child: &mut Child,
+    output_limit: &mut watch::Receiver<bool>,
+) -> CliExitWait {
+    if *output_limit.borrow() {
+        return CliExitWait::OutputLimit;
+    }
+
+    let timeout = tokio::time::sleep(Duration::from_secs(10));
+    tokio::pin!(timeout);
+    let wait = child.wait();
+    tokio::pin!(wait);
+    let mut output_limit_open = true;
+    loop {
+        tokio::select! {
+            result = &mut wait => match result {
+                Ok(status) => return CliExitWait::Exited(status),
+                Err(error) => return CliExitWait::Failed(error.to_string()),
+            },
+            _ = &mut timeout => return CliExitWait::TimedOut,
+            changed = output_limit.changed(), if output_limit_open => {
+                match changed {
+                    Ok(()) if *output_limit.borrow() => return CliExitWait::OutputLimit,
+                    Ok(()) => continue,
+                    Err(_) => output_limit_open = false,
+                }
+            }
+        }
+    }
 }
 
 fn redact_secrets(mut text: String, secrets: &[String]) -> String {
@@ -2376,17 +2934,81 @@ fn redact_secrets(mut text: String, secrets: &[String]) -> String {
     snippet(text.trim(), 1_000)
 }
 
-fn sanitized_cli_stderr(stderr: &[u8]) -> String {
-    let secrets = std::env::vars()
-        .filter(|(name, value)| {
-            !value.is_empty()
-                && ["KEY", "TOKEN", "SECRET", "PASSWORD"]
-                    .iter()
-                    .any(|marker| name.to_ascii_uppercase().contains(marker))
-        })
-        .map(|(_, value)| value)
+fn normalized_cli_redaction_secrets(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut secrets = values
+        .into_iter()
+        .filter(|secret| secret.len() >= 4 && secret.len() <= CLI_MAX_REDACTION_SECRET_BYTES)
         .collect::<Vec<_>>();
-    redact_secrets(String::from_utf8_lossy(stderr).into_owned(), &secrets)
+    secrets.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    secrets.dedup();
+    secrets
+}
+
+fn redact_cli_text(mut text: String, secrets: &[String]) -> String {
+    for secret in secrets.iter().filter(|secret| secret.len() >= 4) {
+        text = text.replace(secret, "[REDACTED]");
+    }
+    text
+}
+
+fn cli_redaction_secrets() -> Vec<String> {
+    normalized_cli_redaction_secrets(
+        std::env::vars()
+            .filter(|(name, value)| {
+                !value.is_empty() && is_sensitive_cli_environment_variable(name)
+            })
+            .map(|(_, value)| value),
+    )
+}
+
+fn sanitized_cli_stderr(stderr: &[u8], secrets: &[String]) -> String {
+    snippet(
+        redact_cli_text(String::from_utf8_lossy(stderr).into_owned(), secrets).trim(),
+        1_000,
+    )
+}
+
+fn is_sensitive_cli_environment_variable(name: &str) -> bool {
+    let normalized = name.to_ascii_uppercase();
+    [
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "PRIVATE",
+        "DATABASE_URL",
+        "DB_URL",
+        "REDIS_URL",
+        "CONNECTION_STRING",
+        "JWT",
+        "OAUTH",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+#[cfg(test)]
+fn is_cli_environment_variable_allowed(name: &str, codex_full_access: bool) -> bool {
+    CLI_ENV_ALLOWLIST
+        .iter()
+        .any(|allowed| name.eq_ignore_ascii_case(allowed))
+        || (codex_full_access && name.eq_ignore_ascii_case("CODEX_HOME"))
+}
+
+/// The CLI gets only process bootstrap variables. Authentication stays in the
+/// user's persisted CLI login instead of inheriting application credentials.
+fn configure_cli_environment(command: &mut Command, codex_full_access: bool) {
+    command.env_clear();
+    for name in CLI_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    if codex_full_access && let Some(value) = std::env::var_os("CODEX_HOME") {
+        command.env("CODEX_HOME", value);
+    }
 }
 
 #[cfg(windows)]
@@ -2397,11 +3019,268 @@ fn hide_cli_window(command: &mut Command) {
 #[cfg(not(windows))]
 fn hide_cli_window(_command: &mut Command) {}
 
+fn checked_cli_workspace_directory(
+    workspace_directory: Option<&PathBuf>,
+    workspace_kind: Option<&str>,
+) -> Result<PathBuf, String> {
+    let directory =
+        workspace_directory.ok_or_else(|| "CLI 工作区不存在，已拒绝启动。".to_string())?;
+    let category = match workspace_kind {
+        Some("project") => "projects",
+        Some("server") => "servers",
+        _ => return Err("CLI 工作区类型无效，已拒绝启动。".into()),
+    };
+    let root = crate::runtime::data_root().join(category);
+    let root = fs::canonicalize(&root)
+        .map_err(|_| "CLI 工作区根目录不存在或不可访问，已拒绝启动。".to_string())?;
+    let metadata = fs::symlink_metadata(directory)
+        .map_err(|_| "CLI 工作区不存在或不可访问，已拒绝启动。".to_string())?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("CLI 工作区必须是受管的真实目录，已拒绝启动。".into());
+    }
+    let directory = fs::canonicalize(directory)
+        .map_err(|_| "无法解析 CLI 工作区路径，已拒绝启动。".to_string())?;
+    if directory == root || !directory.starts_with(&root) {
+        return Err("CLI 工作区路径越出了受管工作区根目录，已拒绝启动。".into());
+    }
+    Ok(directory)
+}
+
+#[cfg(windows)]
+fn is_windows_batch_script(path: &FsPath) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+        })
+}
+
+#[cfg(windows)]
+fn is_safe_cmd_batch_path(path: &FsPath) -> bool {
+    path.to_str().is_some_and(|value| {
+        !value.chars().any(|character| {
+            matches!(
+                character,
+                '"' | '&' | '|' | '<' | '>' | '(' | ')' | '^' | '%' | '!'
+            )
+        })
+    })
+}
+
+#[cfg(windows)]
+fn is_safe_cmd_runtime_argument(argument: &str) -> bool {
+    !argument.is_empty()
+        && argument.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '=' | '.' | '\'')
+        })
+}
+
+#[cfg(windows)]
+fn windows_cmd_compatible_batch_path(path: &FsPath) -> Result<PathBuf, String> {
+    let raw = path
+        .to_str()
+        .ok_or_else(|| "Codex 批处理启动器路径不是有效的 Windows 路径".to_string())?;
+    // Windows canonical paths have a \\?\ prefix. Keep it for trust checks,
+    // but translate it before cmd.exe resolves the batch-file command.
+    let value = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(drive) = raw.strip_prefix(r"\\?\") {
+        let bytes = drive.as_bytes();
+        if bytes.len() < 3
+            || !bytes[0].is_ascii_alphabetic()
+            || bytes[1] != b':'
+            || bytes[2] != b'\\'
+        {
+            return Err("Codex 批处理启动器使用了 cmd.exe 不支持的设备路径".into());
+        }
+        drive.to_owned()
+    } else {
+        raw.to_owned()
+    };
+    let path = PathBuf::from(value);
+    if !path.is_absolute() || !is_safe_cmd_batch_path(&path) {
+        return Err("Codex 批处理启动器路径包含不受支持的命令解释符".into());
+    }
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn windows_cli_working_directory(path: &FsPath) -> Result<PathBuf, String> {
+    let raw = path
+        .to_str()
+        .ok_or_else(|| "CLI 工作目录不是有效的 Windows 路径".to_string())?;
+    // Rust canonicalize may return an extended-length path. CreateProcess can
+    // accept it, but cmd.exe and the Node wrapper used by codex.cmd cannot
+    // reliably use it as their current directory.
+    let value = if raw.starts_with(r"\\?\UNC\") {
+        // cmd.exe cannot use either extended or normal UNC paths as its
+        // current directory. It silently falls back to the Windows directory,
+        // which would make the relative Codex output file unreadable here.
+        return Err("CLI 工作目录不能位于 UNC 路径，cmd.exe 不支持该当前目录".into());
+    } else if let Some(drive) = raw.strip_prefix(r"\\?\") {
+        let bytes = drive.as_bytes();
+        if bytes.len() < 3
+            || !bytes[0].is_ascii_alphabetic()
+            || bytes[1] != b':'
+            || bytes[2] != b'\\'
+        {
+            return Err("CLI 工作目录使用了 cmd.exe 不支持的设备路径".into());
+        }
+        drive.to_owned()
+    } else {
+        raw.to_owned()
+    };
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err("CLI 工作目录必须是绝对路径".into());
+    }
+    if path.to_str().is_some_and(|value| value.starts_with(r"\\")) {
+        return Err("CLI 工作目录不能位于 UNC 路径，cmd.exe 不支持该当前目录".into());
+    }
+    Ok(path)
+}
+
+#[cfg(not(windows))]
+fn windows_cli_working_directory(path: &FsPath) -> Result<PathBuf, String> {
+    Ok(path.to_owned())
+}
+
+#[cfg(windows)]
+fn windows_batch_invocation(shim: &FsPath, args: &[String]) -> Result<String, String> {
+    let shim = windows_cmd_compatible_batch_path(shim)?;
+    if args
+        .iter()
+        .any(|argument| !is_safe_cmd_runtime_argument(argument))
+    {
+        return Err("Codex 批处理启动器参数包含不受支持的命令解释符".into());
+    }
+    Ok(format!(
+        r#" /d /s /c ""{}" {}""#,
+        shim.display(),
+        args.join(" ")
+    ))
+}
+
+/// Windows does not reliably preserve stdio semantics when CreateProcess is
+/// pointed at an npm-generated `.cmd` shim. The command string here contains
+/// only the canonical shim path and runtime-owned Codex flags; user prompts
+/// stay on stdin and are never interpreted by cmd.exe.
+fn cli_command(agent: &AiAgent, invocation: &CliInvocation) -> Result<Command, String> {
+    #[cfg(windows)]
+    {
+        let configured = PathBuf::from(&agent.command);
+        if agent.kind == "codex" && configured.is_absolute() && is_windows_batch_script(&configured)
+        {
+            let shim = fs::canonicalize(&configured)
+                .map_err(|_| "无法解析原生 Codex 批处理启动器".to_string())?;
+            if !shim.is_file() {
+                return Err("Codex 批处理启动器不是普通文件".into());
+            }
+            let command_interpreter = std::env::var_os("COMSPEC")
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "cmd.exe".into());
+            let mut command = Command::new(command_interpreter);
+            command.raw_arg(windows_batch_invocation(&shim, &invocation.args)?);
+            return Ok(command);
+        }
+    }
+    let mut command = Command::new(&agent.command);
+    command.args(&invocation.args);
+    Ok(command)
+}
+
+enum CliResponseCapture {
+    Stdout,
+    #[cfg(windows)]
+    LastMessageFile(PathBuf),
+}
+
+impl CliResponseCapture {
+    fn uses_last_message_file(&self) -> bool {
+        #[cfg(windows)]
+        if matches!(self, Self::LastMessageFile(_)) {
+            return true;
+        }
+        false
+    }
+}
+
+struct CliOutputFileCleanup(Option<PathBuf>);
+
+impl CliOutputFileCleanup {
+    fn for_capture(capture: &CliResponseCapture) -> Self {
+        #[cfg(windows)]
+        if let CliResponseCapture::LastMessageFile(path) = capture {
+            return Self(Some(path.clone()));
+        }
+        Self(None)
+    }
+}
+
+impl Drop for CliOutputFileCleanup {
+    fn drop(&mut self) {
+        let Some(path) = self.0.take() else {
+            return;
+        };
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            return;
+        };
+        if metadata.is_file() && !metadata.file_type().is_symlink() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn configure_cli_response_capture(
+    agent: &AiAgent,
+    invocation: &mut CliInvocation,
+    working_directory: &FsPath,
+) -> Result<CliResponseCapture, String> {
+    #[cfg(windows)]
+    {
+        let configured = PathBuf::from(&agent.command);
+        if agent.kind == "codex" && configured.is_absolute() && is_windows_batch_script(&configured)
+        {
+            let output_name = format!(".sculk-codex-{}.txt", Uuid::new_v4().simple());
+            let output_path = working_directory.join(&output_name);
+            if output_path.exists() {
+                return Err("无法分配 Codex CLI 输出文件".into());
+            }
+            let stdin_index = invocation
+                .args
+                .iter()
+                .rposition(|argument| argument == "-")
+                .ok_or_else(|| "Codex CLI 缺少受控标准输入参数".to_string())?;
+            invocation.args.splice(
+                stdin_index..stdin_index,
+                ["--output-last-message".into(), output_name],
+            );
+            return Ok(CliResponseCapture::LastMessageFile(output_path));
+        }
+    }
+    Ok(CliResponseCapture::Stdout)
+}
+
+async fn terminate_cli_process_tree(
+    child: &mut Child,
+    pid: u32,
+    guard: &crate::process_platform::ProcessGuard,
+) {
+    if crate::process_platform::start_kill_tree(child, pid, Some(guard)).is_err() {
+        let _ = child.start_kill();
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
+    let _ = crate::process_platform::cleanup_remaining_tree(pid, Some(guard));
+}
+
 async fn stream_cli_agent(
     agent: &AiAgent,
     reasoning_effort: Option<&str>,
+    review_mode: &str,
+    full_access_allowed: bool,
     request: &ChatStreamRequest,
     workspace_directory: Option<&PathBuf>,
+    workspace_kind: Option<&str>,
     server_context: &str,
     language: &str,
     persona: &str,
@@ -2410,9 +3289,25 @@ async fn stream_cli_agent(
     tx: &mpsc::Sender<Event>,
     full_reply: &mut String,
 ) -> StreamOutcome {
-    let invocation = match cli_invocation(agent, reasoning_effort) {
-        Ok(invocation) => invocation,
-        Err(error) => return StreamOutcome::FailedBeforeOutput(error),
+    let mut invocation =
+        match cli_invocation(agent, reasoning_effort, review_mode, full_access_allowed) {
+            Ok(invocation) => invocation,
+            Err(error) if agent.kind == "codex" => return StreamOutcome::PolicyDenied(error),
+            Err(error) => return StreamOutcome::FailedBeforeOutput(error),
+        };
+    if invocation.codex_full_access && !codex_command_is_trusted(&agent.command) {
+        return StreamOutcome::PolicyDenied(
+            "Codex 完全访问要求当前 Agent 的启动命令与 SCULK_CODEX_TRUSTED_COMMAND 指向同一个绝对可执行文件。".into(),
+        );
+    }
+    let working_directory =
+        match checked_cli_workspace_directory(workspace_directory, workspace_kind) {
+            Ok(directory) => directory,
+            Err(error) => return StreamOutcome::PolicyDenied(error),
+        };
+    let working_directory = match windows_cli_working_directory(&working_directory) {
+        Ok(directory) => directory,
+        Err(error) => return StreamOutcome::PolicyDenied(error),
     };
     let prompt = build_cli_prompt(
         request,
@@ -2422,82 +3317,181 @@ async fn stream_cli_agent(
         skill_context,
         plugin_context,
     );
-    let mut command = Command::new(&agent.command);
+    let response_capture =
+        match configure_cli_response_capture(agent, &mut invocation, &working_directory) {
+            Ok(capture) => capture,
+            Err(error) => return StreamOutcome::FailedBeforeOutput(error),
+        };
+    let _output_file_cleanup = CliOutputFileCleanup::for_capture(&response_capture);
+    let mut command = match cli_command(agent, &invocation) {
+        Ok(command) => command,
+        Err(error) => return StreamOutcome::FailedBeforeOutput(error),
+    };
     command
-        .args(&invocation.args)
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    if let Some(directory) = workspace_directory.filter(|directory| directory.is_dir()) {
-        command.current_dir(directory);
+        .kill_on_drop(false);
+    if response_capture.uses_last_message_file() {
+        command.stdout(Stdio::null());
+    } else {
+        command.stdout(Stdio::piped());
+    }
+    configure_cli_environment(&mut command, invocation.codex_full_access);
+    command.current_dir(&working_directory);
+    if crate::process_platform::configure_managed_command(&mut command).is_err() {
+        return StreamOutcome::FailedBeforeOutput("无法配置受管 CLI 进程".into());
     }
     hide_cli_window(&mut command);
+    let guard = match crate::process_platform::create_process_guard() {
+        Ok(guard) => guard,
+        Err(_) => return StreamOutcome::FailedBeforeOutput("无法初始化 CLI 进程保护".into()),
+    };
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return StreamOutcome::FailedBeforeOutput(error.to_string()),
     };
+    let pid = match child.id() {
+        Some(pid) => pid,
+        None => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return StreamOutcome::FailedBeforeOutput("无法确认 CLI 进程".into());
+        }
+    };
+    if crate::process_platform::bind_process_to_guard(&guard, pid).is_err() {
+        terminate_cli_process_tree(&mut child, pid, &guard).await;
+        return StreamOutcome::FailedBeforeOutput("无法保护 CLI 进程".into());
+    }
     let mut stdin = match child.stdin.take() {
         Some(stdin) => stdin,
-        None => return StreamOutcome::FailedBeforeOutput("CLI 标准输入不可用".into()),
+        None => {
+            terminate_cli_process_tree(&mut child, pid, &guard).await;
+            return StreamOutcome::FailedBeforeOutput("CLI 标准输入不可用".into());
+        }
     };
+    // Codex CLI 0.144 on Windows waits for a line terminator even after EOF.
+    let mut prompt = prompt;
+    prompt.push('\n');
     match tokio::time::timeout(Duration::from_secs(10), stdin.write_all(prompt.as_bytes())).await {
         Err(_) => {
-            let _ = child.kill().await;
+            terminate_cli_process_tree(&mut child, pid, &guard).await;
             return StreamOutcome::FailedBeforeOutput("写入 CLI 提示词超时".into());
         }
         Ok(Err(error)) => {
-            let _ = child.kill().await;
+            terminate_cli_process_tree(&mut child, pid, &guard).await;
             return StreamOutcome::FailedBeforeOutput(format!("写入 CLI 提示词失败：{error}"));
         }
         Ok(Ok(())) => {}
     }
     if let Err(error) = stdin.shutdown().await {
-        let _ = child.kill().await;
+        terminate_cli_process_tree(&mut child, pid, &guard).await;
         return StreamOutcome::FailedBeforeOutput(format!("关闭 CLI 标准输入失败：{error}"));
     }
-    drop(stdin);
 
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => return StreamOutcome::FailedBeforeOutput("CLI 标准输出不可用".into()),
+    let stdout = if response_capture.uses_last_message_file() {
+        None
+    } else {
+        match child.stdout.take() {
+            Some(stdout) => Some(stdout),
+            None => {
+                terminate_cli_process_tree(&mut child, pid, &guard).await;
+                return StreamOutcome::FailedBeforeOutput("CLI 标准输出不可用".into());
+            }
+        }
     };
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
-        None => return StreamOutcome::FailedBeforeOutput("CLI 标准错误不可用".into()),
+        None => {
+            terminate_cli_process_tree(&mut child, pid, &guard).await;
+            return StreamOutcome::FailedBeforeOutput("CLI 标准错误不可用".into());
+        }
     };
-    let stderr_task = tokio::spawn(read_limited(stderr, 64 * 1024));
+    let redaction_secrets = cli_redaction_secrets();
+    let output_budget = Arc::new(CliOutputBudget::new(CLI_MAX_TOTAL_OUTPUT_BYTES));
+    let (output_limit_tx, output_limit_rx) = watch::channel(false);
+    let mut exit_output_limit_rx = output_limit_rx.clone();
+    let mut file_output_limit_rx = output_limit_rx.clone();
+    let stderr_task = tokio::spawn(read_cli_stderr(
+        stderr,
+        Arc::clone(&output_budget),
+        output_limit_tx,
+    ));
     let meta = json!({
         "provider": agent.name,
         "model": format!("CLI · {}", agent.kind),
         "fallback": false,
         "transport": "cli",
         "reasoning_effort": reasoning_effort,
+        "codex_full_access": invocation.codex_full_access,
     });
     if send_event(tx, "meta", &meta).await.is_err() {
-        let _ = child.kill().await;
+        terminate_cli_process_tree(&mut child, pid, &guard).await;
         stderr_task.abort();
         return StreamOutcome::ClientGone;
     }
 
-    let read = match tokio::time::timeout(
-        Duration::from_secs(30 * 60),
-        read_cli_output(stdout, tx, full_reply, Duration::from_secs(120)),
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(_) => CliOutputRead::TimedOut("CLI 总执行时间超过 30 分钟，已终止".into()),
+    let read = match &response_capture {
+        CliResponseCapture::Stdout => {
+            let stdout = stdout.expect("stdout capture is configured");
+            match tokio::time::timeout(
+                Duration::from_secs(30 * 60),
+                read_cli_output(
+                    stdout,
+                    tx,
+                    full_reply,
+                    &redaction_secrets,
+                    output_budget,
+                    output_limit_rx,
+                    Duration::from_secs(120),
+                ),
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(_) => CliOutputRead::TimedOut("CLI 总执行时间超过 30 分钟，已终止".into()),
+            }
+        }
+        #[cfg(windows)]
+        CliResponseCapture::LastMessageFile(path) => {
+            match tokio::time::timeout(
+                Duration::from_secs(30 * 60),
+                read_cli_last_message_file(
+                    &mut child,
+                    path,
+                    tx,
+                    full_reply,
+                    &redaction_secrets,
+                    output_budget,
+                    &mut file_output_limit_rx,
+                ),
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    CliOutputRead::TimedOut("Codex CLI 总执行时间超过 30 分钟，已终止".into())
+                }
+            }
+        }
     };
     match read {
         CliOutputRead::ClientGone => {
-            let _ = child.kill().await;
+            terminate_cli_process_tree(&mut child, pid, &guard).await;
             stderr_task.abort();
             return StreamOutcome::ClientGone;
         }
+        CliOutputRead::OutputLimit => {
+            terminate_cli_process_tree(&mut child, pid, &guard).await;
+            stderr_task.abort();
+            let message = cli_output_limit_message();
+            return if full_reply.is_empty() {
+                StreamOutcome::FailedBeforeOutput(message)
+            } else {
+                StreamOutcome::FailedMidway(message)
+            };
+        }
         CliOutputRead::TimedOut(message) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            terminate_cli_process_tree(&mut child, pid, &guard).await;
             stderr_task.abort();
             return if full_reply.is_empty() {
                 StreamOutcome::FailedBeforeOutput(message)
@@ -2506,7 +3500,7 @@ async fn stream_cli_agent(
             };
         }
         CliOutputRead::Failed(error) => {
-            let _ = child.kill().await;
+            terminate_cli_process_tree(&mut child, pid, &guard).await;
             stderr_task.abort();
             return if full_reply.is_empty() {
                 StreamOutcome::FailedBeforeOutput(error)
@@ -2516,22 +3510,63 @@ async fn stream_cli_agent(
         }
         CliOutputRead::Eof => {}
     }
-    let status = match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(error)) => {
-            stderr_task.abort();
-            return StreamOutcome::FailedMidway(error.to_string());
+    if response_capture.uses_last_message_file() {
+        // The npm Windows command wrapper can retain handles after the last
+        // message is written. Once the official CLI output file is read, the
+        // managed process tree can be closed.
+        terminate_cli_process_tree(&mut child, pid, &guard).await;
+        stderr_task.abort();
+        if *exit_output_limit_rx.borrow() {
+            let message = cli_output_limit_message();
+            return if full_reply.is_empty() {
+                StreamOutcome::FailedBeforeOutput(message)
+            } else {
+                StreamOutcome::FailedMidway(message)
+            };
         }
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+        return if full_reply.trim().is_empty() {
+            StreamOutcome::FailedBeforeOutput("Codex CLI 未返回文本".into())
+        } else {
+            StreamOutcome::Completed
+        };
+    }
+    let status = match wait_for_cli_exit(&mut child, &mut exit_output_limit_rx).await {
+        CliExitWait::Exited(status) => status,
+        CliExitWait::OutputLimit => {
+            terminate_cli_process_tree(&mut child, pid, &guard).await;
+            stderr_task.abort();
+            let message = cli_output_limit_message();
+            return if full_reply.is_empty() {
+                StreamOutcome::FailedBeforeOutput(message)
+            } else {
+                StreamOutcome::FailedMidway(message)
+            };
+        }
+        CliExitWait::Failed(error) => {
+            terminate_cli_process_tree(&mut child, pid, &guard).await;
+            stderr_task.abort();
+            return StreamOutcome::FailedMidway(error);
+        }
+        CliExitWait::TimedOut => {
+            terminate_cli_process_tree(&mut child, pid, &guard).await;
             stderr_task.abort();
             return StreamOutcome::FailedMidway("CLI 输出已关闭但进程未退出，已终止".into());
         }
     };
+    // The CLI can exit while a descendant still holds stderr. Reap that tree
+    // before awaiting stderr so a detached helper cannot block the chat stream.
+    let _ = crate::process_platform::cleanup_remaining_tree(pid, Some(&guard));
     let stderr = stderr_task.await.unwrap_or_default();
+    if stderr.output_limit_exceeded || *exit_output_limit_rx.borrow() {
+        let message = cli_output_limit_message();
+        return if full_reply.is_empty() {
+            StreamOutcome::FailedBeforeOutput(message)
+        } else {
+            StreamOutcome::FailedMidway(message)
+        };
+    }
     if !status.success() {
-        let error = sanitized_cli_stderr(&stderr);
+        let error = sanitized_cli_stderr(&stderr.output, &redaction_secrets);
         let error = if error.is_empty() {
             format!("CLI 退出状态：{status}")
         } else {
@@ -2667,6 +3702,12 @@ async fn acp_write_text_file(
         crate::persist(state, &data).await?;
     }
     Ok(Value::Null)
+}
+
+/// ACP permission prompts come from an external process. Local review preferences
+/// must not turn those prompts into an implicit capability grant.
+fn acp_permission_outcome(_review_mode: &str, _options: &[Value]) -> Value {
+    json!({"outcome": {"outcome": "cancelled"}})
 }
 
 async fn stream_acp(
@@ -2899,28 +3940,7 @@ async fn stream_acp_inner(
                         .as_array()
                         .cloned()
                         .unwrap_or_default();
-                    let pick = |want_allow: bool| {
-                        options
-                            .iter()
-                            .find(|option| {
-                                let kind = option["kind"].as_str().unwrap_or_default();
-                                if want_allow {
-                                    kind.starts_with("allow")
-                                } else {
-                                    kind.starts_with("reject")
-                                }
-                            })
-                            .or(options.first())
-                            .and_then(|option| option["optionId"].as_str())
-                            .map(String::from)
-                    };
-                    let allow = review_mode != "approval";
-                    let outcome = match pick(allow) {
-                        Some(option_id) => {
-                            json!({"outcome": {"outcome": "selected", "optionId": option_id}})
-                        }
-                        None => json!({"outcome": {"outcome": "cancelled"}}),
-                    };
+                    let outcome = acp_permission_outcome(review_mode, &options);
                     if client.respond(&request_id, outcome).await.is_err() {
                         return mid_fail("权限应答失败".into(), !full_reply.is_empty());
                     }
@@ -3097,6 +4117,17 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncWriteExt, duplex};
 
+    fn cli_output_context(
+        limit: usize,
+    ) -> (
+        Arc<CliOutputBudget>,
+        watch::Sender<bool>,
+        watch::Receiver<bool>,
+    ) {
+        let (tx, rx) = watch::channel(false);
+        (Arc::new(CliOutputBudget::new(limit)), tx, rx)
+    }
+
     fn native_agent(kind: &str) -> AiAgent {
         AiAgent {
             id: "agent-test".into(),
@@ -3230,6 +4261,21 @@ mod tests {
         );
         assert!(acp_relative_path(&root, &root.join("../outside.rs").to_string_lossy()).is_err());
         assert!(acp_relative_path(&root, "../outside.rs").is_err());
+    }
+
+    #[test]
+    fn acp_permissions_are_fail_closed_for_every_review_mode() {
+        let options = vec![
+            json!({"optionId": "allow-once", "kind": "allow_once"}),
+            json!({"optionId": "allow-always", "kind": "allow_always"}),
+            json!({"optionId": "reject", "kind": "reject_once"}),
+        ];
+
+        for review_mode in ["approval", "auto", "full"] {
+            let outcome = acp_permission_outcome(review_mode, &options);
+            assert_eq!(outcome["outcome"]["outcome"], "cancelled");
+            assert!(outcome["outcome"].get("optionId").is_none());
+        }
     }
 
     #[tokio::test]
@@ -3385,23 +4431,152 @@ mod tests {
 
     #[test]
     fn codex_invocation_uses_official_exec_config_order_and_stdin() {
-        let invocation = cli_invocation(&native_agent("codex"), Some("high")).unwrap();
+        let invocation =
+            cli_invocation(&native_agent("codex"), Some("high"), "approval", false).unwrap();
         assert_eq!(
             invocation.args,
             [
+                "--ask-for-approval",
+                "never",
                 "exec",
                 "-c",
-                "model_reasoning_effort=\"high\"",
+                "model_reasoning_effort='high'",
+                "--sandbox",
+                "read-only",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--ignore-user-config",
+                "--ignore-rules",
                 "--color",
                 "never",
                 "-"
             ]
         );
+        assert!(!invocation.codex_full_access);
+    }
+
+    #[test]
+    fn codex_full_access_uses_the_explicit_full_profile_without_the_bypass_flag() {
+        let invocation =
+            cli_invocation(&native_agent("codex"), Some("high"), "full", true).unwrap();
+        assert_eq!(
+            invocation.args,
+            [
+                "--ask-for-approval",
+                "never",
+                "--search",
+                "exec",
+                "-c",
+                "model_reasoning_effort='high'",
+                "--sandbox",
+                "danger-full-access",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--color",
+                "never",
+                "-"
+            ]
+        );
+        assert!(invocation.codex_full_access);
+        assert!(
+            !invocation
+                .args
+                .iter()
+                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_batch_invocation_keeps_the_shell_surface_runtime_owned() {
+        let args = vec![
+            "--ask-for-approval".into(),
+            "never".into(),
+            "exec".into(),
+            "--sandbox".into(),
+            "danger-full-access".into(),
+            "-".into(),
+        ];
+        assert_eq!(
+            windows_batch_invocation(FsPath::new(r"C:\Codex Tools\codex.cmd"), &args).unwrap(),
+            r#" /d /s /c ""C:\Codex Tools\codex.cmd" --ask-for-approval never exec --sandbox danger-full-access -""#
+        );
+        assert!(
+            windows_batch_invocation(FsPath::new(r"C:\Codex Tools\codex.cmd"), &["&".into()])
+                .is_err()
+        );
+        assert_eq!(
+            windows_batch_invocation(
+                FsPath::new(r"\\?\C:\Codex Tools\codex.cmd"),
+                &[
+                    "-c".into(),
+                    "model_reasoning_effort='high'".into(),
+                    "--sandbox".into(),
+                    "danger-full-access".into(),
+                ],
+            )
+            .unwrap(),
+            r#" /d /s /c ""C:\Codex Tools\codex.cmd" -c model_reasoning_effort='high' --sandbox danger-full-access""#
+        );
+        assert_eq!(
+            windows_cmd_compatible_batch_path(FsPath::new(r"\\?\UNC\server\share\codex.cmd"))
+                .unwrap(),
+            PathBuf::from(r"\\server\share\codex.cmd")
+        );
+        assert!(
+            windows_cmd_compatible_batch_path(FsPath::new(r"\\?\Volume{abc}\codex.cmd")).is_err()
+        );
+        assert_eq!(
+            windows_cli_working_directory(FsPath::new(r"\\?\C:\workspace\project")).unwrap(),
+            PathBuf::from(r"C:\workspace\project")
+        );
+        assert!(
+            windows_cli_working_directory(FsPath::new(r"\\?\UNC\server\share\project")).is_err()
+        );
+        assert!(windows_cli_working_directory(FsPath::new(r"\\server\share\project")).is_err());
+        assert!(windows_cli_working_directory(FsPath::new(r"\\?\Volume{abc}\project")).is_err());
+    }
+
+    #[test]
+    fn codex_full_access_requires_the_server_environment_gate() {
+        let error = cli_invocation(&native_agent("codex"), None, "full", false)
+            .err()
+            .unwrap();
+        assert!(error.contains("SCULK_ALLOW_CODEX_FULL=true"));
+        assert_eq!(
+            codex_permission_profile("auto", false).unwrap(),
+            CodexPermissionProfile::ReadOnly
+        );
+        assert!(parse_opt_in_value(" true "));
+        assert!(!parse_opt_in_value("enabled"));
+    }
+
+    #[test]
+    fn full_access_only_allows_native_codex_cli() {
+        let codex = native_agent("codex");
+        assert!(validate_full_access_agent(&codex, "full").is_ok());
+
+        let mut codex_acp = codex.clone();
+        codex_acp.transport = "acp".into();
+        assert!(validate_full_access_agent(&codex_acp, "full").is_err());
+        assert!(validate_full_access_agent(&native_agent("claude-code"), "full").is_err());
+        assert!(validate_full_access_agent(&codex_acp, "approval").is_ok());
+    }
+
+    #[test]
+    fn codex_cli_rejects_uncontrolled_custom_arguments() {
+        let mut agent = native_agent("codex");
+        agent.args = vec!["--dangerously-bypass-approvals-and-sandbox".into()];
+        let error = cli_invocation(&agent, None, "approval", false)
+            .err()
+            .unwrap();
+        assert!(error.contains("不能自定义"));
     }
 
     #[test]
     fn claude_invocation_uses_print_mode_and_effort_flag() {
-        let invocation = cli_invocation(&native_agent("claude-code"), Some("max")).unwrap();
+        let invocation =
+            cli_invocation(&native_agent("claude-code"), Some("max"), "approval", false).unwrap();
         assert_eq!(
             invocation.args,
             ["-p", "--output-format", "text", "--effort", "max"]
@@ -3410,7 +4585,7 @@ mod tests {
 
     #[test]
     fn target_specific_effort_is_rejected() {
-        let error = cli_invocation(&native_agent("codex"), Some("max"))
+        let error = cli_invocation(&native_agent("codex"), Some("max"), "approval", false)
             .err()
             .unwrap();
         assert!(error.contains("不支持 reasoning_effort=max"));
@@ -3438,6 +4613,54 @@ mod tests {
         assert!(redacted.chars().count() <= 1_001);
     }
 
+    #[test]
+    fn cli_process_environment_is_an_explicit_allowlist() {
+        let mut command = Command::new("codex");
+        configure_cli_environment(&mut command, false);
+        let configured = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| (name.to_string_lossy().into_owned(), value))
+            .collect::<Vec<_>>();
+
+        assert!(configured.iter().all(
+            |(name, value)| value.is_some() && is_cli_environment_variable_allowed(name, false)
+        ));
+        assert!(is_cli_environment_variable_allowed("Path", false));
+        assert!(is_cli_environment_variable_allowed("SystemRoot", false));
+        assert!(is_cli_environment_variable_allowed("USERPROFILE", false));
+        assert!(!is_cli_environment_variable_allowed(
+            "OPENAI_API_KEY",
+            false
+        ));
+        assert!(!is_cli_environment_variable_allowed("CODEX_HOME", false));
+        assert!(is_cli_environment_variable_allowed("CODEX_HOME", true));
+        assert!(is_sensitive_cli_environment_variable("OPENAI_API_KEY"));
+        assert!(is_sensitive_cli_environment_variable("SCULK_CLOUD_DB_URL"));
+        assert!(is_sensitive_cli_environment_variable("REDIS_URL"));
+        assert!(is_sensitive_cli_environment_variable("JWT_SIGNING_SECRET"));
+        assert!(!is_sensitive_cli_environment_variable("PATH"));
+    }
+
+    #[test]
+    fn cli_stdout_and_stderr_use_the_same_secret_redaction() {
+        let secret = "sk-secret-value".to_string();
+        let mut redactor = CliOutputRedactor::new(std::slice::from_ref(&secret));
+        let mut stdout = redactor.push_bytes(b"0123456789abcdefsk-sec");
+        assert_eq!(stdout, "01234567");
+        stdout.push_str(&redactor.push_bytes(b"ret-value suffix"));
+        stdout.push_str(&redactor.finish());
+        let stderr = sanitized_cli_stderr(
+            b"CLI failed with sk-secret-value in stderr",
+            std::slice::from_ref(&secret),
+        );
+
+        assert!(!stdout.contains(&secret));
+        assert!(stdout.contains("[REDACTED]"));
+        assert!(!stderr.contains(&secret));
+        assert!(stderr.contains("[REDACTED]"));
+    }
+
     #[tokio::test]
     async fn cli_output_preserves_utf8_lines() {
         let (mut writer, reader) = duplex(128);
@@ -3450,7 +4673,17 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::channel(8);
         let mut reply = String::new();
-        let outcome = read_cli_output(reader, &tx, &mut reply, Duration::from_secs(1)).await;
+        let (budget, _limit_tx, limit_rx) = cli_output_context(CLI_MAX_TOTAL_OUTPUT_BYTES);
+        let outcome = read_cli_output(
+            reader,
+            &tx,
+            &mut reply,
+            &[],
+            budget,
+            limit_rx,
+            Duration::from_secs(1),
+        )
+        .await;
         writer_task.await.unwrap();
         assert!(matches!(outcome, CliOutputRead::Eof));
         assert_eq!(reply, "你好，世界\nsecond line");
@@ -3463,7 +4696,17 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
         let mut reply = String::new();
-        let outcome = read_cli_output(reader, &tx, &mut reply, Duration::from_secs(1)).await;
+        let (budget, _limit_tx, limit_rx) = cli_output_context(CLI_MAX_TOTAL_OUTPUT_BYTES);
+        let outcome = read_cli_output(
+            reader,
+            &tx,
+            &mut reply,
+            &[],
+            budget,
+            limit_rx,
+            Duration::from_secs(1),
+        )
+        .await;
         assert!(matches!(outcome, CliOutputRead::ClientGone));
     }
 
@@ -3472,7 +4715,60 @@ mod tests {
         let (_writer, reader) = duplex(16);
         let (tx, _rx) = mpsc::channel(1);
         let mut reply = String::new();
-        let outcome = read_cli_output(reader, &tx, &mut reply, Duration::from_millis(10)).await;
+        let (budget, _limit_tx, limit_rx) = cli_output_context(CLI_MAX_TOTAL_OUTPUT_BYTES);
+        let outcome = read_cli_output(
+            reader,
+            &tx,
+            &mut reply,
+            &[],
+            budget,
+            limit_rx,
+            Duration::from_millis(10),
+        )
+        .await;
         assert!(matches!(outcome, CliOutputRead::TimedOut(_)));
+    }
+
+    #[tokio::test]
+    async fn cli_output_limit_stops_streaming_and_bounds_reply() {
+        let (mut writer, reader) = duplex(64);
+        let writer_task = tokio::spawn(async move {
+            writer.write_all(b"0123456789abcdef").await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+        let (tx, _rx) = mpsc::channel(8);
+        let mut reply = String::new();
+        let (budget, _limit_tx, limit_rx) = cli_output_context(8);
+        let outcome = read_cli_output(
+            reader,
+            &tx,
+            &mut reply,
+            &[],
+            budget,
+            limit_rx,
+            Duration::from_secs(1),
+        )
+        .await;
+        writer_task.await.unwrap();
+
+        assert!(matches!(outcome, CliOutputRead::OutputLimit));
+        assert!(reply.len() <= 8);
+    }
+
+    #[tokio::test]
+    async fn cli_stderr_uses_the_shared_output_budget() {
+        let (mut writer, reader) = duplex(64);
+        let writer_task = tokio::spawn(async move {
+            writer.write_all(b"too-much-stderr").await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+        let (budget, limit_tx, mut limit_rx) = cli_output_context(8);
+        let stderr = read_cli_stderr(reader, budget, limit_tx).await;
+        writer_task.await.unwrap();
+
+        assert!(stderr.output_limit_exceeded);
+        assert!(stderr.output.len() <= 8);
+        limit_rx.changed().await.unwrap();
+        assert!(*limit_rx.borrow());
     }
 }

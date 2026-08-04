@@ -320,6 +320,42 @@ Windows 启动脚本默认使用 `backend\target-local\release\backend.exe` 和 
 
 如需保持后端前台等待，可使用 `-KeepAlive`；NapCat 连接可通过 `-NapCatApiUrl` 和 `-NapCatConfigPath` 传入。启动脚本会检查 PID 文件对应的确实是当前后端可执行文件，避免误杀其他进程。
 
+#### 作为本地 Codex WebUI 启用完整权限
+
+默认启动不会把 Codex 完整权限变量传给后端，即使当前 PowerShell 会话曾设置过相关变量。需要由本机使用者明确授权时，先停止已有本地后端，再用原生 Codex CLI 的绝对路径启动：
+
+```powershell
+.\scripts\stop-local.ps1
+$codexCommand = (Get-Command codex.cmd -CommandType Application).Path
+.\scripts\start-local.ps1 -EnableCodexFullAccess -CodexCommand $codexCommand
+```
+
+`-CodexCommand` 必须是 `.exe`、`.cmd` 或 `.bat` 的绝对路径，并且必须与“设置 > Agent”中选用的原生 Codex CLI Agent 命令完全一致；npm 安装的 Windows Codex 通常应选 `codex.cmd`，不要使用 `codex.ps1`。启动后仍需在对话中选择该 Codex Agent 和“完全访问”审核模式。该授权仅对新启动的回环后端生效，Codex 会以运行后端的本机账户访问宿主机；项目或服务器目录只是初始工作目录，不是权限边界。
+
+Linux 使用同一机制，命令必须是已安装 Codex CLI 的绝对路径：
+
+```bash
+./scripts/stop-local.sh
+./scripts/start-local.sh --enable-codex-full-access --codex-command "$(command -v codex)"
+```
+
+### 本地分发包
+
+日常修改仍使用上面的直接构建和启动流程。只有需要分发独立本地部署包时，才在对应系统执行打包脚本：
+
+```powershell
+.\scripts\package-local.ps1
+```
+
+```bash
+chmod +x scripts/package-local.sh
+./scripts/package-local.sh
+```
+
+可用 `-Version 0.1.0` 或 `--version 0.1.0` 指定分发版本；省略时取 `backend/Cargo.toml` 的包版本。产物分别是 `artifacts/generated/local/sculk-catalyst-local-windows-x86_64-<version>.zip` 与 `artifacts/generated/local/sculk-catalyst-local-linux-<arch>-<version>.tar.gz`，每个归档都会生成同名 `.sha256` 校验文件。默认在归档输出目录内的隔离前端工作区执行 `npm ci`；若已有可用依赖且希望缩短打包时间，Windows 使用 `-SkipDependencyInstall`，Linux 使用 `--skip-dependency-install`，脚本会只读复制源 `frontend/node_modules`。
+
+打包的 Rust target、前端工作区和 staging 目录都位于 `artifacts/generated/local` 下，完成后会自动清理；日常开发的 `backend/target-local`、`frontend/dist`、Cloud 构建和官网构建不会被覆盖。分发包只包含本地后端、前端、启动/停止脚本和许可证，不复制 `backend/data`、`state.json`、`dist-cloud`、`dist-website`、Cloud Agent 下载物或官网静态资源。推送到 `main` 后，GitHub Actions 的 `local-distribution` 工作流会并行构建 Windows x86_64 ZIP 与 Linux x86_64 tar.gz，并将二者及校验文件作为 14 天有效的构建产物上传。
+
 ### 健康检查
 
 ```text
@@ -376,6 +412,8 @@ cargo build
 Set-Location ..
 .\scripts\start-cloud.ps1
 ```
+
+该原生 Cloud 后端同样支持 `-EnableCodexFullAccess -CodexCommand $codexCommand`；完整权限仅允许回环监听下、与 Agent 命令一致的原生 Codex CLI。服务已经运行时先停止再重新启动，参数不会静默修改既有后端的权限。
 
 生产环境对外部署必须使用 HTTPS 反向代理，并限制 PostgreSQL、Redis 只允许内网访问。`SCULK_CLOUD_PUBLIC_URL` 必须是 Agent 可访问的 HTTPS 根地址，不能包含账号密码、查询参数或片段；只有 `localhost` 或回环地址的本地开发环境允许使用 HTTP。详细的数据库迁移、会话、Token 和部署边界见 [`docs/SCULK_CLOUD.md`](docs/SCULK_CLOUD.md)。
 

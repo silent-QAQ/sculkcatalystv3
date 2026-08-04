@@ -869,13 +869,22 @@ async fn main() {
         .await
         .expect("failed to bind API server");
     println!("Sculk Catalyst backend listening on http://{bind_address}");
-    let shutdown_state = state.clone();
     let (shutdown_sender, mut shutdown_receiver) = watch::channel(false);
+    let mut shutdown_trigger = shutdown_receiver.clone();
+    let shutdown_state = state.clone();
+    let shutdown_signal_sender = shutdown_sender.clone();
     let shutdown_task = tokio::spawn(async move {
-        shutdown_signal().await;
+        tokio::select! {
+            _ = shutdown_signal() => {}
+            changed = shutdown_trigger.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
         shutdown_state.shutting_down.store(true, Ordering::Release);
-        let _ = shutdown_sender.send(true);
-        shutdown_all_processes(&shutdown_state).await;
+        let _ = shutdown_signal_sender.send(true);
+        shutdown_backend(&shutdown_state).await;
     });
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -884,17 +893,25 @@ async fn main() {
             }
         })
         .await;
-    if result.is_err() {
-        shutdown_task.abort();
-        state.shutting_down.store(true, Ordering::Release);
+    // A serve error has no graceful-shutdown callback, so wake the same task
+    // that handles an OS shutdown signal. Re-sending `true` is harmless.
+    let _ = shutdown_sender.send(true);
+    let shutdown_failed = match shutdown_task.await {
+        Ok(()) => false,
+        Err(error) => {
+            eprintln!("backend shutdown task failed: {error}");
+            true
+        }
+    };
+    if shutdown_failed {
+        shutdown_backend(&state).await;
     }
-    if let Err(error) = shutdown_task.await
-        && !error.is_cancelled()
-    {
-        eprintln!("backend shutdown task failed: {error}");
-    }
-    shutdown_all_processes(&state).await;
     result.expect("API server failed");
+}
+
+async fn shutdown_backend(state: &AppState) {
+    state.shutting_down.store(true, Ordering::Release);
+    shutdown_all_processes(state).await;
 }
 
 async fn shutdown_all_processes(state: &AppState) {
@@ -2743,7 +2760,10 @@ async fn run_process_actor(
             _ = poll.tick(), if exit_status.is_none() => {
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        let _ = process_platform::cleanup_remaining_tree(managed.pid);
+                        let _ = process_platform::cleanup_remaining_tree(
+                            managed.pid,
+                            Some(&managed.guard),
+                        );
                         exit_status = Some(status);
                     }
                     Ok(None) => {
@@ -2792,7 +2812,7 @@ async fn run_process_actor(
             && (!stdout_open && !stderr_open)
             && let Ok(Some(status)) = child.try_wait()
         {
-            let _ = process_platform::cleanup_remaining_tree(managed.pid);
+            let _ = process_platform::cleanup_remaining_tree(managed.pid, Some(&managed.guard));
             exit_status = Some(status);
         }
     }
@@ -5150,6 +5170,19 @@ mod tests {
             cloud: cloud::CloudRuntime::disabled_for_test(),
         };
         (state, directory)
+    }
+
+    #[tokio::test]
+    async fn backend_shutdown_is_idempotent_for_an_idle_state() {
+        let id = format!("shutdown-{}", Uuid::new_v4().simple());
+        let (state, state_directory) = test_state_with_workspace(&id, "project").await;
+
+        shutdown_backend(&state).await;
+        shutdown_backend(&state).await;
+
+        assert!(state.shutting_down.load(Ordering::Acquire));
+        assert!(state.processes.read().await.is_empty());
+        fs::remove_dir_all(state_directory).await.unwrap();
     }
 
     #[tokio::test]

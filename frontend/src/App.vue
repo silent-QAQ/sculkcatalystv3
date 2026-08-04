@@ -66,7 +66,8 @@ interface BrowserSpeechRecognition {
 interface BrowserSpeechRecognitionConstructor { new():BrowserSpeechRecognition }
 
 const launchParams = new URLSearchParams(window.location.search)
-const cloudWorkspaceLaunch = launchParams.get('cloud') === 'workspace'
+const localPackage = import.meta.env.VITE_APP_MODE === 'local'
+const cloudWorkspaceLaunch = !localPackage && launchParams.get('cloud') === 'workspace'
 const WORKSPACE_MODE_KEY = 'sculk-workspace-mode-v1'
 const savedWorkspaceMode = localStorage.getItem(WORKSPACE_MODE_KEY)
 const workspaceMode = ref<WorkspaceKind>(savedWorkspaceMode === 'project' ? 'project' : 'server')
@@ -349,7 +350,7 @@ const composerSuggestions=computed<ComposerSuggestion[]>(()=>{
   if(token.kind==='skill')return composerSkills.value.filter(skill=>skill.enabled&&(!query||skill.id.toLocaleLowerCase('zh-CN').includes(query)||skill.name.toLocaleLowerCase('zh-CN').includes(query))).slice(0,10).map(skill=>({id:'skill:'+skill.id,kind:'skill',label:skill.name,detail:skill.description,value:skill.id,skill}))
   if(token.kind==='file')return composerFiles.value.filter(path=>!query||path.toLocaleLowerCase('zh-CN').includes(query)).slice(0,12).map(path=>({id:'file:'+path,kind:'file',label:path.split('/').at(-1)??path,detail:path,value:path,filePath:path}))
   const builtIn:ComposerSuggestion={id:'agent:default',kind:'agent',label:'Sculk Agent',detail:'内置模型直连智能体',value:'Sculk-Agent',agentId:'default'}
-  return [builtIn,...agentMenuItems.value.map(agent=>({id:'agent:'+agent.id,kind:'agent' as const,label:agent.name,detail:(agent.transport??'acp')==='cli'?'原生 CLI':'ACP 协议',value:agent.name.replace(/\s+/g,'-'),agentId:agent.id}))].filter(item=>!query||item.label.toLocaleLowerCase('zh-CN').includes(query)||item.value.toLocaleLowerCase('zh-CN').includes(query)).slice(0,10)
+  return [builtIn,...agentMenuItems.value.map(agent=>({id:'agent:'+agent.id,kind:'agent' as const,label:agent.name,detail:agentMenuDetail(agent),value:agent.name.replace(/\s+/g,'-'),agentId:agent.id}))].filter(item=>!query||item.label.toLocaleLowerCase('zh-CN').includes(query)||item.value.toLocaleLowerCase('zh-CN').includes(query)).slice(0,10)
 })
 const activeAgentId = computed(()=>{
   if(chatAgentOverride.value==='default')return null
@@ -365,6 +366,13 @@ const chatAgentLabel = computed(()=>{
   return 'Sculk Agent'
 })
 const activeAgent = computed(()=>activeAgentId.value ? aiSettings.value?.agents.find(item=>item.id===activeAgentId.value) ?? null : null)
+function fullAccessAgentPolicyMessage(agent:AiAgent|null){
+  if(reviewMode.value!=='full'||!agent)return''
+  if(agent.kind!=='codex'||(agent.transport??'acp')!=='cli')return '完全访问仅支持原生 Codex CLI；请选择 Codex CLI，或切回请求批准/替我审核模式'
+  if((aiSettings.value?.codex_full_access_ready_agent_ids??[]).includes(agent.id))return''
+  return aiSettings.value?.codex_full_access_available?'当前 Codex 命令未授权；请在设置中重新接入检测到的 Codex，或改为已授权绝对路径':'Codex 完整权限尚未配置；请在设置 → 常规完成本机启动授权'
+}
+const activeAgentPolicyMessage=computed(()=>fullAccessAgentPolicyMessage(activeAgent.value))
 const reasoningSupported = computed(()=>!activeAgent.value || (activeAgent.value.transport ?? 'acp')==='cli')
 const reasoningMenuItems = computed(()=>{
   if(!activeAgent.value)return REASONING_EFFORTS
@@ -397,6 +405,14 @@ function agentReasoningLabel(agent:AiAgent){
   if(activeAgentId.value!==agent.id||!chatReasoningEffort.value)return '自动'
   return REASONING_EFFORTS.find(item=>item.key===chatReasoningEffort.value)?.label??chatReasoningEffort.value
 }
+function agentMenuDetail(agent:AiAgent){
+  const transport=(agent.transport??'acp')==='cli'?'原生 CLI':'ACP 协议'
+  if(agent.kind!=='codex'||transport!=='原生 CLI')return `${agent.kind} · ${transport}${reviewMode.value==='full'?' · 完全访问不支持':''}`
+  const codexFullAccessAvailable=aiSettings.value?.codex_full_access_available===true
+  const codexFullAccessReady=codexFullAccessAvailable&&(aiSettings.value?.codex_full_access_ready_agent_ids??[]).includes(agent.id)
+  const access=reviewMode.value!=='full'?'只读保护':codexFullAccessReady?'完全访问权限':codexFullAccessAvailable?'当前命令未授权':'完全访问未配置'
+  return `${agent.kind} · ${transport} · ${access}`
+}
 const chatModelLabel = computed(()=>{
   const override = chatModelOverride.value
   if(!override) return '自动模型'
@@ -427,6 +443,8 @@ async function pickChatAgent(agentId:string|null,requestedEffort:ReasoningEffort
   showAgentMenu.value=false
   try{
     const chosen=agentId?aiSettings.value?.agents.find(item=>item.id===agentId):null
+    const policyMessage=fullAccessAgentPolicyMessage(chosen??null)
+    if(policyMessage){flashSafeNotice(policyMessage);return false}
     const values=chosen?reasoningItemsForAgent(chosen).map(item=>item.key):[]
     const nextEffort=chosen?(chosen.transport??'acp')==='cli'&&(!requestedEffort||values.includes(requestedEffort))?requestedEffort:null:requestedEffort
     const summary=await persistConversationExecution(chatModelOverride.value,nextAgent,nextEffort)
@@ -880,6 +898,8 @@ async function send(preset?:string) {
   if(!selectedConversationId.value&&ensureConversationPromises.has(serverId)){flashSafeNotice('正在创建对话，本条内容仍保留在草稿中');return}
   const outgoingDraftKey=draftKey(serverId,selectedConversationId.value)
   const prepared=prepareChatSend(raw);if(!prepared)return
+  const policyMessage=fullAccessAgentPolicyMessage(prepared.agentOverride==='default'?null:activeAgent.value)
+  if(policyMessage){flashSafeNotice(policyMessage);return}
   if(preset===undefined){input.value='';saveCurrentDraft()}
   const ensured=await ensureConversation(serverId);if(!ensured.selected||!ensured.id||selectedId.value!==serverId){if(preset===undefined)restoreUnsentDraft(ensured.id?draftKey('',ensured.id):outgoingDraftKey,raw);flashSafeNotice('工作区已变化或对话创建失败，本条内容已恢复到草稿');return}
   const conversationId=ensured.id
@@ -1323,6 +1343,7 @@ onUnmounted(()=>{document.removeEventListener('click',closeMenus);if(refreshTime
         :servers="visibleServers"
         :mode="workspaceMode"
         :conversations="conversationsByServer"
+        :agents="aiSettings?.agents ?? []"
         :selected-server-id="selectedId"
         :selected-conversation-id="selectedConversationId"
         :running-conversation-ids="activeConversationIds"
@@ -1355,7 +1376,7 @@ onUnmounted(()=>{document.removeEventListener('click',closeMenus);if(refreshTime
         <div class="composer-toolbar">
           <span class="composer-menu-anchor composer-agent-picker">
             <button class="agent-picker" :class="{active:showAgentMenu}" title="选择当前对话使用的 Agent" @click.stop="showAgentMenu=!showAgentMenu;showModelMenu=false;showReviewMenu=false"><Bot/>{{chatAgentLabel}}<ChevronDown/></button>
-            <div v-if="showAgentMenu" class="composer-menu composer-agent-menu"><small>当前对话的 Agent</small><button :class="{picked:!activeAgentId}" @click="pickChatAgent(null)"><span><b>Sculk Agent（内置）</b><em>直连模型提供商，模型和思考强度在输入框下方选择</em></span><Check v-if="!activeAgentId"/></button><template v-if="agentMenuItems.length"><small class="group">已接入的智能体</small><div v-for="agent in agentMenuItems" :key="agent.id" class="agent-option" :class="{picked:activeAgentId===agent.id}"><button @click="pickChatAgent(agent.id)"><span><b>{{agent.name}}</b><em>{{agent.kind}} · {{(agent.transport??'acp')==='cli'?'原生 CLI':'ACP 协议'}}</em></span><Check v-if="activeAgentId===agent.id"/></button><label v-if="(agent.transport??'acp')==='cli'" title="拖动后会选择该 Agent 并保存思考强度" @click.stop><BrainCircuit/><input type="range" min="0" :max="reasoningItemsForAgent(agent).length" step="1" :value="agentReasoningIndex(agent)" @change="changeChatAgentReasoning(agent,$event)"/><em>{{agentReasoningLabel(agent)}}</em></label></div></template><small v-else class="empty-hint">尚未接入外部智能体，可到「设置」自动检测 CLI 或手动接入</small></div>
+            <div v-if="showAgentMenu" class="composer-menu composer-agent-menu"><small>当前对话的 Agent</small><button :class="{picked:!activeAgentId}" @click="pickChatAgent(null)"><span><b>Sculk Agent（内置）</b><em>直连模型提供商，模型和思考强度在输入框下方选择</em></span><Check v-if="!activeAgentId"/></button><template v-if="agentMenuItems.length"><small class="group">已接入的智能体</small><div v-for="agent in agentMenuItems" :key="agent.id" class="agent-option" :class="{picked:activeAgentId===agent.id}"><button :disabled="!!fullAccessAgentPolicyMessage(agent)" :title="fullAccessAgentPolicyMessage(agent)||'选择该 Agent'" @click="pickChatAgent(agent.id)"><span><b>{{agent.name}}</b><em>{{agentMenuDetail(agent)}}</em></span><Check v-if="activeAgentId===agent.id"/></button><label v-if="(agent.transport??'acp')==='cli'" :title="fullAccessAgentPolicyMessage(agent)||'拖动后会选择该 Agent 并保存思考强度'" @click.stop><BrainCircuit/><input type="range" min="0" :max="reasoningItemsForAgent(agent).length" step="1" :disabled="!!fullAccessAgentPolicyMessage(agent)" :value="agentReasoningIndex(agent)" @change="changeChatAgentReasoning(agent,$event)"/><em>{{agentReasoningLabel(agent)}}</em></label></div></template><small v-else class="empty-hint">尚未接入外部智能体，可到「设置」自动检测 CLI 或手动接入</small></div>
           </span>
           <div v-if="cloudPrompts.length" class="quick-prompts" :class="{open:showQuickPrompts}"><button class="quick-prompts-toggle" :aria-expanded="showQuickPrompts" title="展开快捷指令" @click="showQuickPrompts=!showQuickPrompts"><MessageSquareText/><span>快捷指令</span><small>{{cloudPrompts.length}}</small><ChevronDown/></button><div v-if="showQuickPrompts" class="prompts"><button v-for="prompt in cloudPrompts" :key="prompt.id" @click="showQuickPrompts=false;send(prompt.content)"><Sparkles/>{{ prompt.title }}</button></div></div>
         </div>
@@ -1407,7 +1428,7 @@ onUnmounted(()=>{document.removeEventListener('click',closeMenus);if(refreshTime
             <button v-for="mode in REVIEW_MODES" :key="mode.key" :class="{picked:reviewMode===mode.key}" @click="pickReviewMode(mode.key)"><span><b>{{mode.label}}</b><em>{{mode.hint}}</em></span><Check v-if="reviewMode===mode.key"/></button>
           </div>
         </span>
-      </span><button v-if="chatBusy" class="send stop-generation" title="停止生成" @click="stopGeneration"><CircleStop/></button><button class="send" :disabled="conversationSelectionPending||conversationCreationPending||!input.trim()" :title="conversationCreationPending?'正在创建对话':conversationSelectionPending?'正在切换对话':chatBusy?'加入发送队列':'发送消息'" @click="send()"><ListPlus v-if="chatBusy"/><Send v-else/></button></footer></div><div class="composer-status"><span v-if="speechState==='recording'"><i/>正在录音 · 点击麦克风按钮结束</span><span v-else-if="speechState==='transcribing'"><LoaderCircle class="spin"/>正在调用 ASR 模型转写</span><span v-else-if="chatBusy"><LoaderCircle v-if="currentChatRun?.phase==='stopping'" class="spin"/><i v-else/>{{chatStatusLabel}} · Enter 加入队列</span><span v-else-if="conversationCreationPending"><LoaderCircle class="spin"/>正在创建对话</span><span v-else-if="conversationSelectionPending"><LoaderCircle class="spin"/>正在载入对话</span><span v-else>Enter 发送 · Shift + Enter 换行</span><p v-if="safeNotice" class="safe" :class="{warn:reviewMode==='full'}"><ShieldCheck/>{{safeNotice}}</p></div></div>
+      </span><button v-if="chatBusy" class="send stop-generation" title="停止生成" @click="stopGeneration"><CircleStop/></button><button class="send" :disabled="conversationSelectionPending||conversationCreationPending||!input.trim()||!!activeAgentPolicyMessage" :title="activeAgentPolicyMessage|| (conversationCreationPending?'正在创建对话':conversationSelectionPending?'正在切换对话':chatBusy?'加入发送队列':'发送消息')" @click="send()"><ListPlus v-if="chatBusy"/><Send v-else/></button></footer></div><div class="composer-status"><span v-if="speechState==='recording'"><i/>正在录音 · 点击麦克风按钮结束</span><span v-else-if="speechState==='transcribing'"><LoaderCircle class="spin"/>正在调用 ASR 模型转写</span><span v-else-if="chatBusy"><LoaderCircle v-if="currentChatRun?.phase==='stopping'" class="spin"/><i v-else/>{{chatStatusLabel}} · Enter 加入队列</span><span v-else-if="conversationCreationPending"><LoaderCircle class="spin"/>正在创建对话</span><span v-else-if="conversationSelectionPending"><LoaderCircle class="spin"/>正在载入对话</span><span v-else-if="activeAgentPolicyMessage"><ShieldCheck/>{{activeAgentPolicyMessage}}</span><span v-else>Enter 发送 · Shift + Enter 换行</span><p v-if="safeNotice" class="safe" :class="{warn:reviewMode==='full'}"><ShieldCheck/>{{safeNotice}}</p></div></div>
       <WorkspacePanelResizer/>
     </section>
 

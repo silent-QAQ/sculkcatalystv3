@@ -55,6 +55,12 @@ impl CloudRuntime {
     }
 
     pub(crate) async fn from_env() -> Self {
+        if cloud_is_explicitly_disabled() {
+            return Self {
+                inner: None,
+                message: "本地部署已显式禁用 Sculk Cloud".into(),
+            };
+        }
         let _ = dotenvy::dotenv();
         let _ = dotenvy::from_filename("../.env");
         let database_url = match env::var("DATABASE_URL") {
@@ -152,6 +158,17 @@ impl CloudRuntime {
             }
         }
     }
+}
+
+fn cloud_is_explicitly_disabled() -> bool {
+    std::env::var("SCULK_DISABLE_CLOUD")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
 }
 
 fn validate_master_secret(value: &str) -> Result<String, &'static str> {

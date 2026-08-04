@@ -1,6 +1,9 @@
 use std::io;
 use tokio::process::{Child, Command};
 
+#[cfg(unix)]
+use std::sync::atomic::{AtomicI32, Ordering};
+
 #[cfg(windows)]
 use std::mem::size_of;
 
@@ -21,6 +24,8 @@ use windows_sys::Win32::{
 pub(crate) struct ProcessGuard {
     #[cfg(windows)]
     job: HANDLE,
+    #[cfg(unix)]
+    process_group: AtomicI32,
 }
 
 #[cfg(windows)]
@@ -35,13 +40,26 @@ impl Drop for ProcessGuard {
     fn drop(&mut self) {
         if !self.job.is_null() {
             unsafe {
+                // KILL_ON_JOB_CLOSE is the final backstop, but terminating first makes the
+                // intended tree shutdown synchronous even when this drop happens during abort.
+                let _ = TerminateJobObject(self.job, 1);
                 CloseHandle(self.job);
             }
         }
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        let process_group = self.process_group.swap(0, Ordering::AcqRel);
+        if process_group > 0 {
+            let _ = signal_process_group(process_group, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(all(not(windows), not(unix)))]
 impl Drop for ProcessGuard {
     fn drop(&mut self) {}
 }
@@ -73,7 +91,14 @@ pub(crate) fn create_process_guard() -> io::Result<ProcessGuard> {
         Ok(ProcessGuard { job })
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        Ok(ProcessGuard {
+            process_group: AtomicI32::new(0),
+        })
+    }
+
+    #[cfg(all(not(windows), not(unix)))]
     {
         Ok(ProcessGuard {})
     }
@@ -95,7 +120,14 @@ pub(crate) fn bind_process_to_guard(guard: &ProcessGuard, pid: u32) -> io::Resul
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        guard
+            .process_group
+            .store(process_group_from_pid(pid)?, Ordering::Release);
+    }
+
+    #[cfg(all(not(windows), not(unix)))]
     {
         let _ = (guard, pid);
     }
@@ -144,13 +176,19 @@ fn terminate_job(guard: &ProcessGuard) -> io::Result<()> {
 pub(crate) fn start_kill_tree(
     child: &mut Child,
     pid: u32,
-    _guard: Option<&ProcessGuard>,
+    guard: Option<&ProcessGuard>,
 ) -> io::Result<()> {
-    match signal_process_group(pid, libc::SIGKILL) {
+    let result = match signal_process_group(process_group_from_pid(pid)?, libc::SIGKILL) {
         Ok(()) => Ok(()),
         Err(error) if error.raw_os_error() == Some(libc::ESRCH) => child.start_kill(),
         Err(error) => Err(error),
+    };
+    if result.is_ok() {
+        if let Some(guard) = guard {
+            guard.disarm_process_group(pid);
+        }
     }
+    result
 }
 
 #[cfg(not(unix))]
@@ -167,23 +205,52 @@ pub(crate) fn start_kill_tree(
 }
 
 #[cfg(unix)]
-pub(crate) fn cleanup_remaining_tree(pid: u32) -> io::Result<()> {
-    match signal_process_group(pid, libc::SIGKILL) {
+pub(crate) fn cleanup_remaining_tree(pid: u32, guard: Option<&ProcessGuard>) -> io::Result<()> {
+    let result = match signal_process_group(process_group_from_pid(pid)?, libc::SIGKILL) {
         Ok(()) => Ok(()),
         Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
         Err(error) => Err(error),
+    };
+    if result.is_ok() {
+        if let Some(guard) = guard {
+            guard.disarm_process_group(pid);
+        }
     }
+    result
 }
 
 #[cfg(not(unix))]
-pub(crate) fn cleanup_remaining_tree(_pid: u32) -> io::Result<()> {
+pub(crate) fn cleanup_remaining_tree(_pid: u32, guard: Option<&ProcessGuard>) -> io::Result<()> {
+    #[cfg(windows)]
+    if let Some(guard) = guard {
+        return terminate_job(guard);
+    }
     Ok(())
 }
 
 #[cfg(unix)]
-fn signal_process_group(pid: u32, signal: i32) -> io::Result<()> {
-    let process_group = i32::try_from(pid)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "process id is too large"))?;
+fn process_group_from_pid(pid: u32) -> io::Result<i32> {
+    i32::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "process id is too large"))
+}
+
+#[cfg(unix)]
+impl ProcessGuard {
+    fn disarm_process_group(&self, pid: u32) {
+        let Ok(process_group) = process_group_from_pid(pid) else {
+            return;
+        };
+        let _ = self.process_group.compare_exchange(
+            process_group,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(process_group: i32, signal: i32) -> io::Result<()> {
     let result = unsafe { libc::kill(-process_group, signal) };
     if result == 0 {
         Ok(())
@@ -232,6 +299,85 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "descendant process {descendant} survived process-group termination"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_process_guard_terminates_the_bound_process_group() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 60 & child=$!; printf '%s\\n' \"$child\"; wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(false);
+        configure_managed_command(&mut command).unwrap();
+
+        let guard = create_process_guard().unwrap();
+        let mut child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
+        bind_process_to_guard(&guard, pid).unwrap();
+        let mut descendant_line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut descendant_line)
+            .await
+            .unwrap();
+        let descendant = descendant_line.trim().parse::<i32>().unwrap();
+
+        drop(guard);
+        child.wait().await.unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let exists = unsafe { libc::kill(descendant, 0) } == 0;
+            if !exists {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant process {descendant} survived ProcessGuard drop"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_remaining_tree_terminates_and_disarms_the_bound_guard() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 60 & child=$!; printf '%s\\n' \"$child\"; wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(false);
+        configure_managed_command(&mut command).unwrap();
+
+        let guard = create_process_guard().unwrap();
+        let mut child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
+        bind_process_to_guard(&guard, pid).unwrap();
+        let mut descendant_line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut descendant_line)
+            .await
+            .unwrap();
+        let descendant = descendant_line.trim().parse::<i32>().unwrap();
+
+        cleanup_remaining_tree(pid, Some(&guard)).unwrap();
+        assert_eq!(guard.process_group.load(Ordering::Acquire), 0);
+        child.wait().await.unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let exists = unsafe { libc::kill(descendant, 0) } == 0;
+            if !exists {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant process {descendant} survived normal completion cleanup"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

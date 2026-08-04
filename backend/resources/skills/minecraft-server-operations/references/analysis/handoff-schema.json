@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "minecraft-ops-handoff/v1",
+  "type": "object",
+  "required": ["schema", "handoff_id", "created_at", "producer", "intent", "target", "evidence", "recommended_actions", "risks", "rollback_plan", "verification_plan", "prohibitions", "unknowns", "executor_contract", "execution_performed", "writes_performed", "integrity"],
+  "properties": {
+    "schema": {"const": "minecraft-ops-handoff/v1"},
+    "handoff_id": {"type": "string", "minLength": 1},
+    "created_at": {"type": "string", "minLength": 1},
+    "producer": {"type": "object"},
+    "intent": {"type": "object"},
+    "target": {"type": "object"},
+    "evidence": {"type": "array"},
+    "recommended_actions": {"type": "array"},
+    "risks": {"type": "array"},
+    "rollback_plan": {"type": "object"},
+    "verification_plan": {"type": "object"},
+    "prohibitions": {"type": "array"},
+    "unknowns": {"type": "array"},
+    "executor_contract": {"type": "object", "properties": {"may_execute": {"const": false}, "handoff_is_authorization": {"const": false}}, "required": ["may_execute", "handoff_is_authorization"]},
+    "execution_performed": {"const": false},
+    "writes_performed": {"const": false},
+    "integrity": {"type": "object"}
+  },
+  "additionalProperties": false
+}

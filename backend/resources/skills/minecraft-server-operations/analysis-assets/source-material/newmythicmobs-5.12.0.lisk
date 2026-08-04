@@ -1,0 +1,1251 @@
+# ==============================================================================
+# MythicMobs 5.12.0 完整配置范式
+# 文件名：newmythicmobs.lisk
+# 基于源码反编译 (io.lumine.mythic.core.skills.*) + 官方示例文件
+# 所有参数名和合法值均来自字节码注解和常量池，非凭空生成。
+# ==============================================================================
+
+# ==========================================
+# [SECTION 0] 全局生成规则
+# ==========================================
+[RULES]
+1. 使用标准 YAML 格式，严格 2 空格缩进，绝对禁止 Tab 键。
+2. 每个配置组必须带有文件目标标记，格式：
+   [FILE:plugins/MythicMobs/Items/CustomItems.yml]
+   [FILE:plugins/MythicMobs/Mobs/CustomMobs.yml]
+   [FILE:plugins/MythicMobs/Skills/CustomSkills.yml]
+   [FILE:plugins/MythicMobs/DropTables/CustomDrops.yml]
+3. 节点 ID 只能使用 英文、数字、下划线，首字母推荐大写。
+4. Display 显示名称使用 '&' 颜色代码。
+5. 技能参数使用 等号= 赋值，分号; 分隔。如 damage{amount=10;ignorearmor=true}
+6. 带括号的格式要求参数用小括号括起来，如 @PlayersInRadius{r=15}
+7. 注意大小写敏感。物品 ID 和生物类型必须使用大写原版英文名。
+
+# ==========================================
+# [SECTION 1] 物品 (Items) 编写范式
+# ==========================================
+[SKILL:ITEMS]
+当用户要求制作武器、防具、饰品或消耗品道具时参考以下格式。
+
+# 注意：物品技能(Item Skills)需要 MythicCrucible 付费拓展才能生效。
+# 在基础 MythicMobs 中，物品的 Skills 节点会被忽略。
+
+# ========== 基础物品模板 ==========
+SkeletonKingSword:
+  Id: DIAMOND_SWORD              # 材质基底，必须使用大写原版英文名
+  Display: '&3Greatsword of the Skeleton King'
+  Lore:                           # 物品描述面板
+  - '&6A powerful sword used by'
+  - '&6the King of Skeletons.'
+  Enchantments:                   # 附魔 (原版附魔名:等级)
+  - DAMAGE_ALL:5
+  - KNOCKBACK:2
+  - FIRE_ASPECT:2
+  Attributes:                     # 属性加成
+    MainHand:                     # 槽位: MainHand / Head / Chest / Legs / Feet / OffHand
+      Health: 10
+      MovementSpeed: 0.1
+  Hide:                           # 隐藏标签 (MM 5.x 新格式)
+  - ATTRIBUTES                     # 可选: ATTRIBUTES / ENCHANTS / UNBREAKABLE / DYE / PLACED_ON / DESTROYABLE / ARMOR_TRIM / POTION_EFFECTS
+  - ENCHANTS
+
+# 可染色皮革防具
+BanditTunic:
+  Id: LEATHER_CHESTPLATE
+  Display: '&aBandit Tunic'
+  Lore:
+  - '&6A leather tunic taken from'
+  - '&6the corpse of a bandit.'
+  Options:
+    Color: 255,40,40               # RGB 颜色 (仅皮革防具)
+
+# ========== 物品配置字段参考 ==========
+# Id: 原版大写材质名 (DIAMOND_SWORD, NETHERITE_CHESTPLATE, etc.)
+# Display: 带 & 颜色代码的显示名称
+# Lore: 物品描述列表
+# Enchantments: 附魔列表 (格式: ENCHANT_NAME:LEVEL)
+# Attributes: 属性加成 (按槽位分组: MainHand, OffHand, Head, Chest, Legs, Feet)
+#   可用属性: Health, MovementSpeed, KnockbackResistance, AttackDamage, Armor, ArmorToughness, AttackSpeed, Luck, MaxHealth
+# Hide: 隐藏标签列表 (ATTRIBUTES, ENCHANTS, UNBREAKABLE, DYE, PLACED_ON, DESTROYABLE, ARMOR_TRIM, POTION_EFFECTS)
+# Options: 特殊选项
+#   Color: R,G,B (仅皮革防具)
+#   Unbreakable: true/false
+#   Model: 数字 (自定义模型数据)
+#   PreventEnchanting: true/false
+#   PreventCrafting: true/false/modeled/default
+#   PreventAnviling: true/false/modeled/default
+#   PreventSmithing: true/false/modeled/default
+# Skills: 物品技能列表 (需要 MythicCrucible)
+
+# ==========================================
+# [SECTION 2] 怪物 (Mobs) 编写范式
+# ==========================================
+[SKILL:MOBS]
+当用户要求制作怪物、Boss、随从或刷怪点生物时参考以下格式。
+
+# ========== Boss 模板 ==========
+SkeletonKing:
+  Type: WITHER_SKELETON            # 原型生物 (大写原版英文名)
+  Display: '&6Skeleton King'       # 血条显示名
+  Health: 500                      # 基础血量
+  Damage: 10                       # 基础伤害
+  Skills:                          # 技能条
+  # 格式: - mechanic{参数} @targeter ~trigger 概率
+  # 无 ~trigger 标记时默认为 ~onCombat
+  - speak{m="None may challenge the Skeleton King!";cooldown=20} @PlayersInRadius{r=40} ~onCombat 0.2
+  - speak{m="Ahahahahah! Die, <trigger.name>!"} @PlayersInRadius{r=40} ~onPlayerKill
+  - skill{s=SummonSkeletons} @self 0.1
+  - skill{s=SmashAttack} @target 0.2
+  Equipment:                       # 装备栏 (物品ID 槽位)
+  - KingsCrown HEAD                # 格式: 物品ID 空格 槽位
+  - SkeletonKingSword HAND         # 槽位: HEAD / CHEST / LEGS / FEET / HAND / OFFHAND
+  Drops:                           # 掉落物
+  - SkeletonKingDrops              # 引用掉落表 (推荐方式)
+  # 或直接写: - GOLD_NUGGET{display="Gold Coin"} 1to2 0.5
+  Options:                         # 怪物选项
+    AlwaysShowName: true
+    MovementSpeed: 0.2
+    MaxCombatDistance: 25
+    PreventOtherDrops: true        # 阻止原版掉落物
+
+# ========== 基础生物模板 ==========
+SkeletalMinion:
+  Type: SKELETON
+  Display: '&2Skeletal Minion'
+  Health: 10
+  Damage: 2
+  Options:
+    MovementSpeed: 0.1
+
+# ========== 全部怪物 Options 参考 ==========
+# 可见性与显示:
+#   AlwaysShowName: true/false         # 总是显示名字
+#   ShowNameOnDamaged: true/false      # 受伤时显示名字
+#   Invisible: true/false              # 隐身
+#   Glowing: true/false                # 发光效果
+#   Silent: true/false                 # 静音
+#   UseCustomNameplate: true/false     # 自定义名牌
+#   VisibleByDefault: true/false       # 默认可见
+# 移动与物理:
+#   MovementSpeed: 0.2                 # 移动速度 (原版约 0.2)
+#   FlyingSpeed: 0.4                   # 飞行速度
+#   NoGravity: true/false              # 无重力
+#   KnockbackResistance: 0-1           # 击退抗性
+#   Scale: 1.0                         # 大小缩放 (倍数)
+#   AttackSpeed: 4.0                   # 攻击速度
+#   FollowRange: 40                    # 跟随范围
+#   Collidable: true/false             # 实体碰撞
+# 战斗与生命:
+#   Invincible/Invulnerable: true/false # 无敌
+#   NoDamageTicks: 10                  # 受伤无敌帧 (tick)
+#   MaxCombatDistance: 25              # 最大战斗距离
+#   MaxAttackRange: 3                  # 最大攻击距离
+#   MaxAttackableRange: 5              # 最大被攻击距离
+#   MaxThreatDistance: 40              # 威胁表范围
+#   PassthroughDamage: true/false      # 穿透伤害
+#   ReviveHealth: 100                  # 复活血量
+# 生成与消失:
+#   Despawn: true/false                # 是否消失 (别名: Persistent, 反义)
+#   HealOnReload: true/false           # 插件重载时回血
+#   LockPitch: true/false              # 锁定俯仰角
+# 防阻类 (全部 boolean):
+#   PreventOtherDrops                   # 阻止原版掉落物
+#   PreventVanillaDamage                # 阻止原版伤害计算
+#   PreventRandomEquipment              # 阻止随机装备
+#   PreventLeashing                     # 阻止栓绳
+#   PreventKnockback                    # 阻止击退
+#   PreventRenaming                     # 阻止命名牌改名
+#   PreventTeleport/PreventEndermanTeleport # 阻止传送
+#   PreventItemPickup                   # 阻止捡起物品
+#   PreventSunburn                      # 阻止阳光燃烧
+#   PreventExploding                    # 阻止爆炸
+#   PreventMobKillDrops                 # 阻止杀怪掉落
+#   PreventTransformation               # 阻止转换 (如村民→僵尸村民)
+#   PreventMounts/PreventJockey         # 阻止骑乘
+# AI:
+#   NoAI: true/false                   # 禁用所有 AI
+#   Aware: true/false                  # AI 感知
+# 威胁表:
+#   UseThreatTable: true/false         # 启用威胁表
+#   UseImmunityTable: true/false       # 启用免疫表
+# 掉落设置:
+#   DropMethod: VANILLA/FANCY/CHEST    # 掉落方式
+#   PerPlayerDrops: true/false         # 每个玩家独立掉落
+#   ClientSideDrops: true/false        # 客户端掉落
+#   Lootsplosion: true/false           # 掉落爆炸效果
+#   HologramItemNames: true/false      # 掉落物品全息显示
+#   ShowDeathHologram: true/false      # 死亡全息消息
+#   ShowDeathChatMessage: true/false   # 死亡聊天消息
+#   RequiredDamagePercent: 0.0-1.0     # 获得掉落所需伤害比例
+# 特殊:
+#   Size: 1-100                         # 史莱姆大小
+#   PreventSlimeSplit: true/false      # 阻止史莱姆分裂
+#   Interactable: true/false           # 可交互
+#   Tameable: true/false               # 可驯服
+#   Angry: true/false                  # 愤怒状态
+#   Baby: true/false                   # 幼年形态
+#   SkeletonType: NORMAL/WITHER        # 骷髅类型
+#   ZombieBabyChance: 0.0-1.0         # 僵尸幼年概率
+#   RepeatAllSkills: true/false        # 重复所有技能
+
+# ========== 全部 AIGoalSelectors 参考 ==========
+# 注意: 名称使用 camelCase，大小写敏感。格式: - 名称 优先级
+# 优先级数字越低越优先 (0=最高)
+# - clear                   # 清除默认 AI (必须先写)
+# - meleeAttack 1.0         # 近战攻击
+# - arrowAttack 1.0         # 骷髅弓攻击
+# - bowAttack 1.0           # 弓攻击 (强于 arrowAttack)
+# - crossbowAttack 1.0      # 弩攻击
+# - spiderAttack 1.0        # 蜘蛛跳跃攻击
+# - zombieAttack 1.0        # 僵尸冲锋攻击
+# - moveTowardsTarget 1.0   # 走向目标
+# - moveWithinDistanceOfTarget 1.0 # 与目标保持距离
+# - moveTowardsTargetConditional 1.0 # 条件走向目标
+# - moveTowardsRestriction 1.0 # 走向限制区域
+# - moveToBlock 1.0         # 走向方块位置
+# - moveToLava 1.0          # 炽足兽走向岩浆
+# - moveToWater 1.0         # 海龟走向水源
+# - moveThroughVillage 1.0  # 穿过村庄
+# - lookAtPlayer 1.0        # 看向玩家
+# - lookAtTarget 1.0        # 看向目标
+# - randomLookAround 1.0    # 随机环顾
+# - randomStroll 1.0        # 随机漫游
+# - randomFly 1.0           # 随机飞行
+# - openDoor 1.0            # 开门
+# - breakDoor 1.0           # 破坏门
+# - leapTowardsTarget 1.0   # 跳向目标
+# - fleePlayers 1.0         # 逃离玩家
+# - fleeSun 1.0             # 逃离阳光
+# - fleeVillagers 1.0       # 逃离村民
+# - fleeGolems 1.0          # 逃离傀儡
+# - fleeWolf 1.0            # 逃离狼
+# - fleeFaction 1.0         # 逃离同派系
+# - fleeConditional 1.0     # 条件逃离
+# - panic 1.0               # 受伤恐慌
+# - eatGrass 1.0            # 吃草
+# - float 1.0               # 漂浮水中
+# - creeperSwell 1.0        # 苦力怕膨胀爆炸
+# - breed 1.0               # 繁殖
+# - restrictSun 1.0         # 避开阳光
+# - horrified 1.0           # 恐惧 (循声守卫)
+
+# ========== 全部 AITargetSelectors 参考 ==========
+# - clear                         # 清除默认仇恨
+# - players 1.0                   # 攻击玩家
+# - monsters 1.0                  # 攻击怪物
+# - ironGolems 1.0                # 攻击铁傀儡
+# - villagers 1.0                 # 攻击村民
+# - hurtByTarget 1.0              # 攻击伤害来源
+# - ownerHurtBy 1.0               # 攻击伤害主人的实体
+# - ownerTarget 1.0               # 攻击主人的目标
+# - parentHurtBy 1.0              # 攻击伤害父实体的目标
+# - parentTarget 1.0              # 攻击父实体的目标
+# - nearestOtherFaction 1.0       # 攻击其他派系
+# - nearestOtherFactionMonsters 1.0 # 攻击其他派系怪物
+# - nearestSpecificFaction{name=FACTION} 1.0 # 攻击特定派系
+# - nearestSpecificFactionMonsters{name=FACTION} 1.0
+# - nearestConditionalTarget 1.0  # 条件攻击最近目标
+
+# ========== 装备 (Equipment) 格式 ==========
+# 使用空格分隔: 物品ID 槽位
+# 例:
+#   - KingsCrown HEAD
+#   - SkeletonKingSword HAND
+#   - SHIELD OFFHAND
+#   - IRON_CHESTPLATE CHEST
+#   - IRON_LEGGINGS LEGS
+#   - IRON_BOOTS FEET
+# 可引用 MythicMobs 自定义物品或原版材质。
+
+# ========== 掉落 (Drops) 格式 ==========
+# 方法 1: 引用掉落表
+#   - DropTableName
+# 方法 2: 直接内联格式
+#   物品ID 数量范围 概率
+#   例:
+#   - GOLD_NUGGET 5to10 1.0        # 100% 掉落 5-10 个金粒
+#   - DIAMOND 1to3 0.5             # 50% 掉落 1-3 个钻石
+#   - Excalibur_Sword 1 0.05       # 5% 掉落圣剑
+#   - experience 100to200 1.0      # 掉落经验
+#   - GOLD_NUGGET{display="Gold Coin"} 1to2 0.5  # 带显示名的掉落
+# 方法 3: 使用内置掉落物品名
+#   - SkeletonKingDrops            # 使用配置的掉落表 ID
+
+# ========== 掉落表 (DropTables) 格式 ==========
+# [FILE:plugins/MythicMobs/DropTables/CustomDrops.yml]
+# SkeletonKingDrops:
+#   Conditions:
+#   - playerwithin{d=40}
+#   Drops:
+#   - SkeletonKingItemDrops 1
+#   - experience 100
+#
+# SkeletonKingItemDrops:
+#   MinItems: 1
+#   MaxItems: 2
+#   Drops:
+#   - KingsCrown 1 0.01
+#   - SkeletonKingSword 1 0.1
+#   - GOLD_NUGGET 32to64 1
+#   - DIAMOND 1to12 0.8
+
+# ========== DamageModifiers 格式 ==========
+# DamageModifiers:
+# - LIGHTNING 0       # 不受闪电伤害
+# - FIRE 0.5           # 火焰伤害减半
+# - ENTITY_ATTACK 1.5  # 近战伤害 150%
+# - PROJECTILE 0.75    # 弹射物伤害 75%
+
+# ========== LevelModifiers 格式 ==========
+# LevelModifiers:
+# - Health 5           # 每级增加 5 点血量
+# - Damage 0.5         # 每级增加 0.5 伤害
+# - KnockbackResistance 0.02
+# - Armor 0.1
+# - Power 0.1          # 技能强度
+
+# ==========================================
+# [SECTION 3] 技能 (Skills) 核心参考
+# ==========================================
+[SKILL:SKILLS]
+当用户需要编写怪物技能、大招、被动时参考以下格式。
+
+# ========== 技能配置文件结构 ==========
+# [FILE:plugins/MythicMobs/Skills/CustomSkills.yml]
+# SkillName:                      # 技能内部 ID
+#   Cooldown: 8                   # 冷却时间 (秒)
+#   Conditions:                   # 技能条件列表
+#   - targetwithin{d=25}
+#   Skills:                       # 技能动作列表
+#   - mechanic{param=value} @targeter
+
+# ========== 技能触发器 (Triggers) 参考 ==========
+# 来源: SkillTriggers.class 字节码枚举 (共 50+ 触发器)
+# 重要: 只有 ~onTimer 和 ~onSignal 使用冒号语法，其他触发器后直接接空格+概率
+# 格式: mechanic @targetor ~onTimer:N
+#        mechanic @targetor ~onTrigger 0.X
+
+# === 战斗触发器 ===
+#   ~onCombat 0.2         # 造成/受到伤害时触发 (概率)
+#   ~onAttack 0.1         # 近战攻击命中时触发 (传递 damage-amount 等变量)
+#   ~onDamaged 0.3        # 受到伤害时触发 (传递 damage-amount, element 等)
+#   ~onDamaged <50% 1     # 血量低于阈值时触发 (1=最多一次)
+#   ~onSkillHit           # 技能命中时触发 (区别于普通攻击)
+#   ~onEnterCombat        # 进入战斗状态时触发
+#   ~onDropCombat         # 脱离战斗状态时触发 (别名: ~onLeaveCombat)
+#   ~onBowHit             # 弓/箭命中时触发
+#   ~onProjectileHit      # 弹射物命中实体时触发
+#   ~onProjectileLand     # 弹射物落地/方块时触发
+#   ~onProjectileThrow    # 弹射物被发射时触发
+#   ~onDeflect            # 弹射物被弹反时触发 (需要 OnDamaged aura)
+
+# === 生命周期触发器 ===
+#   ~onSpawn              # 出生或区块加载时触发
+#   ~onFirstSpawn         # 仅首次生成时触发 (不包含区块重载)
+#   ~onDeath              # 死亡时触发
+#   ~onDespawn            # 消失时触发 (非死亡)
+#   ~onPlayerKill         # 击杀玩家时触发
+#   ~onLoad               # 从区块加载时触发
+#   ~onReady              # 完全初始化完成后触发
+
+# === 定时与信号 ===
+#   ~onTimer:N            # 每 N ticks 触发 (20 ticks = 1秒, 必须用冒号)
+#   ~onSignal:NAME        # 收到特定信号时触发 (必须用冒号, 配合 signal mechanic)
+
+# === 交互触发器 ===
+#   ~onInteract           # 玩家右键交互时触发
+#   ~onTame               # 被驯服时触发
+#   ~onTameFail           # 驯服失败时触发
+#   ~onBreed              # 繁殖时触发
+#   ~onTrade              # 村民交易时触发
+#   ~onBucket             # 被桶装/挤奶时触发
+#   ~onMilk               # 被挤奶时触发
+#   ~onShear              # 被剪毛时触发
+
+# === 移动触发器 ===
+#   ~onJump               # 跳跃时触发
+#   ~onCrouch             # 开始潜行时触发
+#   ~onUncrouch           # 取消潜行时触发
+#   ~onMount              # 被骑乘时触发
+#   ~onUnmount            # 骑乘卸载时触发 (别名: ~onDismount)
+#   ~onTeleport           # 传送时触发
+#   ~onChangeWorld        # 切换世界时触发
+#   ~onTargetChange       # 切换目标时触发
+
+# === 特殊触发器 ===
+#   ~onExplode            # 爆炸时触发 (苦力怕/TNT)
+#   ~onCreeperCharge      # 苦力怕被闪电充能时触发
+#   ~onHeal               # 获得治疗时触发
+#   ~onEffectApply        # 药水效果被应用时触发
+#   ~onCast               # 技能引导 (cast mechanic) 时触发
+#   ~onSplashPotion       # 被喷溅药水命中时触发
+
+# === 玩家独有触发器 (需玩家类型的 MythicMob 或 Crucible) ===
+#   ~onRespawn            # 玩家重生时触发
+#   ~onJoin               # 玩家加入服务器时触发
+#   ~onItemPickup         # 捡起物品时触发
+#   ~onItemDrop           # 丢弃物品时触发
+#   ~onPressQ             # 按 Q 丢弃整组物品时触发
+#   ~onPressF             # 按 F 交换副手时触发
+#   ~onFish               # 抛竿钓鱼时触发
+#   ~onFishBite           # 鱼咬钩时触发
+#   ~onFishCatch          # 钓到鱼时触发 (别名: ~onCatchFish)
+#   ~onFishGrab           # 钓到实体时触发
+#   ~onFishGround         # 浮漂落地面时触发
+#   ~onFishReel           # 收线时触发
+#   ~onFishFail           # 钓鱼失败时触发
+
+# === 输入触发器 (Crucible 或 1.20.5+ Paper) ===
+#   ~onInputForward       # 按 W 键时触发
+#   ~onInputBackward      # 按 S 键时触发
+#   ~onInputLeft          # 按 A 键时触发
+#   ~onInputRight         # 按 D 键时触发
+#   ~onInputJump          # 按空格键时触发
+#   ~onInputSneak         # 按 Shift 键时触发
+#   ~onInputSprint        # 按 Ctrl 键时触发
+
+# === 物品专属触发器 (全部需要 MythicCrucible) ===
+# 注意: 以下触发器在 MM 5.12.0 核心中注册为 ITEM 类型, 但物品技能本身需要 Crucible
+#   ~onRightClick         # 右键使用物品
+#   ~onSwing              # 挥动/左键点击 (别名: ~onLeftClick)
+#   ~onConsume            # 消耗物品 (吃/喝)
+#   ~onEquip              # 装备物品 (别名: ~onArmorEquip)
+#   ~onUnequip            # 卸下物品
+#   ~onBlockPlace         # 放置方块
+#   ~onBlockBreak         # 破坏方块
+#   ~onShoot              # 弓/弩 射击
+
+# === 无触发器 (默认行为) ===
+#   无触发器 + 概率值    # 默认等同于 ~onCombat
+#   例: skill{s=SmashAttack} @target 0.2  (等价于 ~onCombat 0.2)
+
+# ========== 技能目标选择器 (Targeters) 参考 ==========
+# 实体目标 (Entity Targeters):
+#   @Self                          # 自身 (别名: @self, @caster)
+#   @Target                        # 当前目标 (别名: @target)
+#   @Trigger                       # 触发器来源 (别名: @trigger)
+#   @Parent / @Summoner            # 召唤者 (别名: @owner, @father, @daddy)
+#   @Mother                        # 母亲实体
+#   @Children                      # 所有子实体
+#   @Siblings                      # 同级实体
+#   @Mount / @Vehicle              # 骑乘实体
+#   @Passenger                     # 乘客
+#   @PlayersInRadius{r=15}         # 半径内玩家 (别名: @PIR{r=15})
+#   @PlayersNearOrigin{r=15}       # 原点附近玩家 (别名: @PNO{r=15})
+#   @PlayersInRing{minrange=5;maxrange=15} # 环形区域内的玩家
+#   @PlayersInWorld                # 世界内所有玩家
+#   @PlayersOnServer               # 服务器上所有玩家
+#   @LivingInRadius{r=10}          # 半径内生物 (别名: @LIR{r=10})
+#   @LivingNearOrigin{r=10}        # 原点附近生物
+#   @LivingInCone{angle=90;range=10} # 锥形区域内生物 (别名: @EIC{})
+#   @LivingInLine{radius=2;range=10} # 直线上生物
+#   @MobsInRadius{r=15;types=SkeletonKing} # 半径内特定 MythicMob (别名: @MIR{})
+#   @EntitiesInRadius{r=15}        # 半径内所有实体 (别名: @EIR{})
+#   @EntitiesInCone{angle=90;range=10} # 锥形区域内实体
+#   @EntitiesInRing{minrange=3;maxrange=10} # 环形区域实体
+#   @EntitiesNearOrigin{r=15}      # 原点附近实体
+#   @NearestPlayer{r=20}           # 最近的玩家
+#   @Owner                         # 拥有者 (驯服生物)
+#   @WolfOwner                     # 狼的拥有者
+#   @InteractionLastAttacker       # 交互实体的最后攻击者
+#   @InteractionLastInteract       # 交互实体的最后互动者
+#   @ThreatTable                   # 威胁表中的所有实体
+#   @ThreatTableRandom             # 威胁表中的随机实体
+#   @TrackedPlayers                # 追踪的玩家
+#   @UniqueIdentifier{uuid=UUID}   # 通过 UUID 指定实体
+#   @PlayerByName{name=NAME}       # 通过名称指定玩家
+#   @VanillaTargeter{selector=@a}  # 原版选择器
+#   @SpecificPlayer{name=NAME}     # 指定玩家
+#   @Vehicle                       # 载具
+#   @Console                       # 控制台
+#
+# 位置目标 (Location Targeters):
+#   @SelfLocation                  # 自身位置 (别名: @casterlocation)
+#   @TargetLocation                # 目标位置
+#   @Origin                        # 施法原点 (别名: @source, @spawnLocation)
+#   @TargetBlock                   # 目标方块位置
+#   @Forward{amount=5}             # 面朝方向 (别名: @forward)
+#   @ProjectileForward{amount=5}   # 弹射物面朝方向
+#   @Cone{angle=90;range=5;points=10} # 锥形点位
+#   @Ring{radius=5;points=8}       # 环形点位
+#   @RingAroundOrigin{radius=5;points=8} # 原点周围环形
+#   @Line{radius=2;range=10}       # 直线点位
+#   @Sphere{radius=5;points=20}    # 球面点位
+#   @Rectangle{width=3;height=3;depth=3} # 矩形点位 (别名: @cube, @cuboid)
+#   @RandomLocationsNearOrigin{amount=3;radius=5} # 原点附近随机位置
+#   @RandomLocationsNearTargets{amount=3;radius=5} # 目标附近随机位置
+#   @RandomLocations{amount=3;maxradius=10;minradius=2} # 随机位置
+#   @RandomRingPoint{radius=5;points=8} # 环上随机点
+#   @Location{coords=x,y,z}        # 指定坐标
+#   @PlayerLocationByName{name=PLAYER} # 指定玩家位置
+#   @TargetPredictedLocation{ticks=20} # 预判目标位置
+#   @ParentLocation                # 召唤者位置
+#   @OwnerLocation                 # 主人位置
+#   @FloorOfTargets                # 目标脚底
+#   @HighestBlock                  # 最高方块
+#   @BlocksInRadius{radius=5;noair=true} # 半径内方块
+#   @BlocksNearOrigin{radius=5}    # 原点附近方块
+#   @BlockVein{type=IRON_ORE;limit=10} # 矿脉方块
+#   @EscapeLocation{radius=10}     # 逃跑位置
+#   @PinTarget{pin=PINNAME}        # Pin 位置
+#   @TrackedLocation               # 追踪位置
+#   @VariableLocation{variable=var;scope=caster} # 变量位置
+
+# ==========================================
+# [SECTION 4] 技能机械 (Mechanics) 完整参考
+# ==========================================
+# 参数使用 等号= 赋值，分号; 分隔多个参数。
+# 格式: mechanic{param1=value1;param2=value2}
+# 旧式 effect: 前缀仍然可用，如 effect:sound{...} 等价于 sound{...}
+
+# --- 伤害与治疗 ---
+
+# damage - 造成伤害
+#   amount: 伤害量 (double, 支持占位符)
+#   ignorearmor: 是否无视护甲 (boolean, 默认 false)
+#   preventknockback: 阻止击退 (boolean)
+#   damageType: 伤害类型
+#   别名: dmg
+# 用法: damage{amount=100;ignorearmor=true} @target
+
+# heal - 治疗
+#   amount: 治疗量 (double)
+#   overheal: 是否允许超量治疗 (boolean)
+#   maxoverheal: 最大超量治疗
+#   absorb: 是否给吸收生命 (boolean)
+#   tags: 治疗标签 (用于别处引用)
+#   用法: heal{amount=20;overheal=true} @self
+
+# healpercent - 百分比治疗
+#   amount/multiplier: 百分比 (0-1, 如 0.5 = 50%)
+#   overheal: 是否允许超量治疗
+#   maxoverheal: 最大超量治疗
+#   别名: percentheal
+#   用法: healpercent{amount=0.5} @self
+
+# --- 药水效果 ---
+
+# potion - 给药水效果
+#   type: 药水类型 (大写, 如 POISON, SLOW, DAMAGE_RESISTANCE 等, 默认 SLOW)
+#   duration: 持续时间 (tick)
+#   level/lvl: 等级 (1 = 效果 II, 因为 1 级是基础, 默认 1)
+#   force/override/overwrite: 强制覆盖同类型低等级效果 (boolean)
+#   ambient/ambientparticles/ambientParticles: 环境粒子 (boolean)
+#   particles/hasparticles/hasParticles: 显示粒子 (boolean)
+#   icon/hasicon/hasIcon: 显示图标 (boolean)
+#   用法: potion{type=POISON;lvl=2;duration=100} @PlayersInRadius{r=15}
+#   注意: 参数是 lvl (不是 l)，type (不是 t)，duration (不是 d)
+
+# --- 消息与标题 ---
+
+# message - 发送消息
+#   message/m/msg: 消息文本 (支持 & 颜色代码和占位符)
+#   audience: 消息受众 (可选)
+#   用法: message{m="&cHello!"} @self
+#   注意: cooldown 是技能层面属性，不直接在 mechanic 里写
+
+# sendtitle - 发送标题
+#   title: 主标题
+#   subtitle: 副标题
+#   fadein/timeIn: 淡入时间 (tick)
+#   duration/timeSt: 持续时间 (tick)
+#   fadeout/timeOt: 淡出时间 (tick)
+#   用法: sendtitle{title="&cBoss";subtitle="&ePhase 2";fadein=10;duration=60;fadeout=10} @PlayersInRadius{r=50}
+
+# sendactionmessage - 动作栏消息
+#   message/m: 消息文本
+#   别名: actionmessage
+#   用法: sendactionmessage{m="&a+10 HP"} @self
+
+---
+
+# speak - 实体说话
+#   message/m/msg: 说话文本
+#   radius: 听到的范围 (默认)
+#   maxlinelength/linelength: 最大行长度
+#   offset/yoffset: 上方偏移
+#   audience: 受众
+#   chatprefix: 聊天前缀
+#   别名: speech
+#   用法: speak{m="Die, mortal!";radius=30} @PlayersInRadius{r=40}
+
+# --- 召唤与传送 ---
+
+# summon - 召唤 MythicMob
+#   type/mob: 怪物类型/ID (默认 SKELETON)
+#   amount: 数量
+#   level: 等级
+#   noise: 生成位置随机偏移
+#   pitch: 朝向角度
+#   yNoise: Y 轴随机偏移
+#   yUpOnly: 只向上偏移 (boolean)
+#   onSurface: 生成在表面上 (boolean)
+#   force/yForce: 强制生成 (boolean)
+#   summonerIsOwner: 召唤者是主人 (boolean)
+#   summonerIsParent: 召唤者是父实体 (boolean)
+#   summonerIsFaction: 继承召唤者派系 (由 inheritFaction 别名)
+#   inheritFaction: 继承派系 (boolean)
+#   inheritThreatTable/copyThreatTable: 复制威胁表 (boolean)
+#   inheritDespawnOption: 继承消失选项 (boolean)
+#   velocity: 初始速度
+#   别名: spawnMob
+#   用法: summon{type=SkeletalMinion;amount=3;noise=5} @self
+
+# summonindependent - 独立召唤 (不跟随召唤者)
+#   type/mob: 怪物类型
+#   summonerIsOwner/summonerisowner
+#   summonerIsParent/summonerisparent
+#   inheritFaction/inheritfaction
+#   inheritDespawnOption/inheritdespawn
+#   useTargetPitch/usetargetpitch
+#   useTargetYaw/usetargetyaw
+#   别名: summoni
+#   用法: summoni{type=Minion;amount=1} @targetlocation
+
+# teleport - 传送
+#   radius/spreadh/spreadH: 水平扩散 (double, 支持占位符)
+#   spreadv/spreadV: 垂直扩散 (double)
+#   preservepitch/preservePitch: 保留视角俯仰 (boolean)
+#   preserveyaw/preserveYaw: 保留视角方向 (boolean)
+#   unsafe: 允许不安全传送 (boolean)
+#   用法: teleport @target
+#         teleport{spreadh=2;spreadv=1} @PlayersInRadius{r=30}
+
+# --- 推拉与位移 ---
+
+# throw - 抛飞实体
+#   velocity: 水平速度 (float)
+#   velocityy/yvelocity: 垂直速度 (float)
+#   fromOrigin/fromorigin: 从原点计算 (boolean)
+#   用法: throw{velocity=10;velocityY=5} @PlayersInRadius{r=5}
+
+# pull - 拉向自己
+#   velocity: 速度 (double)
+#   toOrigin/toorigin: 拉向原点 (boolean, 默认 false = 拉向施法者)
+#   用法: pull{velocity=12} @PlayersInRadius{r=15}
+
+# forcepull - 强制拉回 (传送)
+#   spread: 水平扩散
+#   vspread/spreadV/spreadv: 垂直扩散
+#   sourceIsOrigin: 源点是原点 (boolean)
+#   用法: forcepull @PlayersInRadius{r=15}
+
+# look - 看向目标
+#   headOnly/headonly: 仅移动头部 (boolean)
+#   speed/ticks: 转向速度 (tick)
+#   force/forceLook/forcePaper: 强制看向 (boolean)
+#   immediate/immediately: 立即转向 (boolean)
+#   duration: 凝视持续时间
+#   用法: look{headonly=true;immediate=true} @target
+
+# spin - 旋转实体
+#   velocity: 旋转速度 (int)
+#   别名: effect:spin, e:spin
+#   用法: spin{velocity=10} @self
+
+# rally - 召集附近同类型生物
+#   同类型生物将围攻目标
+#   radius: 搜索半径 (别名: hradius, hRadius)
+#   vradius/vRadius: 垂直搜索半径
+#   types: 生物类型
+#   overwritetarget/ot/overwriteTarget: 覆盖目标 (boolean)
+#   condition/cond: 额外条件
+#   别名: callforhelp
+#   用法: rally{radius=30;types=SkeletalMinion} @self
+
+# --- 弹射物 ---
+
+# projectile - 发射弹射物
+#   type: 弹射物类型 (NORMAL/METEOR/SWORD/LINGERING_POTION/TRIDENT 等)
+#   bulletType: 弹射物显示类型 (默认 NONE)
+#   velocity/projectileVelocity: 速度
+#   startYOffset: 起始 Y 偏移
+#   startForwardOffset: 起始前方偏移
+#   startSideOffset/endSideOffset: 起始/结束侧向偏移
+#   powerAffectsVelocity: 力量影响速度 (boolean)
+#   sourceIsOrigin: 源点是原点 (boolean)
+#   faulty: 容错模式
+#   hitRadius: 命中半径
+#   verticalHitRadius: 垂直命中半径
+#   canStopAtEntity: 命中实体后停止 (boolean)
+#   stopOnHitGround: 落地后停止 (boolean)
+#   onHitSkill: 命中实体时执行的技能
+#   onHitBlockSkill: 命中方块时执行的技能
+#   onTickSkill: 每 tick 执行的技能
+#   onBounceSkill: 反弹时执行的技能
+#   ticksPerSecond: 每秒 tick 数
+#   tickInterpolation: tick 插值
+#   surfaceMode: 表面模式 (NONE 等)
+#   用法: projectile{type=ARROW;velocity=30;onHitSkill=ExplosionSkill} @forward
+
+# missile - 发射追踪导弹
+#   参数与 projectile 基本相同，额外:
+#   inertia/intertia: 惯性
+#   bouncevelocity: 反弹速度
+#   hitnonplayers/hitNonPlayers: 是否命中非玩家 (boolean)
+#   用法: missile{velocity=20;onHitSkill=Explode;inertia=1.5} @target
+
+# shoot - 发射弹射物
+#   参数与 projectile 类似
+#   damage: 伤害
+#   maxdistance: 最大距离
+#   onTickSkill/onHitSkill/onEndSkill/onStartSkill: 对应技能
+#   tickInterval: tick 间隔
+#   projectileType: 弹射物类型
+#   projectileClass: 自定义弹射物类
+#   projectileItem: 弹射物物品
+#   别名: shootprojetile
+#   用法: shoot{type=ARROW;damage=10;velocity=20} @target
+
+# orbital - 环绕弹射物
+#   在施法者周围旋转的弹射物
+#   radius: 环绕半径 (float)
+#   hitradius/hitRadius: 命中半径
+#   verticalhitradius/verticalHitRadius: 垂直命中半径
+#   points: 环绕点数 (int)
+#   angularVelocityX/angularVelocityY/angularVelocityZ: 各轴角速度 (float)
+#   startingPoint/startingStep: 起始点位 (int)
+#   onHitSkill/onTickSkill/onStartSkill/onEndSkill: 对应技能
+#   hitConditions/stopConditions: 命中/停止条件
+#   drawHitbox: 绘制碰撞箱 (boolean)
+#   surfaceMode: 表面模式
+#   用法: orbital{radius=3;points=4;angularVelocityY=0.05;onHitSkill=OrbitalHit} @self
+
+# totem - 图腾弹射物
+#   放置在地面上的图腾
+#   charges/maxCharges: 最大充能/使用次数 (int)
+#   yoffset/YOffset: Y 偏移 (float)
+#   stopatentity/stopOnHitEntity: 碰到实体停止 (boolean)
+#   hugsurface/heightfromsurface/heightFromSurface: 贴近表面/表面高度 (float)
+#   faceAwayFromCaster/fafc: 面朝施法者反方向 (boolean)
+#   hugliquid/hugwater/huglava: 贴近液体 (boolean)
+#   onHitSkill/onTickSkill: 对应技能
+#   surfaceMode: 表面模式
+#   bulletType: 显示类型
+#   用法: totem{charges=3;yoffset=0.5;onTickSkill=TotemAura} @self
+
+# --- 特效类 ---
+
+# effect:particles - 粒子效果
+#   particle/p/particleName: 粒子类型 (如 happyVillager, FLAME, end_rod, etc.)
+#                         支持小写和下划线混合格式
+#   amount/count: 粒子数量 (int)
+#   hSpread/horizontalSpread: 水平扩散
+#   ySpread/verticalSpread: 垂直扩散
+#   speed: 粒子速度
+#   yOffset: Y 偏移
+#   xOffset: X 偏移 (别名: xoffset)
+#   zOffset: Z 偏移 (别名: zoffset)
+#   color: 粒子颜色 (用于 reddust 等)
+#   viewDistance/viewdistance: 可视距离
+#   audience: 受众
+#   别名: effect:particle, e:particles, e:p
+#   用法: effect:particles{p=FLAME;amount=100;hSpread=5;ySpread=3;speed=1;yOffset=0.5} @self
+#   注意: 参数是 hSpread/ySpread (不是 hS/vS)
+
+# effect:sound - 音效
+#   sound/s: 音效名称 (如 entity.lightning_bolt.thunder, block.anvil.land 等)
+#   volume: 音量 (float, 默认 1.0)
+#   pitch: 音调 (float, 默认 1.0)
+#   radius: 听觉范围
+#   audience: 受众
+#   别名: e:sound, e:s
+#   用法: effect:sound{s=entity.lightning_bolt.thunder;volume=1.0;pitch=1.5} @self
+
+# effect:explosion - 爆炸效果 (视觉)
+#   仅视觉效果，不造成伤害
+#   别名: e:explosion, effect:explode, e:explode, fakeexplosion, fakeexplode
+#   用法: effect:explosion @self
+
+# lightning - 召唤闪电 (造成伤害)
+#   damage/amount: 伤害量 (double)
+#   用法: lightning{amount=10} @target
+
+# effect:lightning - 召唤闪电 (仅视觉)
+#   不造成伤害
+#   localized/localizedRadius: 仅本地可见/范围 (boolean/int)
+#   别名: e:lightning, fakelightning
+#   用法: effect:lightning @target
+
+# blockmask - 放置方块 (临时/永久)
+#   material/mat/block: 方块材质 (默认 GRAVEL)
+#   radius: 半径
+#   radiusY/radiusy: Y 半径
+#   duration: 持续时间 (tick)
+#   noise/randomness: 噪声/随机性
+#   sphere/shape: 形状 (SPHERE 或 CUBE)
+#   noair: 不替换空气 (boolean)
+#   audience: 受众
+#   别名: effect:blockMask, e:blockMask
+#   用法: blockmask{material=SLIME_BLOCK;radius=1;duration=100} @self
+
+# summonfallingblock - 召唤下落方块
+#   type/block/material: 方块类型 (默认 DIRT)
+#   别名: summonFallingBlock
+#   用法: summonfallingblock{type=ANVIL} @target
+
+# effect:ender - 末影人传送粒子效果
+#   别名: e:ender
+#   用法: effect:ender @self
+
+# effect:enderbeam - 末影光束粒子
+#   duration: 持续时间 (tick)
+#   yoffset/yOffset: Y 偏移
+#   别名: enderbeam
+#   用法: effect:enderbeam{duration=60} @target
+
+# effect:geyser - 喷泉效果
+#   type: 水/岩浆 (默认 water)
+#   height: 高度
+#   interval/speed: 动画速度 (tick)
+#   别名: e:geyser
+#   用法: effect:geyser{type=lava;height=3} @self
+
+# --- 爆炸类 ---
+
+# explosion - 真实爆炸 (造成伤害/破坏)
+#   yield: 爆炸强度 (默认 0.01337)
+#   blockdamage: 是否破坏方块 (默认 false)
+#   fire: 是否留下火焰 (默认 false)
+#   usesource/usecaster: 施法者为伤害来源 (默认 true)
+#   别名: explode
+#   用法: explosion{yield=4;blockdamage=false} @target
+
+# effect:explosion - 爆炸效果 (仅视觉)
+#   仅视觉效果，不造成伤害或破坏
+#   别名: e:explosion, effect:explode, e:explode, fakeexplosion, fakeexplode
+#   用法: effect:explosion @self
+
+# shootfireball - 发射火球
+#   yield/strength: 爆炸强度
+#   velocity: 速度
+#   fireticks/incendiary: 火焰持续时间
+#   type: NORMAL/SMALL (小号火球)
+#   别名: fireball
+#   用法: shootfireball{yield=2;velocity=15;type=SMALL} @target
+
+# --- 特殊位移 ---
+
+# leap - 跳跃
+#   velocity: 跳跃力度 (默认 100)
+#   noise: 随机偏移
+#   用法: leap{velocity=200} @target
+
+# teleportin - 定向传送
+#   direction/dir: 方向向量 (格式 c=x,y,z)
+#   yaw: 朝向
+#   别名: tpin, tpi
+#   用法: teleportin{direction=c=0,0,-5} @self
+
+# teleportto - 传送到指定位置
+#   coordinates/coords: 坐标 (格式 x,y,z)
+#   world: 目标世界
+#   yaw/pitch: 朝向
+#   别名: tpt, tpl
+#   用法: teleportto{coordinates=100,64,100} @self
+
+# --- 光环/状态类 ---
+
+# shield - 护盾/吸收生命
+#   amount: 吸收量
+#   maxabsorb/maxshield: 最大吸收量
+#   noloop: 禁用循环 (boolean)
+#   用法: shield{amount=50;maxshield=100} @self
+
+# sethealth - 设置生命值
+#   直接将目标血量设为指定值
+#   amount: 目标血量值
+#   别名: sethp
+#   用法: sethealth{amount=1} @target
+
+# velocity - 设置实体速度
+#   velocityx/velocityX: X 速度
+#   velocityy/velocityY: Y 速度
+#   velocityz/velocityZ: Z 速度
+#   relative: 相对面朝方向 (boolean)
+#   mode: SET/ADD/MULTIPLY (默认 SET)
+#   用法: velocity{velocityx=0;velocityy=2;velocityz=0} @self
+
+# ignite - 点燃实体
+#   ticks/duration: 点燃持续时间
+#   用法: ignite{ticks=100} @target
+
+# attribute - 修改实体属性
+#   attr: 属性名 (默认 GENERIC_LUCK)
+#   amount/amt: 修改值
+#   duration/dur: 持续时间 (tick)
+#   别名: setAttribute
+#   用法: attribute{attr=GENERIC_MAX_HEALTH;amount=20;duration=100} @self
+
+# stun - 晕眩实体 (通过光环实现)
+#   stopai: 停止 AI (boolean)
+#   gravity: 停止重力 (boolean)
+#   facing: 冻结朝向 (boolean)
+#   noknockback: 免疫击退 (boolean)
+#   用法: stun{stopai=true;duration=60} @target
+
+# giveitem - 给玩家物品
+#   items/item: 物品名/掉落表
+#   type/material: 物品材质
+#   dofakelooting: 拾取动画 (boolean)
+#   别名: give, itemgive
+#   用法: giveitem{items=GoldenSword} @target
+
+# --- 弹射物链/光束 ---
+
+# chain - 连锁弹跳技能
+#   onbounceskill/onbounce: 每次弹跳执行的技能 (必填)
+#   bounces: 弹跳次数
+#   bouncedelay: 弹跳间隔 (tick)
+#   bounceradius/bouncerange: 弹跳搜索半径
+#   hitself: 是否命中自身 (默认 false)
+#   hitplayers: 是否命中玩家 (默认 true)
+#   hitnonplayers/hnp: 是否命中非玩家 (默认 true)
+#   用法: chain{bounces=5;bounceradius=10;onbounceskill=ChainHit} @target
+
+# beam - 光束技能
+#   onhitskill: 命中实体时技能
+#   ontickskill: 每 tick 技能
+#   duration: 持续时间 (tick)
+#   material: 光束材质 (默认 END_ROD)
+#   hitradius: 命中半径 (默认 1.0)
+#   用法: beam{duration=100;onhitskill=LaserHit;material=MAGMA_BLOCK} @target
+
+# --- 召唤与传送 ---
+
+# command - 执行命令
+#   command/cmd: 要执行的命令 (支持占位符)
+#   asCaster/ascaster: 以施法者身份执行 (boolean, 默认 false)
+#   asTarget/astarget: 以目标身份执行 (boolean, 默认 false)
+#   asOp/asOperator: 以 OP 身份执行 (boolean)
+#   requireTarget: 需要目标存在 (boolean)
+#   用法: command{command="give <target.name> diamond 1";astarget=true} @self
+
+# signal - 发送信号
+#   signal: 信号名
+#   别名: sendSignal, ping
+#   用法: signal{signal=PHASE_TWO} @self
+
+# --- 变量操作 ---
+
+# variableset - 设置变量
+#   variable/value: 变量名和值
+#   scope: 作用域 (caster/target/world/global/skill)
+#   type: 变量类型 (INTEGER/FLOAT/DOUBLE/STRING/LOCATION/等)
+#   duration: 持续时间
+#   别名: setVariable, setVar
+#   用法: variableset{variable=caster.timesHit;value=1;type=INTEGER;scope=skill} @self
+
+# variableadd - 增加变量值
+#   variable/value: 变量名和增量
+#   scope: 作用域
+#   amount: 增量
+#   别名: addVariable, addVar, varAdd, incrementVariable
+#   用法: variableadd{variable=caster.kills;amount=1;scope=caster} @self
+
+# variableunset - 删除变量
+#   variable: 变量名
+#   scope: 作用域
+#   别名: unsetVariable, unsetVar, varUnset
+#   用法: variableunset{variable=caster.tempFlag;scope=caster} @self
+
+# variablemath - 变量运算 (VariableMathMechanic)
+
+# --- 杂项 ---
+
+# delay - 延迟执行
+#   在下方的技能行之前插入延迟 (tick)
+#   用法:
+#     - effect:sound{s=prepare} @self
+#     - delay 20
+#     - effect:sound{s=attack} @self
+
+# weather - 改变天气
+#   type/weather: 天气类型 (sunny/clear, rainy/rain, stormy/thunder/thundering)
+#   duration: 持续时间
+#   用法: weather{type=stormy;duration=6000} @self
+
+# time - 改变时间
+#   time/ticks: 设置的时间 (tick 或数字)
+#   mode: 模式 (SET/ADD/RELATIVE)
+#   personal/person: 仅对目标玩家生效 (boolean)
+#   world: 目标世界
+#   用法: time{time=18000;mode=SET} @self
+
+# disguise - 伪装实体 (需要 LibsDisguises)
+#   disguise/type: 伪装类型 (如 player Ashijin)
+#   audience: 对谁可见
+#   用法: disguise{type=ZOMBIE} @self
+
+# aura - 光环效果
+#   在目标身上持续附加一组技能效果
+#   auraName: 光环名称
+#   charges: 使用次数
+#   maxStacks: 最大叠层
+#   mergeSameCaster: 同施法者合并 (boolean)
+#   overwriteCaster: 覆盖施法者 (boolean)
+#   refreshDuration: 刷新持续时间
+#   components: 光环组件 (技能列表)
+#   interval: 执行间隔 (tick)
+#   targetIsCaster: 目标是施法者 (boolean)
+#   auraTags: 光环标签
+#   别名: buff, debuff
+#   用法: aura{auraName=Fire_Aura;interval=20} @self
+
+# cancelSkill - 取消/终止技能
+#   别名: cancel
+#   用法: cancelskill @self
+
+# --- 物品专属 Mechanics (需要 MythicCrucible) ---
+
+# consume - 消耗物品
+#   用法: consume @self
+
+# closeInventory - 关闭物品栏
+#   用法: closeInventory @self
+
+# ==========================================
+# [SECTION 5] 常用技能条件 (Conditions) 参考
+# ==========================================
+# 条件放在技能的 Conditions 节点下
+# 格式: - conditionname{param=value}
+
+# 目标位置条件:
+#   targetwithin{d=25}              # 目标在 N 格内
+#   distance{d=10}                  # 目标距离范围
+#   altitude{height=0to64}          # 高度范围
+#   outside                         # 目标在露天下
+#   inside                          # 目标在遮蔽下
+#   onGround                        # 目标在地面上 (别名: grounded)
+#   inLiquid                        # 目标在液体中
+#   onBlock{types=DIRT,GRASS}       # 站在特定方块上
+#   blockAbove{types=STONE}         # 头上有特定方块
+#   inregion{region=REGION_NAME}    # 在 WorldGuard 区域内
+#   playerwithin{d=40}              # 玩家在范围内 (别名: playerWithin, playerswithin)
+#   playernotwithin{d=10}           # 玩家不在范围内
+
+# 实体状态条件:
+#   health{amount=0to100}           # 生命值范围
+#   healthpercent{percent=<50%}     # 生命百分比
+#   burning                         # 着火状态 (别名: isburning)
+#   blocking                        # 格挡状态 (别名: isblocking)
+#   crouching                       # 潜行状态 (别名: sneaking)
+#   sprinting                       # 冲刺状态
+#   gliding                         # 滑翔状态 (别名: isgliding)
+#   flying/isflying                 # 飞行状态
+#   climbing                        # 攀爬状态
+#   isbaby                          # 幼年状态
+#   isplayer                        # 是玩家
+#   ismonster                       # 是怪物
+#   isliving                        # 是生物
+#   hasAI                           # 有 AI
+#   hasgravity                      # 有重力
+#   hasowner                        # 有主人
+#   hasparent                       # 有父实体
+#   haspassenger                    # 有乘客
+#   isTamed                         # 已驯服
+#   isLeashed                       # 被拴绳拴住
+#   mounted                         # 在载具上
+#   iscaster                        # 是施法者
+#   ischild                         # 是施法者的子实体
+#   isParentAlive                   # 父实体还活着
+#   issibling                       # 是同级实体 (别名: sibling)
+
+# 物品/穿戴条件:
+#   holding{types=DIAMOND_SWORD}    # 手持物品类型
+#   wearing{slot=HEAD;types=DIAMOND_HELMET} # 穿戴物品
+#   hasItem{types=DIAMOND;amount=1to64}    # 背包中有物品
+#   offhand/hasoffhand{types=SHIELD} # 副手物品
+#   entityItemType{types=DIAMOND}    # 实体是物品且匹配类型
+
+# 生物/世界条件:
+#   entityType{types=ZOMBIE,SKELETON} # 实体类型
+#   mythicMobType{type=SkeletonKing} # MythicMob 类型
+#   faction{faction=Void}          # 派系 (别名: samefaction)
+#   mobsinradius{amount=1to5;radius=20} # 半径内怪物数量
+#   mobsinworld{amount=0to100}     # 世界内怪物数量
+#   playersInRadius{amount=0to5;distance=30} # 半径内玩家数量
+#   livinginradius{amount=1to3;radius=10} # 半径内生物数量
+#   world{world=world_nether}      # 指定世界
+#   dimension{env=THE_END}         # 指定维度
+#   biome{biomes=DESERT,PLAINS}    # 指定生物群系
+#   biomeType{type=DRY}             # 生物群系类型
+
+# 时间/天气条件:
+#   day                            # 白天
+#   night                          # 夜晚
+#   dawn                           # 黎明
+#   dusk                           # 黄昏
+#   sunny/issunny                  # 晴天
+#   raining/israining              # 雨天
+#   thundering/stormy              # 雷暴
+#   lunarPhase{phase=0to7}         # 月相
+#   worldtime{time=0to12000}       # 世界时间
+
+# 技能/伤害条件:
+#   damageCause{cause=ENTITY_ATTACK} # 伤害原因
+#   damageAmount{amount=10to100}   # 伤害量
+#   skillOnCooldown{skill=SKILL}   # 技能冷却中
+#   skillIsRecharging{skill=SKILL} # 技能充能中
+#   hasAura{aura=NAME}             # 有光环
+#   offGCD                         # 不在全局冷却中
+#   incombat                       # 在战斗中
+
+# 概率/比较条件:
+#   chance{chance=0.1}             # 10% 概率通过
+#   variableEquals{value=X;scope=caster} # 变量值等于
+#   variableInRange{value=0to10;scope=caster} # 变量值在范围内
+#   variableIsSet{scope=caster}    # 变量已设置
+#   compareValues{value1=X;value2=Y;operator=EQUALS} # 值比较
+#   stringEquals{value1=X;value2=Y} # 字符串相等
+#   score{obj=OBJ;ent=ENTRY;val=0to10} # 记分板分数
+#   haspermission{permission=perm.node} # 有权限
+#   hasCurrency{amount=100}         # 有经济货币
+#   level{data=0to30}              # 玩家等级
+
+# 视线/朝向条件:
+#   lineOfSight                   # 在视线内 (别名: inlineofsight)
+#   lineOfSightFromOrigin         # 原点视线内
+#   targetInLineOfSight           # 目标有施法者视线
+#   lookingAt{type=entity;distance=15} # 正在看某物
+#   pitch{data=-90to90}           # 俯仰角度
+#   yaw{yaw=0to360}               # 方向角度
+#   fieldOfView{angle=90}          # 视野内 (别名: fov)
+#   velocity{velocity=1to10}       # 移动速度
+
+# ==========================================
+# [SECTION 6] 完整技能示例
+# ==========================================
+
+# 示例: Boss 主动技能
+SmashAttack:
+  Cooldown: 8
+  Conditions:
+  - targetwithin{d=25}
+  Skills:
+  - message{m="<mob.name><&co> Hahahah! I will crush you, fool!"} @PlayersInRadius{r=40}
+  - teleport @target
+  - effect:sound{s=entity.enderman.teleport;volume=1.0;pitch=0.5} @self
+  - delay 10
+  - damage{amount=5;ignorearmor=true} @PlayersInRadius{r=5}
+  - throw{velocity=10;velocityY=5} @PlayersInRadius{r=5}
+  - effect:explosion @self
+
+# 示例: 召唤技能
+SummonSkeletons:
+  Cooldown: 15
+  Skills:
+  - message{m="<caster.name><&co> Arise, my minions!"} @PlayersInRadius{r=40}
+  - summon{type=SkeletalMinion;amount=2;noise=5} @self
+  - delay 20
+  - summon{type=SkeletalMinion;amount=2;noise=5} @self
+  - delay 20
+  - summon{type=SkeletalMinion;amount=2;noise=5} @self
+
+# 示例: 范围毒性技能
+AngrySludgePoison:
+  Cooldown: 10
+  Skills:
+  - potion{type=POISON;lvl=2;duration=100} @PlayersInRadius{r=15}
+  - effect:particles{p=happyVillager;amount=1000;hSpread=15;ySpread=1;speed=0;yOffset=0.5} @self
+
+# 示例: 带有阶段切换的 Boss 技能
+PhaseChange:
+  Conditions:
+  - healthpercent{percent=<50%}
+  Skills:
+  - message{m="&c&lBoss: &eYou've only made me stronger!"} @PlayersInRadius{r=30}
+  - potion{type=DAMAGE_RESISTANCE;lvl=1;duration=200} @self
+  - effect:sound{s=entity.wither.spawn;volume=2;pitch=0.5} @self
+  - effect:particles{p=FLAME;amount=200;hSpread=5;ySpread=3;speed=0.5} @self
+
+# ==========================================
+# [SECTION 7] 常见错误对照
+# ==========================================
+[PITFALLS]
+# 以下是原有 lisk 文件中常见的错误，请特别注意避免:
+
+1. 药水参数名错误
+   ❌ effect:potion{t=DAMAGE_RESISTANCE;d=100;l=1}
+   ✅ potion{type=DAMAGE_RESISTANCE;duration=100;lvl=1}
+   说明: 参数名是 type/duration/lvl，不是 t/d/l。
+
+2. 粒子参数名错误
+   ❌ effect:particles{p=end_rod;amount=50;speed=1;hS=1;vS=1}
+   ✅ effect:particles{p=end_rod;amount=50;speed=1;hSpread=1;ySpread=1}
+   说明: 扩散参数是 hSpread/ySpread，不是 hS/vS。
+
+3. 装备格式错误
+   ❌ - Excalibur_Sword:HAND
+   ✅ - Excalibur_Sword HAND
+   说明: 物品 ID 和槽位之间用空格分隔，不是冒号。
+
+4. 掉落物格式错误
+   ❌ - Excalibur_Sword:1:0.05
+   ✅ - Excalibur_Sword 1 0.05
+   ✅ - GOLD_NUGGET 5to10 1.0
+   说明: 物品ID、数量、概率之间用空格分隔。数量范围用 to 连接。
+
+5. 物品选项格式错误
+   ❌ Options:
+        Unbreakable: true
+        HideAttributes: true
+   ✅ Hide:
+      - ATTRIBUTES
+      - ENCHANTS
+      或者:
+      Options:
+        Unbreakable: true
+   说明: Hide 是独立节点，值是列表格式。Unbreakable 在 Options 下。
+
+6. 触发概率格式
+   ❌ ~onAttack:0.1 (冒号分隔)
+   ✅ ~onAttack 0.1 (空格分隔)
+   例外: ~onTimer:100 和 ~onSignal:SIGNAL_NAME 内部用冒号。
+
+7. 技能参数分隔符
+   ❌ damage{amount=100,ignoreArmor=true} (逗号分隔)
+   ✅ damage{amount=100;ignorearmor=true} (分号分隔)
+   注意: 参数名是 ignorearmor (全小写)，不是 ignoreArmor。
+
+8. Items 的 Skills 节点
+   MM 5.x 中，物品的技能配置 (Skills 节点) 需要 MythicCrucible 附加插件。
+   基础 MythicMobs 物品不支持直接绑定技能。
+   如需给物品添加技能，请在注释中说明需要 Crucible。
+
+9. 药水类型
+   ❌ DAMAGE_RESISTANCE
+   ✅ DAMAGE_RESISTANCE 在较新版本中可能已改名或分拆
+   常用有效值: POISON, SLOW, SPEED, STRENGTH, WEAKNESS, WITHER,
+             REGENERATION, INVISIBILITY, FIRE_RESISTANCE, WATER_BREATHING,
+             NIGHT_VISION, JUMP_BOOST, HASTE, MINING_FATIGUE, NAUSEA,
+             BLINDNESS, HUNGER, INSTANT_DAMAGE, INSTANT_HEALTH, SATURATION,
+             GLOWING, LEVITATION, LUCK, BAD_LUCK, SLOW_FALLING,
+             CONDUIT_POWER, DOLPHINS_GRACE, BAD_OMEN, HERO_OF_THE_VILLAGE,
+             DARKNESS
+
+10. 伤害参数名
+    ✅ damage{amount=10;ignorearmor=true}    (全小写 ignorearmor)
+    ❌ damage{ignoreArmor=true}             (大写 A)
+    ❌ dmg{amount=10}                       (虽然 dmg 是别名，建议用 damage)
+
+11. 物品 Skills 节点
+    MM 5.12.0 核心中，物品的 Skills 节点需要 MythicCrucible 附加插件。
+    如果没有 Crucible，物品的 Skills 会被忽略或报错。
+    如需给物品添加技能，必须在输出中标注需要 Crucible。
+
+12. ~onUse / ~onUseCooldown 不存在于基础 MM 5.12.0
+    这些是 Crucible 附加功能。基础版的物品触发器只有:
+    ~onRightClick, ~onSwing(~onLeftClick), ~onConsume, ~onEquip, ~onUnequip,
+    ~onBlockPlace, ~onBlockBreak, ~onShoot (全部需要 Crucible 才能生效)
+
+13. 弹射物 mechanics 的参数是对应关系，不是同义词
+    projectile 的 type 参数和 potion 的 type 参数不同:
+    - projectile{type=ARROW}  → 弹射物外形
+    - potion{type=POISON}     → 药水效果类型
+    - shoot{type=ARROW}       → 同 projectile 的 type 用法
+
+14. 目标选择器内参数用分号分隔
+    ✅ @PlayersInRadius{radius=15;sort=NEAREST;limit=3}
+    ❌ @PlayersInRadius{radius=15,sort=NEAREST,limit=3}
+    ❌ @PlayersInRadius{r=15,sort=NEAREST}

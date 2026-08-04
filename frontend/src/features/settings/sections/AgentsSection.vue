@@ -23,9 +23,22 @@ const addingDetected = ref('')
 const agents = computed(() => aiSettings.value?.agents ?? [])
 const detectedAgents = computed(() => aiSettings.value?.detected_agents ?? [])
 const activeAgent = computed(() => aiSettings.value?.active_agent ?? null)
+const codexFullAccessReadyAgentIds = computed(() => new Set(aiSettings.value?.codex_full_access_ready_agent_ids ?? []))
 const agentKindLabel = (kind: string) => AGENT_KINDS.find(item => item.key === kind)?.label ?? kind
 const agentCommandHint = computed(() => AGENT_KINDS.find(item => item.key === agentForm.value.kind)?.commandHint ?? '')
 const agentTransportLabel = (agent: AiAgent) => (agent.transport ?? 'acp') === 'cli' ? '原生 CLI' : 'ACP'
+const fullAccessAgentPolicyMessage = (agent: AiAgent) => {
+  if (aiSettings.value?.review_mode !== 'full') return ''
+  if (agent.kind !== 'codex' || (agent.transport ?? 'acp') !== 'cli') return '完全访问仅支持原生 Codex CLI'
+  if (codexFullAccessReadyAgentIds.value.has(agent.id)) return ''
+  return aiSettings.value?.codex_full_access_available ? '当前 Codex 命令未授权' : 'Codex 完整权限尚未配置'
+}
+const agentAccessDetail = (agent: AiAgent) => {
+  if (aiSettings.value?.review_mode !== 'full') {
+    return agent.kind === 'codex' && (agent.transport ?? 'acp') === 'cli' ? '只读保护' : ''
+  }
+  return fullAccessAgentPolicyMessage(agent) || '完全访问已就绪'
+}
 const detectedConfigured = (detected: DetectedAgent) => agents.value.some(agent => agent.kind === detected.kind && (agent.transport ?? 'acp') === 'cli')
 const detectedStatus = (detected: DetectedAgent) => detected.available ? (detectedConfigured(detected) ? '已接入' : '可用') : detected.installed ? '已检测，但不可用' : '未安装'
 const formReasoningEfforts = computed(() => {
@@ -51,7 +64,7 @@ function fillAgentPreset(kind: string) {
   if (kind === 'codex' || kind === 'claude-code') {
     const detected = detectedAgents.value.find(item => item.kind === kind)
     agentForm.value.transport = 'cli'
-    agentForm.value.command = detected?.command || (kind === 'codex' ? 'codex' : 'claude')
+    agentForm.value.command = detected?.path ?? detected?.command ?? (kind === 'codex' ? 'codex' : 'claude')
     agentForm.value.args = ''
   } else {
     agentForm.value.transport = 'acp'
@@ -89,7 +102,7 @@ async function addDetectedAgent(detected: DetectedAgent) {
   try {
     await apiRequest('/api/ai/agents', {
       method: 'POST',
-      body: JSON.stringify({ name: detected.name, kind: detected.kind, command: detected.command, args: [], enabled: true, transport: 'cli', reasoning_effort: null }),
+      body: JSON.stringify({ name: detected.name, kind: detected.kind, command: detected.path ?? detected.command, args: [], enabled: true, transport: 'cli', reasoning_effort: null }),
     })
     await loadAi()
     flash(`${detected.name} 已接入，可在对话输入框中选择`)
@@ -116,6 +129,9 @@ async function testAgent(agent: AiAgent) {
   } finally { agentTesting.value = '' }
 }
 async function setActiveAgent(agentId: string | null) {
+  const agent = agentId ? agents.value.find(item => item.id === agentId) : null
+  const policyMessage = agent ? fullAccessAgentPolicyMessage(agent) : ''
+  if (policyMessage) { flash(policyMessage); return }
   try {
     aiSettings.value = await apiRequest<AiSettingsView>('/api/ai/agents/active', { method: 'PUT', body: JSON.stringify({ agent_id: agentId }) })
     flash(agentId ? '默认对话已切换到该 Agent' : '已恢复内置 Sculk Agent（模型直连）')
@@ -161,13 +177,14 @@ async function setActiveAgent(agentId: string | null) {
         <p>
           <b>{{ agent.name }}<em style="margin-left:6px;padding:2px 5px;border-radius:4px;color:#8f84d8;background:rgba(156,140,255,.1);font:normal 7px Inter">{{ agentKindLabel(agent.kind) }} · {{ agentTransportLabel(agent) }}</em></b>
           <code>{{ agent.command }} {{ agent.args.join(' ') }}</code>
+          <small v-if="agentAccessDetail(agent)">{{ agentAccessDetail(agent) }}</small>
         </p>
         <span v-if="agentTestResults[agent.id]" class="s-test" :class="{ok:agentTestResults[agent.id].ok}">
           <template v-if="agentTestResults[agent.id].ok">✓ {{ agentTestResults[agent.id].latency_ms }} ms<em v-if="agentTestResults[agent.id].reply"> · {{ agentTestResults[agent.id].reply }}</em></template>
           <template v-else>✗ {{ agentTestResults[agent.id].error }}</template>
         </span>
         <span v-if="activeAgent===agent.id" class="s-test ok" style="display:flex;align-items:center;gap:4px"><Check style="width:11px"/>默认对话使用</span>
-        <button v-else-if="agent.enabled" class="s-btn small" @click="setActiveAgent(agent.id)">设为默认</button>
+        <button v-else-if="agent.enabled" class="s-btn small" :disabled="!!fullAccessAgentPolicyMessage(agent)" :title="fullAccessAgentPolicyMessage(agent)||'设为默认'" @click="setActiveAgent(agent.id)">设为默认</button>
         <button class="s-btn small" :disabled="agentTesting===agent.id" @click="testAgent(agent)"><LoaderCircle v-if="agentTesting===agent.id" class="s-spin"/><FlaskConical v-else/>测试</button>
         <button class="s-btn small" @click="openAgentEdit(agent)"><Pencil/></button>
         <button class="s-btn small danger" @click="askDeleteAgent(agent)"><Trash2/></button>

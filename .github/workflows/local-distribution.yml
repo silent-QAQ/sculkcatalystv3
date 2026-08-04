@@ -1,0 +1,92 @@
+name: local-distribution
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - backend/**
+      - frontend/**
+      - scripts/package-local.ps1
+      - scripts/package-local.sh
+      - scripts/start-local.ps1
+      - scripts/start-local.sh
+      - scripts/stop-local.ps1
+      - scripts/stop-local.sh
+      - LICENSE
+      - NOTICE
+      - LICENSES/**
+      - .github/workflows/local-distribution.yml
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Optional package version. Leave blank to use the backend Cargo version.
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package-local:
+    name: Package local distribution (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows x86_64
+            artifact_name: sculk-catalyst-local-windows-x86_64
+            archive_glob: '*.zip*'
+          - os: ubuntu-latest
+            label: Linux x86_64
+            artifact_name: sculk-catalyst-local-linux-x86_64
+            archive_glob: '*.tar.gz*'
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.88'
+
+      - name: Build Windows local distribution
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.version || '' }}
+        run: |
+          $arguments = @()
+          if (-not [string]::IsNullOrWhiteSpace($env:RELEASE_VERSION)) {
+            $arguments += @('-Version', $env:RELEASE_VERSION)
+          }
+          & ./scripts/package-local.ps1 @arguments
+
+      - name: Build Linux local distribution
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version || '' }}
+        run: |
+          arguments=()
+          if [[ -n "${RELEASE_VERSION:-}" ]]; then
+            arguments+=(--version "$RELEASE_VERSION")
+          fi
+          bash ./scripts/package-local.sh "${arguments[@]}"
+
+      - name: Upload local distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: artifacts/generated/local/${{ matrix.archive_glob }}
+          if-no-files-found: error
+          retention-days: 14
