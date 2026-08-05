@@ -79,7 +79,11 @@ function Remove-ManagedPath([string]$BasePath, [string]$Path) {
 
 function Get-ApplicationPath([string[]]$Names) {
     foreach ($name in $Names) {
-        $command = Get-Command -Name $name -CommandType Application -ErrorAction SilentlyContinue
+        # GitHub-hosted Windows runners can expose the Node setup cache and the
+        # system Node installation under the same command name. Select exactly
+        # one application path instead of coercing the collection to a string.
+        $command = Get-Command -Name $name -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
         if ($null -ne $command) {
             return $command.Source
         }
