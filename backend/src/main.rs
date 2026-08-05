@@ -1907,6 +1907,7 @@ async fn import_workspace(
             .servers
             .iter()
             .any(|server| server.kind == "server" && server.port == detected.port);
+    let is_server = detected.kind == "server";
     let configured_port = if !is_server || port_conflict {
         0
     } else {
@@ -1932,7 +1933,6 @@ async fn import_workspace(
             .take(8)
             .collect::<String>()
     );
-    let is_server = detected.kind == "server";
     let lifecycle_phase = if !is_server {
         "project"
     } else if detected.core_ready {
@@ -7044,6 +7044,21 @@ mod tests {
         assert!(build_action_args(BuildTool::Maven, "build").is_some());
         assert!(build_action_args(BuildTool::Maven, "-DskipTests package").is_none());
         assert!(build_action_args(BuildTool::Gradle, "publish").is_none());
+    }
+
+    #[test]
+    fn project_build_shell_labels_cannot_contain_workspace_paths() {
+        for tool in [BuildTool::Maven, BuildTool::Gradle] {
+            assert!(is_build_shell_label(tool, build_wrapper_name(tool)));
+            for name in build_path_names(tool) {
+                assert!(is_build_shell_label(tool, name));
+            }
+        }
+        assert!(!is_build_shell_label(
+            BuildTool::Maven,
+            r"C:\plugin&echo injected\mvnw.cmd"
+        ));
+        assert!(!is_build_shell_label(BuildTool::Gradle, "custom-build.cmd"));
     }
 
     #[test]

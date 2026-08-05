@@ -667,6 +667,12 @@ async fn collect_player_data_files(
                     ));
                 }
                 let entry = entry.map_err(|error| format!("读取玩家数据文件失败：{error}"))?;
+                let file_type = entry
+                    .file_type()
+                    .map_err(|error| format!("读取玩家数据文件类型失败：{error}"))?;
+                if file_type.is_symlink() || !file_type.is_file() {
+                    continue;
+                }
                 let name = entry.file_name().to_string_lossy().to_string();
                 if !name.ends_with(".dat") {
                     continue;
