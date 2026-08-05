@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { Activity, AlertTriangle, Archive, Bot, Box, BrainCircuit, ChevronDown, ChevronRight, ChevronUp, CircleStop, Copy, CornerDownRight, Cpu, Database, Download, FileCode2, FileUp, Files, Folder, FolderTree, Gauge, GitBranch, LayoutDashboard, ListPlus, MapPin, MessageSquareText, Mic, MoreHorizontal, PanelLeftClose, Paperclip, Pencil, Play, PlugZap, Plus, RefreshCw, RotateCcw, RotateCw, Search, Send, Server, Settings, ShieldCheck, Sparkles, SquareTerminal, Trash2, Users, Vote, X, Coffee, HardDrive, Check, LoaderCircle, SlidersHorizontal } from 'lucide-vue-next'
+import { Activity, AlertTriangle, Archive, Bot, Box, BrainCircuit, ChevronDown, ChevronRight, ChevronUp, CircleStop, Copy, CornerDownRight, Cpu, Database, Download, FileCode2, FileUp, Files, Folder, FolderOpen, FolderTree, Gauge, GitBranch, LayoutDashboard, ListPlus, MapPin, MessageSquareText, Mic, MoreHorizontal, PanelLeftClose, Paperclip, Pencil, Play, PlugZap, Plus, RefreshCw, RotateCcw, RotateCw, Search, Send, Server, Settings, ShieldCheck, Sparkles, SquareTerminal, Trash2, Users, Vote, Wrench, X, Coffee, HardDrive, Check, LoaderCircle, SlidersHorizontal } from 'lucide-vue-next'
 import AutomationView from './components/AutomationView.vue'
 import CommunityView from './components/CommunityView.vue'
 import ConversationTree from './components/ConversationTree.vue'
@@ -8,6 +8,7 @@ import ConversationMessageContent from './features/conversations/ConversationMes
 import IntegrationsView from './components/IntegrationsView.vue'
 import MirrorCenterView from './features/mirror/MirrorCenterView.vue'
 import SettingsView from './features/settings/SettingsView.vue'
+import ProjectBuildManager from './features/project/ProjectBuildManager.vue'
 import WorkspacePanelResizer from './components/WorkspacePanelResizer.vue'
 import { API_BASE, ApiError, apiRequest } from './lib/api'
 import { filterDeletedWorkspaceSnapshot } from './lib/dashboard-state'
@@ -29,7 +30,7 @@ import type { SkillItem } from './features/settings/types'
 type Status = 'online' | 'stopped' | 'warning' | 'planning' | 'ready'
 type ServerOperationState = 'idle' | 'provisioning' | 'starting' | 'stopping'
 type WorkspaceKind = 'server' | 'project'
-type Tab = 'overview' | 'files' | 'terminal'
+type Tab = 'overview' | 'files' | 'build' | 'terminal'
 type Surface = 'control' | 'automation' | 'community' | 'integrations' | 'mirror' | 'settings'
 interface SocialServiceSettings { enabled:boolean; qq_bot:boolean; bilibili_bot:boolean; douyin_bot:boolean; sync_interval_seconds:number; burst_interval_seconds:number; burst_recovery_seconds:number }
 interface ServiceSettings { social:SocialServiceSettings; economy:boolean; player_support:boolean; game_operations:boolean; content_improvement:boolean }
@@ -48,6 +49,7 @@ interface FileEntry { name:string;path:string;kind:'folder'|'file';size:number;m
 interface ComposerSuggestion { id:string;kind:ComposerTokenKind;label:string;detail:string;value:string;agentId?:string;filePath?:string;skill?:SkillItem }
 interface CatalogCore { slug:string;name:string;minecraft_versions:string[] }
 interface DownloadStatus { task_id:string; phase:string; source:string; received:number; total?:number|null; percent:number; message:string }
+interface OpenDirectoryResponse { server:ServerItem; directory?:string; detected?:Record<string,unknown>|null; warnings?:string[]; files?:string[] }
 interface SpeechRecognitionAlternativeLike { transcript:string }
 interface SpeechRecognitionResultLike { isFinal:boolean; 0:SpeechRecognitionAlternativeLike }
 interface SpeechRecognitionResultListLike { length:number; [index:number]:SpeechRecognitionResultLike }
@@ -82,6 +84,8 @@ let modelSpeechStream:MediaStream|null=null
 let modelSpeechChunks:Blob[]=[]
 let speechRecordingTimer:number|undefined
 const showCreate = ref(false), createStep = ref(1), creating = ref(false), systemInfo = ref<SystemInfo|null>(null)
+const showOpenDirectory = ref(false), openingDirectory = ref(false), openDirectoryPath = ref(''), openDirectoryName = ref(''), openDirectoryError = ref('')
+const openDirectorySummary = ref<OpenDirectoryResponse|null>(null)
 const dashboardState = ref<'loading'|'ready'|'error'>('loading'), dashboardError = ref('')
 const systemState = ref<'idle'|'loading'|'ready'|'error'>('idle'), systemError = ref('')
 const javaInstallState = ref<'idle'|'installing'|'success'|'error'>('idle'), javaInstallError = ref('')
@@ -931,6 +935,50 @@ async function api(url:string, options?:RequestInit){return apiRequest<any>(url,
 const remoteConnections=computed(()=>(uiSettings.value?.connections??[]).filter(connection=>connection.enabled))
 const selectedLocationLabel=computed(()=>createForm.value.location==='local'?(systemInfo.value?.data_dir||'数据目录尚未获取'):'远程服务器（暂未支持）')
 const projectLocationLabel=computed(()=>projectForm.value.location==='local'?'本机项目工作区 · data/projects':'远程项目（暂未支持）')
+const openDirectoryModeLabel=computed(()=>workspaceMode.value==='project'?'项目':'服务器')
+const openDirectoryDetectedRows=computed(()=>{
+  const detected=openDirectorySummary.value?.detected
+  if(!detected||typeof detected!=='object')return[]
+  const labels:Record<string,string>={name:'名称',core:'核心',version:'Minecraft 版本',port:'端口',memory_gb:'内存上限',core_ready:'核心状态',java_major:'Java 版本',server_properties:'server.properties',sculk_manifest:'sculk.yml'}
+  return Object.entries(detected).filter(([,value])=>value!==null&&value!==undefined).map(([key,value])=>({key,label:labels[key]??key,value:formatOpenDirectoryValue(value)}))
+})
+function formatOpenDirectoryValue(value:unknown):string{
+  if(typeof value==='boolean')return value?'已检测到':'未检测到'
+  if(Array.isArray(value))return value.map(item=>formatOpenDirectoryValue(item)).join('、')
+  if(value&&typeof value==='object'){
+    try{return JSON.stringify(value)}catch{return String(value)}
+  }
+  return String(value)
+}
+function openExistingDirectory(){
+  if(openingDirectory.value)return
+  openDirectoryPath.value='';openDirectoryName.value='';openDirectoryError.value='';openDirectorySummary.value=null
+  showOpenDirectory.value=true
+}
+function closeOpenDirectory(){if(!openingDirectory.value)showOpenDirectory.value=false}
+async function importExistingDirectory(){
+  const path=openDirectoryPath.value.trim()
+  if(openingDirectory.value)return
+  if(!path){openDirectoryError.value='请输入已有目录的绝对路径';return}
+  openDirectoryError.value='';openingDirectory.value=true
+  try{
+    const body:{path:string;kind:WorkspaceKind;name?:string}={path,kind:workspaceMode.value}
+    const name=openDirectoryName.value.trim();if(name)body.name=name
+    const response=await api('/api/servers/import',{method:'POST',body:JSON.stringify(body)}) as OpenDirectoryResponse
+    if(!response?.server?.id)throw new Error('后端未返回有效工作区')
+    response.warnings=Array.isArray(response.warnings)?response.warnings.filter(item=>typeof item==='string'):[]
+    response.files=Array.isArray(response.files)?response.files.filter(item=>typeof item==='string'):[]
+    openDirectorySummary.value=response
+    upsertServer(response.server)
+    showOpenDirectory.value=false
+    await selectServer(response.server.id)
+    if(workspaceKind(response.server)==='project')tab.value='overview'
+    const warningCount=response.warnings?.length??0
+    const detected=Object.entries(response.detected??{}).filter(([,value])=>value!==null&&value!==undefined).slice(0,3).map(([key,value])=>`${key}: ${formatOpenDirectoryValue(value)}`).join(' · ')
+    flash(`已打开${workspaceKind(response.server)==='project'?'项目':'服务器'}“${response.server.name}”${detected?` · ${detected}`:''}${warningCount?` · ${warningCount} 条提醒`:''}`)
+  }catch(error){openDirectoryError.value=error instanceof ApiError?error.message:String(error)}
+  finally{openingDirectory.value=false}
+}
 async function switchWorkspaceMode(mode:WorkspaceKind){
   if(workspaceMode.value===mode)return
   saveCurrentDraft()
@@ -1336,7 +1384,10 @@ onUnmounted(()=>{document.removeEventListener('click',closeMenus);if(refreshTime
     <aside class="sidebar">
       <div class="brand"><span class="logo"><Box :size="17"/></span><div v-if="!collapsed"><b>Sculk Catalyst</b><small>AI Workspace Studio</small></div><button @click="collapsed=!collapsed"><PanelLeftClose v-if="!collapsed" :size="16"/><ChevronRight v-else :size="16"/></button></div>
       <div v-if="!collapsed" class="workspace-mode-switch" role="tablist" aria-label="工作区模式"><button role="tab" :aria-selected="workspaceMode==='project'" :class="{active:workspaceMode==='project'}" @click="switchWorkspaceMode('project')"><FolderTree/>项目模式</button><button role="tab" :aria-selected="workspaceMode==='server'" :class="{active:workspaceMode==='server'}" @click="switchWorkspaceMode('server')"><Server/>服务器模式</button></div>
-      <button class="create" @click="openCreate"><Plus :size="16"/><span v-if="!collapsed">{{workspaceMode==='project'?'创建项目':'创建服务器'}}</span></button>
+      <div class="workspace-actions">
+        <button class="create" @click="openCreate"><Plus :size="16"/><span v-if="!collapsed">{{workspaceMode==='project'?'创建项目':'创建服务器'}}</span></button>
+        <button class="open-existing" title="打开已有目录" @click="openExistingDirectory"><FolderOpen :size="16"/><span v-if="!collapsed">打开已有目录</span></button>
+      </div>
       <nav><button aria-label="控制中心" :class="{active:surface==='control'}" @click="surface='control'"><LayoutDashboard/><span v-if="!collapsed">控制中心</span></button><button v-if="workspaceMode==='server'" aria-label="资源中心" title="资源中心" :class="{active:surface==='mirror'}" @click="surface='mirror'"><Archive/><span v-if="!collapsed">资源中心</span></button><button aria-label="任务执行器" :class="{active:surface==='automation'}" @click="openTaskCenter()"><Sparkles/><span v-if="!collapsed">任务执行器</span><i v-if="!collapsed&&tasks.some(task=>task.status==='awaiting_approval')">{{tasks.filter(task=>task.status==='awaiting_approval').length}}</i></button><button v-if="workspaceMode==='server'" aria-label="玩家社区" :class="{active:surface==='community'}" @click="surface='community'"><Vote/><span v-if="!collapsed">玩家社区</span></button><button aria-label="Skills & MCP" :class="{active:surface==='integrations'}" @click="surface='integrations'"><PlugZap/><span v-if="!collapsed">Skills & MCP</span></button></nav>
       <div v-if="!collapsed" class="label">{{workspaceMode==='project'?'项目':'服务器'}} <MoreHorizontal :size="15"/></div>
       <ConversationTree
@@ -1363,7 +1414,7 @@ onUnmounted(()=>{document.removeEventListener('click',closeMenus);if(refreshTime
       <div ref="scroller" class="chat-scroll">
         <section v-if="dashboardState==='loading'" class="connection-state"><LoaderCircle class="spin"/><b>正在加载服务器数据</b><small>等待本机后端响应，不会使用演示服务器填充。</small></section>
         <section v-else-if="dashboardState==='error'" class="connection-state error"><PlugZap/><b>后端未连接</b><small>{{dashboardError}}。启动或恢复后端后可在此重试。</small><button @click="retryBackend">重新连接</button></section>
-        <section v-else-if="!selectedId" class="connection-state first-run"><FolderTree v-if="workspaceMode==='project'"/><Server v-else/><b>{{workspaceMode==='project'?'还没有通用项目':'还没有服务器项目'}}</b><small>{{workspaceMode==='project'?'创建项目只会建立一个空文件夹，不会进入 Minecraft 核心或插件引导。':'这是首次使用时的正常状态。可以直接打开创建向导进行环境检查。'}}</small><button @click="openCreate"><Plus/>{{workspaceMode==='project'?'创建第一个项目':'创建第一台服务器'}}</button></section>
+        <section v-else-if="!selectedId" class="connection-state first-run"><FolderTree v-if="workspaceMode==='project'"/><Server v-else/><b>{{workspaceMode==='project'?'还没有通用项目':'还没有服务器项目'}}</b><small>{{workspaceMode==='project'?'创建项目只会建立一个空文件夹，不会进入 Minecraft 核心或插件引导。':'这是首次使用时的正常状态。可以直接打开创建向导进行环境检查。'}}</small><div class="first-run-actions"><button @click="openCreate"><Plus/>{{workspaceMode==='project'?'创建第一个项目':'创建第一台服务器'}}</button><button class="secondary" @click="openExistingDirectory"><FolderOpen/>打开已有目录</button></div></section>
         <section v-else-if="server.status==='planning'" class="mission planning-mission"><div><span class="agent"><BrainCircuit :size="20"/></span><p><small>智能创建 · 规划阶段</small><b>通过对话确定核心、版本与部署方案</b></p><em><i/>仅有 sculk.yml</em></div><footer><span>可迁移标识已建立</span><span>方案确认后再下载服务端文件</span></footer></section>
         <section v-else-if="!selectedConversationId" class="mission empty-mission"><div><span class="agent"><MessageSquareText :size="20"/></span><p><small>{{isProject?'项目对话任务':'服务器对话任务'}}</small><b>新建一个独立对话开始工作</b></p></div><footer><span>每个任务拥有独立历史与上下文</span><button @click="createConversation(selectedId)"><Plus/>新建对话</button></footer></section>
         <div v-if="selectedId&&messages.length" class="day">今天</div>
@@ -1434,11 +1485,18 @@ onUnmounted(()=>{document.removeEventListener('click',closeMenus);if(refreshTime
 
     <section class="work-panel" :class="{'mirror-work':surface==='mirror'||surface==='settings'}">
       <template v-if="surface==='control'">
-      <header class="work-header"><nav><button :disabled="!selectedId" :class="{active:tab==='overview'}" @click="tab='overview'"><Gauge/>总览</button><button :disabled="!selectedId||(!isProject&&server.status==='planning')" :class="{active:tab==='files'}" @click="tab='files';loadFiles()"><Files/>文件</button><button :disabled="!selectedId||isProject||server.status==='planning'" :title="isProject?'项目 Shell 需要通过已认证 Agent 接入，当前不会暴露未鉴权本机命令接口':''" :class="{active:tab==='terminal'}" @click="tab='terminal'"><SquareTerminal/>{{isProject?'Shell':'终端'}}</button></nav><span v-if="notice" class="notice">{{notice}}</span><button :disabled="!selectedId"><MoreHorizontal/></button></header>
+      <header class="work-header"><nav><button :disabled="!selectedId" :class="{active:tab==='overview'}" @click="tab='overview'"><Gauge/>总览</button><button :disabled="!selectedId||(!isProject&&server.status==='planning')" :class="{active:tab==='files'}" @click="tab='files';loadFiles()"><Files/>文件</button><button v-if="isProject" :disabled="!selectedId" :class="{active:tab==='build'}" @click="tab='build'"><Wrench/>构建</button><button :disabled="!selectedId||isProject||server.status==='planning'" :title="isProject?'项目 Shell 需要通过已认证 Agent 接入，当前不会暴露未鉴权本机命令接口':''" :class="{active:tab==='terminal'}" @click="tab='terminal'"><SquareTerminal/>{{isProject?'Shell':'终端'}}</button></nav><span v-if="notice" class="notice">{{notice}}</span><button :disabled="!selectedId"><MoreHorizontal/></button></header>
       <div v-if="dashboardState==='loading'" class="work-scroll workspace-state"><LoaderCircle class="spin"/><small>LOADING</small><h2>正在加载运行数据</h2><p>正在等待本机后端返回服务器列表。</p></div>
       <div v-else-if="dashboardState==='error'" class="work-scroll workspace-state error"><PlugZap/><small>BACKEND OFFLINE</small><h2>后端未连接</h2><p>当前没有可验证的服务器运行状态。{{dashboardError}}</p><button @click="retryBackend">重新连接</button></div>
-      <div v-else-if="!selectedId" class="work-scroll workspace-state first-run"><FolderTree v-if="workspaceMode==='project'"/><Server v-else/><small>FIRST RUN</small><h2>{{workspaceMode==='project'?'创建第一个通用项目':'开始创建第一台服务器'}}</h2><p>{{workspaceMode==='project'?'项目模式只创建一个空文件夹，随后可直接使用文件编辑和独立对话，不会启动 Minecraft 引导。':'服务器列表为空。创建向导会先检查 Java、数据目录、磁盘与内存，再允许创建普通服务器。'}}</p><button @click="openCreate"><Plus/>{{workspaceMode==='project'?'创建项目':'打开创建向导'}}</button></div>
+      <div v-else-if="!selectedId" class="work-scroll workspace-state first-run"><FolderTree v-if="workspaceMode==='project'"/><Server v-else/><small>FIRST RUN</small><h2>{{workspaceMode==='project'?'创建第一个通用项目':'开始创建第一台服务器'}}</h2><p>{{workspaceMode==='project'?'项目模式只创建一个空文件夹，随后可直接使用文件编辑和独立对话，不会启动 Minecraft 引导。':'服务器列表为空。创建向导会先检查 Java、数据目录、磁盘与内存，再允许创建普通服务器。'}}</p><div class="first-run-actions"><button @click="openCreate"><Plus/>{{workspaceMode==='project'?'创建项目':'打开创建向导'}}</button><button class="secondary" @click="openExistingDirectory"><FolderOpen/>打开已有目录</button></div></div>
       <div v-else-if="tab==='overview'" class="work-scroll">
+        <section v-if="openDirectorySummary" class="directory-import-summary">
+          <header><p><small>DIRECTORY IMPORT</small><b>已接管已有{{workspaceKind(openDirectorySummary.server)==='project'?'项目':'服务器目录'}}</b></p><button title="关闭检测摘要" @click="openDirectorySummary=null"><X/></button></header>
+          <div class="directory-import-path"><FolderOpen/><p><b>{{openDirectorySummary.server.name}}</b><small>{{openDirectorySummary.directory||openDirectorySummary.server.location||'本机工作区'}}</small></p></div>
+          <dl v-if="openDirectoryDetectedRows.length"><div v-for="row in openDirectoryDetectedRows" :key="row.key"><dt>{{row.label}}</dt><dd>{{row.value}}</dd></div></dl>
+          <div v-if="openDirectorySummary.warnings?.length" class="directory-import-warnings"><AlertTriangle/><p><b>检测提醒</b><small v-for="warning in openDirectorySummary.warnings" :key="warning">{{warning}}</small></p></div>
+          <footer><span v-if="openDirectorySummary.files?.length">已读取 {{openDirectorySummary.files.length}} 项配置或目录信息</span><button @click="tab='files';loadFiles()"><Files/>查看文件</button></footer>
+        </section>
         <section v-if="isProject" class="project-workspace"><span><FolderTree/></span><small>GENERAL PROJECT</small><h2>{{server.name}}</h2><p>这是一个通用项目目录，不包含 Minecraft 核心、插件或开服引导。你可以直接编辑文件，并通过左侧独立对话让 Codex、Claude 或其他 ACP Agent 参与开发。</p><div><button @click="tab='files';loadFiles()"><Files/>打开文件</button><button @click="createConversation(selectedId)"><MessageSquareText/>新建对话</button></div></section>
         <section v-else-if="server.status==='planning'" class="planning-workspace"><span><BrainCircuit/></span><small>PLANNING WORKSPACE</small><h2>服务器尚在规划阶段</h2><p>当前只创建了用于迁移与接手的 sculk.yml 标识，还没有下载核心或生成服务端配置。确认方案后会创建受审计的开服任务；{{reviewMode==='full'?'当前为完全访问权限，任务会立即下载、写入和启动。':'在当前审核模式下，任务获批后才会下载、写入和启动。'}}</p><div class="planning-actions"><button @click="send('请根据我的需求推荐合适的服务端核心，并说明取舍')"><Sparkles/>继续规划</button><button class="next" :disabled="chatBusy||conversationSelectionPending||conversationCreationPending" @click="send('开始创建服务器')"><Play/>按当前方案创建</button><button class="discard" @click="openDeleteServer(server)"><Trash2/>删除此规划</button></div></section>
         <section v-else class="server-hero"><div><span class="big-icon"><Server/></span><p><b>{{server.name}} <em :class="[server.status,serverOperationState]">{{serverStatusLabel}}</em></b><small>{{server.core}} {{server.version}} · {{systemState==='ready'?(systemInfo?.java_version||'未安装 Java'):'Java 状态未知'}} · 内存 {{serverMemoryLimit}} GB · 端口 {{server.port}}</small></p></div><aside><button :class="{active:mirrorPanel}" :disabled="serverTransitioning" @click="openMirrorPanel"><Download/>核心</button><button :disabled="serverOperationState==='provisioning'" @click="openProperties"><Settings/>配置</button><button @click="openServiceSettings"><SlidersHorizontal/>服务设置</button><button v-if="server.status==='online'" :disabled="busy||serverTransitioning||!serverCoreReady||!javaReady||provisionActive" @click="restartServer"><RotateCw/>重启</button><button :disabled="serverControlDisabled" :class="server.status==='online'?'stop':'start'" @click="toggleServer"><LoaderCircle v-if="serverTransitioning" class="spin"/><CircleStop v-else-if="server.status==='online'"/><Play v-else/>{{serverOperationLabel|| (server.status==='online'?'停止服务器':'启动服务器')}}</button></aside></section>
@@ -1491,6 +1549,7 @@ onUnmounted(()=>{document.removeEventListener('click',closeMenus);if(refreshTime
         <section v-if="!isProject&&server.status!=='planning'&&selectedTasks.length" class="card workflow"><header><p><small>服务器任务</small><b>后端执行记录</b></p><button @click="openTaskCenter()">查看全部<ChevronRight/></button></header><div v-for="(task,index) in selectedTasks" :key="task.id" class="step" :class="{done:task.status==='completed',active:['awaiting_approval','queued','running','cancelling'].includes(task.status),failed:['failed','interrupted','rollback_failed'].includes(task.status)}"><span><i>{{task.status==='completed'?'✓':task.status==='failed'||task.status==='rollback_failed'?'!':index+1}}</i><u v-if="index<selectedTasks.length-1"/></span><p><b>{{task.title}}</b><small>{{task.kind}} · {{task.progress}}%</small></p><em>{{taskStatusLabel[task.status]??task.status}}</em></div></section>
         <section v-else-if="!isProject&&server.status!=='planning'" class="card honest-empty"><Activity/><p><b>暂无执行任务</b><small>后端尚未返回这台服务器的任务记录。</small></p></section>
       </div>
+      <div v-else-if="tab==='build'&&isProject" class="project-build-view"><ProjectBuildManager :server-id="selectedId" @completed="() => loadFiles(currentPath)"/></div>
       <div v-else-if="tab==='files'" class="files-view">
         <aside @contextmenu="openFileContextMenu($event,null)">
            <header><span>{{currentPath||(isProject?'项目文件':'服务器文件')}}</span><button title="刷新文件树" @click="loadFiles(currentPath)"><RefreshCw/></button><button :disabled="busy||!canTransferFiles" title="上传文件到当前目录" @click="triggerFileUpload"><FileUp/></button><input ref="fileUploadInput" type="file" style="display:none" @change="uploadWorkspaceFile"/><button data-new-entry-toggle title="新建文件" @click="showNewFile&& !showNewFolder?cancelNewEntry():openNewEntry('file')"><FileCode2/></button><button data-new-entry-toggle title="新建目录" @click="showNewFolder&& !showNewFile?cancelNewEntry():openNewEntry('folder')"><Folder/></button></header>
@@ -1520,6 +1579,18 @@ onUnmounted(()=>{document.removeEventListener('click',closeMenus);if(refreshTime
        />
        <MirrorCenterView v-else-if="surface==='mirror'" :initial-core="server.core" :initial-minecraft="server.version"/>
     </section>
+    <div v-if="showOpenDirectory" class="modal-backdrop" @click.self="closeOpenDirectory">
+      <section class="action-modal open-directory-modal">
+        <header><div><small>OPEN EXISTING DIRECTORY</small><h2>打开已有目录</h2></div><button :disabled="openingDirectory" title="关闭" @click="closeOpenDirectory"><X/></button></header>
+        <main>
+          <div class="field"><label>{{openDirectoryModeLabel}}目录路径</label><input v-model="openDirectoryPath" autofocus autocomplete="off" spellcheck="false" :placeholder="workspaceMode==='server'?'例如 C:\\servers\\survival 或 /srv/minecraft':'例如 C:\\work\\my-project 或 /home/user/project'" @keydown.enter.prevent="importExistingDirectory"/><small class="field-hint">请输入运行后端所在机器上的绝对路径。后端会读取目录中的 sculk.yml、server.properties、核心文件和常见配置，并将结果接入当前工作台。</small></div>
+          <div class="field"><label>显示名称（可选）</label><input v-model="openDirectoryName" autocomplete="off" maxlength="64" placeholder="留空使用目录或配置中的名称" @keydown.enter.prevent="importExistingDirectory"/></div>
+          <div class="directory-import-hint"><FolderOpen/><p><b>{{workspaceMode==='server'?'服务器模式会自动读取配置':'项目模式会保留目录中的现有文件'}}</b><small>{{workspaceMode==='server'?'不会下载或覆盖核心；检测完成后可直接查看 server.properties、插件和日志。':'不会移动或复制文件；接管后通过工作区文件编辑和对话继续工作。'}}</small></p></div>
+          <div v-if="openDirectoryError" class="environment-loading error"><AlertTriangle/><span><b>打开目录失败</b><small>{{openDirectoryError}}</small></span></div>
+        </main>
+        <footer><button class="back" :disabled="openingDirectory" @click="closeOpenDirectory">取消</button><button class="next" :disabled="openingDirectory||!openDirectoryPath.trim()" @click="importExistingDirectory"><LoaderCircle v-if="openingDirectory" class="spin"/><FolderOpen v-else/>打开目录</button></footer>
+      </section>
+    </div>
     <div v-if="showCreate" class="modal-backdrop" @click.self="showCreate=false">
       <section v-if="workspaceMode==='project'" class="create-modal project-create-modal">
         <header><div><small>NEW GENERAL PROJECT</small><h2>创建通用项目</h2></div><button @click="showCreate=false"><X/></button></header>
@@ -1606,9 +1677,11 @@ onUnmounted(()=>{document.removeEventListener('click',closeMenus);if(refreshTime
 
 <style scoped>
 .workspace-mode-switch{display:grid;grid-template-columns:1fr 1fr;gap:3px;margin:10px 0 0;padding:3px;border:1px solid rgba(255,255,255,.075);border-radius:9px;background:#0a0f14}.workspace-mode-switch button{height:31px;display:flex;align-items:center;justify-content:center;gap:5px;padding:0 6px;border:0;border-radius:6px;color:#75818e;background:transparent;font-weight:600}.workspace-mode-switch button:hover{color:#c8d0d8;background:rgba(255,255,255,.04)}.workspace-mode-switch button.active{color:#9ce8d6;background:rgba(50,213,176,.11);box-shadow:inset 0 0 0 1px rgba(50,213,176,.12)}.workspace-mode-switch svg{width:14px}.workspace-mode-switch+.create{margin-top:8px}
-.project-workspace{min-height:360px;display:flex;align-items:center;justify-content:center;flex-direction:column;padding:40px;text-align:center;border:1px solid rgba(50,213,176,.12);border-radius:12px;background:radial-gradient(circle at 50% 25%,rgba(50,213,176,.08),transparent 55%),#11161c}.project-workspace>span{width:58px;height:58px;display:grid;place-items:center;border-radius:14px;color:#72dec5;background:rgba(50,213,176,.1)}.project-workspace>span svg{width:28px}.project-workspace>small{margin-top:18px;color:#70b7a7;font-weight:700;letter-spacing:.14em}.project-workspace h2{margin:8px 0 0}.project-workspace p{max-width:570px;margin:12px 0 0;color:#87939f}.project-workspace>div{display:flex;gap:8px;margin-top:20px}.project-workspace button{height:36px;display:flex;align-items:center;gap:6px;padding:0 13px;border:1px solid rgba(50,213,176,.16);border-radius:8px;color:#9ee7d6;background:rgba(50,213,176,.07)}.project-workspace button:first-child{border:0;color:#06251e;background:var(--accent)}.project-workspace button svg{width:15px}
+.workspace-actions{display:grid;gap:6px;margin:14px 0 12px}.workspace-actions .create{margin:0}.workspace-actions .open-existing{height:31px;display:flex;align-items:center;justify-content:center;gap:7px;border:1px solid rgba(255,255,255,.09);border-radius:7px;color:#8d99a5;background:rgba(255,255,255,.025);font-size:10px}.workspace-actions .open-existing:hover{color:#c9d3dc;background:rgba(255,255,255,.06)}.workspace-actions .open-existing svg{width:15px}.collapsed .workspace-actions{margin-top:14px}.collapsed .workspace-actions .create,.collapsed .workspace-actions .open-existing{width:36px;align-self:center;padding:0}.first-run-actions{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:5px}.first-run-actions button{margin-top:0!important}.first-run-actions button.secondary{border-color:rgba(255,255,255,.1);color:#8f9ba7;background:rgba(255,255,255,.035)}.first-run-actions button.secondary:hover{color:#d1d9e0;background:rgba(255,255,255,.07)}.first-run-actions button svg{width:14px}
+.directory-import-summary{margin-bottom:12px;padding:15px 16px;border:1px solid rgba(50,213,176,.17);border-radius:10px;background:rgba(50,213,176,.045)}.directory-import-summary>header{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}.directory-import-summary>header p{display:flex;flex-direction:column;margin:0}.directory-import-summary>header small{color:#6b9d90;font-size:8px;font-weight:700;letter-spacing:.12em}.directory-import-summary>header b{margin-top:4px;font-size:12px}.directory-import-summary>header button{width:25px;height:25px;display:grid;place-items:center;border:0;border-radius:5px;color:#6f7c88;background:transparent}.directory-import-summary>header button:hover{color:#d8e2e7;background:rgba(255,255,255,.05)}.directory-import-summary>header svg{width:13px}.directory-import-path{display:flex;align-items:center;gap:9px;margin-top:12px;padding:9px;border-radius:7px;background:rgba(0,0,0,.12)}.directory-import-path>svg{width:16px;flex:none;color:#72d5bf}.directory-import-path p{display:flex;min-width:0;flex-direction:column;margin:0}.directory-import-path b,.directory-import-path small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.directory-import-path b{font-size:10px}.directory-import-path small{margin-top:3px;color:#687a85;font:8px 'Cascadia Code',monospace}.directory-import-summary dl{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin:10px 0 0}.directory-import-summary dl div{display:flex;justify-content:space-between;gap:8px;padding:7px 8px;border:1px solid rgba(255,255,255,.06);border-radius:6px;background:rgba(255,255,255,.018);font-size:8px}.directory-import-summary dt{color:#687681}.directory-import-summary dd{min-width:0;margin:0;overflow:hidden;color:#b6d9cf;text-overflow:ellipsis;white-space:nowrap}.directory-import-warnings{display:flex;align-items:flex-start;gap:8px;margin-top:10px;padding:9px;border:1px solid rgba(243,167,92,.18);border-radius:7px;color:#d4a16a;background:rgba(243,167,92,.045)}.directory-import-warnings>svg{width:14px;flex:none;margin-top:1px}.directory-import-warnings p{display:flex;min-width:0;flex-direction:column;gap:3px;margin:0}.directory-import-warnings b{font-size:8px}.directory-import-warnings small{color:#a88766;font-size:8px;line-height:1.45}.directory-import-summary>footer{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:11px;padding-top:10px;border-top:1px solid rgba(255,255,255,.06)}.directory-import-summary>footer span{color:#6d7c86;font-size:8px}.directory-import-summary>footer button{height:27px;display:flex;align-items:center;gap:5px;padding:0 9px;border:1px solid rgba(50,213,176,.18);border-radius:6px;color:#88d9c7;background:rgba(50,213,176,.06);font-size:8px}.directory-import-summary>footer button svg{width:12px}.directory-import-hint{display:flex;align-items:flex-start;gap:10px;padding:11px 12px;border:1px solid rgba(50,213,176,.13);border-radius:8px;color:#6ed1ba;background:rgba(50,213,176,.045)}.directory-import-hint>svg{width:17px;flex:none;margin-top:1px}.directory-import-hint p{display:flex;flex-direction:column;margin:0}.directory-import-hint b{color:#b4e9dc;font-size:9px}.directory-import-hint small{margin-top:4px;color:#6b7c86;font-size:8px;line-height:1.5}
+.project-build-view{flex:1;min-height:0;overflow:auto;background:#0d1319}.project-workspace{min-height:360px;display:flex;align-items:center;justify-content:center;flex-direction:column;padding:40px;text-align:center;border:1px solid rgba(50,213,176,.12);border-radius:12px;background:radial-gradient(circle at 50% 25%,rgba(50,213,176,.08),transparent 55%),#11161c}.project-workspace>span{width:58px;height:58px;display:grid;place-items:center;border-radius:14px;color:#72dec5;background:rgba(50,213,176,.1)}.project-workspace>span svg{width:28px}.project-workspace>small{margin-top:18px;color:#70b7a7;font-weight:700;letter-spacing:.14em}.project-workspace h2{margin:8px 0 0}.project-workspace p{max-width:570px;margin:12px 0 0;color:#87939f}.project-workspace>div{display:flex;gap:8px;margin-top:20px}.project-workspace button{height:36px;display:flex;align-items:center;gap:6px;padding:0 13px;border:1px solid rgba(50,213,176,.16);border-radius:8px;color:#9ee7d6;background:rgba(50,213,176,.07)}.project-workspace button:first-child{border:0;color:#06251e;background:var(--accent)}.project-workspace button svg{width:15px}
 .project-create-modal .wizard-page{min-height:320px}.project-mode-note{display:flex;align-items:center;gap:12px;padding:14px;border:1px solid rgba(156,140,255,.14);border-radius:9px;color:#ada2f3;background:rgba(156,140,255,.055)}.project-mode-note>svg{width:20px;flex:none}.project-mode-note p{display:flex;flex-direction:column;margin:0}.project-mode-note b{color:#d5d0fa}.project-mode-note small{margin-top:4px;color:#747f8c}
-@media(max-width:1180px){.workspace-mode-switch{display:none}}
+@media(max-width:1180px){.workspace-mode-switch{display:none}.workspace-actions .open-existing span{display:none}.workspace-actions .open-existing{width:36px;align-self:center;padding:0}}
 .chat-panel>header button.active{color:#dff8f1;background:rgba(50,213,176,.09)}
 .message-search{height:42px;display:flex;align-items:center;gap:7px;flex:0 0 auto;padding:0 14px;border-bottom:1px solid rgba(255,255,255,.07);background:#0f141a;color:#6f7b87}
 .message-search>svg{width:14px;flex:none}.message-search input{min-width:0;flex:1;border:0;outline:0;color:#dfe5eb;background:transparent;font-size:10px}.message-search input::placeholder{color:#596572}.message-search>span{min-width:46px;color:#65717e;font-size:8px;text-align:right}.message-search button{width:25px;height:25px;display:grid;place-items:center;padding:0;border:0;border-radius:5px;color:#6f7b87;background:transparent}.message-search button:hover:not(:disabled){color:#e7edf2;background:rgba(255,255,255,.05)}.message-search button:disabled{opacity:.3}.message-search button svg{width:13px}

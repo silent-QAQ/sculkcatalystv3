@@ -312,6 +312,12 @@ async fn start_download(
             .find(|server| server.id == id)
             .ok_or((StatusCode::NOT_FOUND, "server not found".into()))?;
         crate::require_server_kind(server, "core download")?;
+        if server.workspace_path.is_some() {
+            return Err((
+                StatusCode::CONFLICT,
+                "已有服务器目录不会被核心下载覆盖；请直接管理目录中的现有核心".into(),
+            ));
+        }
     }
     let operation = crate::server_operation_lock(&state, &id).await;
     let _guard = operation.lock().await;
@@ -412,6 +418,9 @@ pub(crate) async fn provision_core(
             .find(|server| server.id == server_id)
             .cloned()
             .ok_or_else(|| "server not found".to_string())?;
+        if server.workspace_path.is_some() {
+            return Err("已有服务器目录不支持核心下载或初始化".into());
+        }
         let sources = collect_sources(&data, &server, &[]);
         (server.core, server.version, sources)
     };

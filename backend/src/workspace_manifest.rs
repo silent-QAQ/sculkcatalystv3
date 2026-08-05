@@ -305,6 +305,11 @@ pub(crate) async fn sync_all(data: &PersistedState) -> Result<bool, Vec<String>>
     let mut errors = Vec::new();
     for server in data.servers.iter().filter(|server| server.kind == "server") {
         let manifest = from_state(data, server);
+        // External workspaces are user-owned; never write a Sculk manifest into
+        // them as a side effect of a dashboard refresh.
+        if server.workspace_path.is_some() {
+            continue;
+        }
         match write_manifest(&runtime::server_directory(&server.id), &manifest).await {
             Ok(written) => changed |= written,
             Err(error) => errors.push(format!("{}: {error}", server.id)),
@@ -405,6 +410,8 @@ async fn import_one(
             "已从 sculk.yml 接手 · 等待状态校验".into()
         },
         location: "local".into(),
+        workspace_path: None,
+        launch_jar: None,
         pid: None,
         runtime_generation: None,
         started_at: None,
@@ -515,6 +522,8 @@ mod tests {
             port: 25565,
             task: String::new(),
             location: "local".into(),
+            workspace_path: None,
+            launch_jar: None,
             pid: None,
             runtime_generation: None,
             started_at: None,

@@ -1763,8 +1763,7 @@ async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::
             .iter()
             .find(|server| server.id == request.server_id);
         let is_planning = server.map(|s| s.status == "planning").unwrap_or(false);
-        let workspace_directory =
-            server.map(|server| workspace_directory(&server.id, &server.kind));
+        let workspace_directory = server.map(crate::workspace_directory_for_server);
         let workspace_kind = server.map(|server| server.kind.clone());
         let latest_task = latest_task_for_chat(
             &data,
@@ -3030,9 +3029,6 @@ fn checked_cli_workspace_directory(
         Some("server") => "servers",
         _ => return Err("CLI 工作区类型无效，已拒绝启动。".into()),
     };
-    let root = crate::runtime::data_root().join(category);
-    let root = fs::canonicalize(&root)
-        .map_err(|_| "CLI 工作区根目录不存在或不可访问，已拒绝启动。".to_string())?;
     let metadata = fs::symlink_metadata(directory)
         .map_err(|_| "CLI 工作区不存在或不可访问，已拒绝启动。".to_string())?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -3040,8 +3036,20 @@ fn checked_cli_workspace_directory(
     }
     let directory = fs::canonicalize(directory)
         .map_err(|_| "无法解析 CLI 工作区路径，已拒绝启动。".to_string())?;
-    if directory == root || !directory.starts_with(&root) {
-        return Err("CLI 工作区路径越出了受管工作区根目录，已拒绝启动。".into());
+    let root = crate::runtime::data_root().join(category);
+    if let Ok(root) = fs::canonicalize(&root) {
+        if directory == root {
+            return Err("CLI 工作区路径必须指向具体工作区目录，已拒绝启动。".into());
+        }
+        if directory.starts_with(&root) {
+            return Ok(directory);
+        }
+    }
+    // Imported workspaces are explicitly registered by the user and retain
+    // their canonical path in ServerInfo.  Keep the same no-symlink boundary,
+    // while allowing those paths outside SCULK_DATA_DIR.
+    if crate::server_import::canonicalize_existing_directory(&directory).is_err() {
+        return Err("CLI 工作区路径不可访问或包含符号链接，已拒绝启动。".into());
     }
     Ok(directory)
 }

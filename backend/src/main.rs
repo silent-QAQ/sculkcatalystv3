@@ -7,11 +7,13 @@ mod cloud;
 mod conversations;
 mod download;
 mod msl_sync;
+mod player_management;
 mod prefs;
 mod process_platform;
 mod resource_catalog;
 mod resource_sync;
 mod runtime;
+mod server_import;
 mod server_intelligence;
 mod skills;
 mod task_executor;
@@ -46,7 +48,7 @@ use std::{
 };
 use tokio::{
     fs,
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStderr, ChildStdin, ChildStdout},
     sync::{Mutex, RwLock, broadcast, mpsc, oneshot, watch},
     time::{Duration, Instant, timeout},
@@ -160,6 +162,14 @@ pub(crate) struct ServerInfo {
     task: String,
     #[serde(default = "default_location")]
     location: String,
+    /// Absolute canonical path for a workspace opened from the host file system.
+    /// `None` keeps the legacy managed location under `SCULK_DATA_DIR`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace_path: Option<String>,
+    /// Relative JAR selected while importing an existing Minecraft directory.
+    /// Managed servers continue to use `server.jar` when this is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) launch_jar: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -392,6 +402,8 @@ pub(crate) struct PersistedState {
     mirrors: Vec<MirrorInfo>,
     #[serde(default = "seed_players")]
     players: Vec<PlayerInfo>,
+    #[serde(default)]
+    player_management: player_management::PlayerManagementState,
     #[serde(default = "seed_feedback")]
     feedback: Vec<FeedbackInfo>,
     #[serde(default = "seed_polls")]
@@ -486,6 +498,37 @@ struct CreateProjectResponse {
     project: ServerInfo,
     directory: String,
     files: Vec<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildRequest {
+    tool: String,
+    action: String,
+}
+#[derive(Serialize)]
+struct BuildBuilderInfo {
+    tool: String,
+    label: String,
+    source: Option<String>,
+    available: bool,
+    descriptor: Option<String>,
+    wrapper: Option<String>,
+}
+#[derive(Serialize)]
+struct BuildDiscoveryResponse {
+    builders: Vec<BuildBuilderInfo>,
+    detected_tool: Option<String>,
+}
+#[derive(Serialize)]
+struct BuildResultResponse {
+    tool: String,
+    action: String,
+    command: String,
+    success: bool,
+    exit_code: Option<i32>,
+    duration_ms: u64,
+    output: String,
+    output_truncated: bool,
 }
 #[derive(Deserialize)]
 struct PlanServerRequest {
@@ -800,12 +843,18 @@ async fn main() {
         .route("/api/system", get(get_system_info))
         .route("/api/runtime/java/install", post(install_java_runtime))
         .route("/api/servers", post(create_server))
+        .route("/api/workspaces/open", post(import_workspace))
+        .route("/api/servers/import", post(import_workspace))
         .route("/api/projects", post(create_project))
         .route("/api/servers/plan", post(plan_server))
         .route("/api/servers/{id}", delete(delete_server))
         .route("/api/servers/{id}/provision", post(provision_server))
         .route("/api/servers/{id}/action", post(server_action))
         .route("/api/servers/{id}/command", post(run_command))
+        .route(
+            "/api/servers/{id}/build",
+            get(get_project_build).post(run_project_build),
+        )
         .route(
             "/api/servers/{id}/config",
             get(get_config).put(update_config),
@@ -842,6 +891,7 @@ async fn main() {
         .route("/api/polls/{id}/vote", post(vote_poll))
         .route("/api/feedback/cluster", post(cluster_feedback))
         .route("/api/players/{id}/action", post(player_action))
+        .merge(player_management::router())
         .route("/api/integrations", get(get_integrations))
         .route("/api/integrations/{id}/toggle", post(toggle_integration))
         .route("/api/integrations/{id}/test", post(test_integration))
@@ -907,6 +957,51 @@ async fn main() {
         shutdown_backend(&state).await;
     }
     result.expect("API server failed");
+}
+
+#[derive(Deserialize)]
+struct ImportWorkspaceRequest {
+    path: String,
+    /// `server`, `project`, or `auto` (the UI normally sends the current mode).
+    #[serde(default = "default_import_kind")]
+    kind: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    memory_gb: Option<u8>,
+    #[serde(default)]
+    port: Option<u16>,
+}
+
+#[derive(Clone, Serialize)]
+struct DetectedWorkspace {
+    kind: String,
+    name: String,
+    core: String,
+    version: String,
+    port: u16,
+    memory_gb: u8,
+    max_players: u32,
+    core_ready: bool,
+    eula_accepted: bool,
+    launch_jar: Option<String>,
+    config_files: Vec<String>,
+    jar_candidates: Vec<String>,
+    script_candidates: Vec<String>,
+    properties: HashMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct ImportWorkspaceResponse {
+    server: ServerInfo,
+    directory: String,
+    detected: DetectedWorkspace,
+    warnings: Vec<String>,
+    files: Vec<String>,
+}
+
+fn default_import_kind() -> String {
+    "auto".into()
 }
 
 async fn shutdown_backend(state: &AppState) {
@@ -1200,9 +1295,12 @@ async fn reconcile_server_file_state(state: &mut PersistedState) -> bool {
         if server.kind != "server" {
             continue;
         }
-        let core_ready = fs::metadata(runtime::server_directory(&server.id).join("server.jar"))
-            .await
-            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0);
+        let core_ready = match launch_jar_name(server) {
+            Ok(launch) => fs::metadata(workspace_directory_for_server(server).join(launch))
+                .await
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0),
+            Err(_) => false,
+        };
         reconciled |= repair_server_operation_metadata(
             server,
             core_ready,
@@ -1315,6 +1413,598 @@ async fn install_java_runtime(
             (status, error.to_string())
         })
 }
+
+/// Resolve a user supplied workspace without inheriting any symbolic link or
+/// junction.  The server manager runs with the same account as the user, so
+/// this check is both a safety boundary and a useful early error for typos.
+async fn canonical_external_workspace(value: &str) -> Result<PathBuf, (StatusCode, String)> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "目录路径不能为空".into()));
+    }
+    let supplied = PathBuf::from(value);
+    if !supplied.is_absolute() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "打开已有目录必须使用本机绝对路径".into(),
+        ));
+    }
+    server_import::canonicalize_existing_directory(&supplied).map_err(|error| {
+        let status = if error.contains("不存在") || error.contains("读取") {
+            StatusCode::NOT_FOUND
+        } else if error.contains("符号链接") || error.contains("访问") {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        (status, error)
+    })
+}
+
+pub(crate) fn workspace_directory_for_server(server: &ServerInfo) -> PathBuf {
+    server
+        .workspace_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            if server.kind == "project" {
+                runtime::project_directory(&server.id)
+            } else {
+                runtime::server_directory(&server.id)
+            }
+        })
+}
+
+fn launch_jar_name(server: &ServerInfo) -> Result<String, String> {
+    let value = server.launch_jar.as_deref().unwrap_or("server.jar").trim();
+    let relative = safe_relative(value).map_err(|(_, message)| message)?;
+    if relative.as_os_str().is_empty() || relative.components().count() != 1 {
+        return Err("启动核心必须是工作区根目录下的单个 JAR 文件".into());
+    }
+    let name = relative
+        .to_str()
+        .ok_or_else(|| "启动核心文件名不是有效 UTF-8".to_string())?;
+    if !name.to_ascii_lowercase().ends_with(".jar") {
+        return Err("启动核心必须是 .jar 文件".into());
+    }
+    Ok(name.to_string())
+}
+
+pub(crate) fn workspace_directory_for_id(data: &PersistedState, id: &str) -> Option<PathBuf> {
+    data.servers
+        .iter()
+        .find(|server| server.id == id)
+        .map(workspace_directory_for_server)
+}
+
+fn import_name_from_properties(properties: &HashMap<String, String>, root: &StdPath) -> String {
+    let motd = properties
+        .get("motd")
+        .map(|value| value.trim().trim_matches('"').trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let motd = motd
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>();
+    if !motd.is_empty() {
+        return motd.chars().take(64).collect();
+    }
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("已有工作区")
+        .chars()
+        .take(64)
+        .collect()
+}
+
+fn parse_properties(content: &str) -> HashMap<String, String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start_matches('\u{feff}').trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+                return None;
+            }
+            let (key, value) = line.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            Some((key.to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+fn parse_u16_property(properties: &HashMap<String, String>, key: &str) -> Option<u16> {
+    properties.get(key)?.trim().parse().ok()
+}
+
+fn parse_memory_from_text(text: &str) -> Option<u8> {
+    let lower = text.to_ascii_lowercase();
+    let marker = "-xmx";
+    let start = lower.find(marker)? + marker.len();
+    let digits: String = lower[start..]
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let amount: u32 = digits.parse().ok()?;
+    let suffix = lower[start + digits.len()..].chars().next();
+    let gb = match suffix {
+        Some('g') => amount,
+        Some('m') => amount / 1024,
+        _ => return None,
+    };
+    u8::try_from(gb)
+        .ok()
+        .filter(|value| (MIN_MEMORY_GB..=MAX_MEMORY_GB).contains(value))
+}
+
+fn detect_core_version(
+    jar: Option<&str>,
+    properties: &HashMap<String, String>,
+) -> (String, String) {
+    let lower = jar.unwrap_or_default().to_ascii_lowercase();
+    let core = if lower.contains("purpur") {
+        "Purpur"
+    } else if lower.contains("paper") {
+        "Paper"
+    } else if lower.contains("folia") {
+        "Folia"
+    } else if lower.contains("leaves") {
+        "Leaves"
+    } else if lower.contains("spigot") {
+        "Spigot"
+    } else if lower.contains("fabric") {
+        "Fabric"
+    } else if lower.contains("neoforge") {
+        "NeoForge"
+    } else if lower.contains("forge") {
+        "Forge"
+    } else if lower.contains("velocity") {
+        "Velocity"
+    } else if lower.contains("bukkit") {
+        "Bukkit"
+    } else if jar.is_some() {
+        "Vanilla"
+    } else {
+        ""
+    };
+    let version = properties
+        .get("minecraft-version")
+        .or_else(|| properties.get("version"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            lower
+                .split(|character: char| !character.is_ascii_digit() && character != '.')
+                .find(|token| token.matches('.').count() >= 1 && token.len() >= 3)
+                .map(ToString::to_string)
+        })
+        .unwrap_or_default();
+    (core.into(), version)
+}
+
+async fn read_bounded_text(path: &StdPath, limit: usize) -> Option<String> {
+    let metadata = fs::symlink_metadata(path).await.ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > limit as u64 {
+        return None;
+    }
+    let bytes = fs::read(path).await.ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+async fn inspect_existing_workspace(
+    root: &StdPath,
+    requested_kind: &str,
+    requested_name: Option<&str>,
+    requested_memory: Option<u8>,
+    requested_port: Option<u16>,
+) -> Result<(DetectedWorkspace, Vec<String>, Vec<String>), (StatusCode, String)> {
+    let mut files = Vec::new();
+    let mut jars = Vec::new();
+    let mut scripts = Vec::new();
+    let mut entries = fs::read_dir(root)
+        .await
+        .map_err(|error| (StatusCode::FORBIDDEN, format!("无法读取目录内容：{error}")))?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| (StatusCode::FORBIDDEN, format!("读取目录内容失败：{error}")))?
+    {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .await
+            .map_err(|error| (StatusCode::FORBIDDEN, format!("无法读取目录项：{error}")))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(ToString::to_string) else {
+            continue;
+        };
+        files.push(name.clone());
+        if !metadata.is_file() {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("server.jar")
+            || name.to_ascii_lowercase().ends_with(".jar")
+                && !name.to_ascii_lowercase().ends_with(".part")
+        {
+            jars.push(name.clone());
+        }
+        if matches!(
+            name.to_ascii_lowercase().as_str(),
+            "start.sh" | "start.ps1" | "start.bat" | "run.sh" | "run.ps1" | "run.bat"
+        ) {
+            scripts.push(name);
+        }
+    }
+    files.sort();
+    jars.sort_by_key(|name| {
+        if name.eq_ignore_ascii_case("server.jar") {
+            0
+        } else {
+            1
+        }
+    });
+    scripts.sort();
+    let properties_content = read_bounded_text(&root.join("server.properties"), 2 * 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    let properties = parse_properties(&properties_content);
+    let requested_kind = requested_kind.trim().to_ascii_lowercase();
+    let is_server = match requested_kind.as_str() {
+        "server" => true,
+        "project" => false,
+        "auto" | "" => {
+            !properties.is_empty()
+                || !jars.is_empty()
+                || fs::try_exists(root.join("eula.txt")).await.unwrap_or(false)
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "kind 必须是 server、project 或 auto".into(),
+            ));
+        }
+    };
+    let kind = if is_server { "server" } else { "project" };
+    let launch_jar = if is_server {
+        jars.first().cloned()
+    } else {
+        None
+    };
+    let (core, version) = detect_core_version(launch_jar.as_deref(), &properties);
+    let mut warnings = Vec::new();
+    let detected_port = parse_u16_property(&properties, "server-port").unwrap_or(25565);
+    let port = requested_port.unwrap_or(detected_port);
+    if is_server && !properties_content.is_empty() && !properties.contains_key("server-port") {
+        warnings.push("server.properties 未包含 server-port，已使用 25565".into());
+    }
+    if is_server && jars.is_empty() {
+        warnings.push("未找到服务端 JAR；导入后可先补充核心文件，再启动服务器".into());
+    } else if is_server && jars.len() > 1 {
+        warnings.push(format!(
+            "检测到多个 JAR，已选择 {}；可在导入后调整",
+            jars[0]
+        ));
+    }
+    let eula_accepted = read_bounded_text(&root.join("eula.txt"), 64 * 1024)
+        .await
+        .map(|content| {
+            parse_properties(&content)
+                .get("eula")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        })
+        .unwrap_or(false);
+    if is_server && !eula_accepted {
+        warnings.push("eula.txt 未明确设置 eula=true，启动前仍需接受 EULA".into());
+    }
+    let script_memory = {
+        let mut detected = None;
+        for script in &scripts {
+            if let Some(content) = read_bounded_text(&root.join(script), 256 * 1024).await {
+                detected = parse_memory_from_text(&content);
+                if detected.is_some() {
+                    break;
+                }
+            }
+        }
+        detected
+    };
+    let mut memory_gb = requested_memory
+        .filter(|value| (MIN_MEMORY_GB..=MAX_MEMORY_GB).contains(value))
+        .or(script_memory)
+        .unwrap_or(DEFAULT_MEMORY_GB);
+    if !(MIN_MEMORY_GB..=MAX_MEMORY_GB).contains(&memory_gb) {
+        memory_gb = DEFAULT_MEMORY_GB;
+    }
+    let name = requested_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| import_name_from_properties(&properties, root));
+    validate_server_name(&name)
+        .or_else(|_| validate_project_name(&name))
+        .map_err(|message| (StatusCode::BAD_REQUEST, message.into()))?;
+    let max_players = properties
+        .get("max-players")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(60);
+    let mut config_files = Vec::new();
+    for name in ["server.properties", "eula.txt", "sculk.yml"] {
+        if fs::try_exists(root.join(name)).await.unwrap_or(false) {
+            config_files.push(name.to_string());
+        }
+    }
+    let detected = DetectedWorkspace {
+        kind: kind.into(),
+        name,
+        core,
+        version,
+        port,
+        memory_gb,
+        max_players,
+        core_ready: launch_jar.is_some(),
+        eula_accepted,
+        launch_jar,
+        config_files,
+        jar_candidates: jars,
+        script_candidates: scripts,
+        properties,
+    };
+    Ok((detected, warnings, files))
+}
+
+/// Adapt the bounded inspector to the dashboard's compact import response.
+/// The inspector remains the single place that parses properties, EULA and
+/// launch artifacts, so API behavior and its unit tests cannot drift apart.
+async fn inspect_existing_workspace_safe(
+    root: &StdPath,
+    requested_kind: &str,
+    requested_name: Option<&str>,
+    requested_memory: Option<u8>,
+    requested_port: Option<u16>,
+) -> Result<(DetectedWorkspace, Vec<String>, Vec<String>), (StatusCode, String)> {
+    let inspection = server_import::inspect_existing_directory(root)
+        .await
+        .map_err(|error| (StatusCode::FORBIDDEN, error))?;
+    let requested_kind = requested_kind.trim().to_ascii_lowercase();
+    let is_server = match requested_kind.as_str() {
+        "server" => true,
+        "project" => false,
+        "auto" | "" => !inspection.properties.is_empty() || !inspection.jar_candidates.is_empty(),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "kind 必须是 server、project 或 auto".into(),
+            ));
+        }
+    };
+    let kind = if is_server { "server" } else { "project" };
+    let name = requested_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| inspection.properties.get("motd").cloned())
+        .or_else(|| {
+            root.file_name()
+                .and_then(|value| value.to_str())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "已有工作区".into());
+    let name = name
+        .chars()
+        .filter(|value| !value.is_control())
+        .take(64)
+        .collect::<String>();
+    if is_server {
+        validate_server_name(&name).map_err(|message| (StatusCode::BAD_REQUEST, message.into()))?;
+    } else {
+        validate_project_name(&name)
+            .map_err(|message| (StatusCode::BAD_REQUEST, message.into()))?;
+    }
+    let port = requested_port.or(inspection.server_port).unwrap_or(25565);
+    let mut warnings = inspection.warnings.clone();
+    if is_server && inspection.server_port.is_none() {
+        warnings.push("未检测到有效 server-port，已使用 25565；启动前请确认配置".into());
+    }
+    if !is_server {
+        warnings.retain(|warning| !warning.contains("EULA") && !warning.contains("JAR"));
+    }
+    let memory_gb = requested_memory
+        .filter(|value| (MIN_MEMORY_GB..=MAX_MEMORY_GB).contains(value))
+        .unwrap_or(DEFAULT_MEMORY_GB);
+    let properties = inspection
+        .properties
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<HashMap<_, _>>();
+    let config_files = ["server.properties", "eula.txt", "sculk.yml"]
+        .iter()
+        .filter(|name| root.join(name).is_file())
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    let files = inspection
+        .jar_candidates
+        .iter()
+        .map(|candidate| candidate.path.clone())
+        .chain(
+            inspection
+                .launch_scripts
+                .iter()
+                .map(|script| script.path.clone()),
+        )
+        .chain(config_files.iter().cloned())
+        .collect::<Vec<_>>();
+    let detected = DetectedWorkspace {
+        kind: kind.into(),
+        name,
+        core: inspection.core_hint.clone().unwrap_or_default(),
+        version: inspection
+            .minecraft_version_hint
+            .clone()
+            .unwrap_or_default(),
+        port,
+        memory_gb,
+        max_players: inspection.max_players.unwrap_or(60),
+        core_ready: is_server && inspection.recommended_jar.is_some(),
+        eula_accepted: inspection.eula_accepted == Some(true),
+        launch_jar: is_server
+            .then(|| inspection.recommended_jar.clone())
+            .flatten(),
+        config_files,
+        jar_candidates: inspection
+            .jar_candidates
+            .iter()
+            .map(|candidate| candidate.path.clone())
+            .collect(),
+        script_candidates: inspection
+            .launch_scripts
+            .iter()
+            .map(|script| script.path.clone())
+            .collect(),
+        properties,
+    };
+    Ok((detected, warnings, files))
+}
+
+async fn import_workspace(
+    State(state): State<AppState>,
+    Json(request): Json<ImportWorkspaceRequest>,
+) -> ApiResult<ImportWorkspaceResponse> {
+    let root = canonical_external_workspace(&request.path).await?;
+    let (mut detected, mut warnings, files) = inspect_existing_workspace_safe(
+        &root,
+        &request.kind,
+        request.name.as_deref(),
+        request.memory_gb,
+        request.port,
+    )
+    .await?;
+    if detected.kind == "server" {
+        validate_server_port(detected.port)
+            .map_err(|message| (StatusCode::BAD_REQUEST, message.into()))?;
+    }
+    let canonical_string = root.to_string_lossy().to_string();
+    let mut data = state.inner.write().await;
+    if data.servers.iter().any(|server| {
+        workspace_directory_for_server(server)
+            .canonicalize()
+            .ok()
+            .is_some_and(|path| path == root)
+            || server.workspace_path.as_deref() == Some(canonical_string.as_str())
+    }) {
+        return Err((StatusCode::CONFLICT, "该目录已经在工作区列表中".into()));
+    }
+    let port_conflict = detected.kind == "server"
+        && detected.port != 0
+        && data
+            .servers
+            .iter()
+            .any(|server| server.kind == "server" && server.port == detected.port);
+    let configured_port = if !is_server || port_conflict {
+        0
+    } else {
+        detected.port
+    };
+    if port_conflict {
+        warnings.push(format!(
+            "端口 {} 已被其他工作区登记；请在 server.properties 中调整后再启动",
+            detected.port
+        ));
+    }
+    let prefix = if detected.kind == "server" {
+        "server-import"
+    } else {
+        "project-import"
+    };
+    let id = format!(
+        "{prefix}-{}",
+        Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(8)
+            .collect::<String>()
+    );
+    let is_server = detected.kind == "server";
+    let lifecycle_phase = if !is_server {
+        "project"
+    } else if detected.core_ready {
+        "build"
+    } else {
+        "create"
+    };
+    let server = ServerInfo {
+        id: id.clone(),
+        kind: detected.kind.clone(),
+        name: detected.name.clone(),
+        core: detected.core.clone(),
+        core_resource_id: None,
+        version: detected.version.clone(),
+        status: if is_server {
+            "stopped".into()
+        } else {
+            "ready".into()
+        },
+        players: if is_server {
+            format!("0 / {}", detected.max_players)
+        } else {
+            "- / -".into()
+        },
+        memory: 0,
+        memory_gb: detected.memory_gb,
+        cpu: 0,
+        port: configured_port,
+        task: if is_server {
+            "已打开已有目录 · 等待启动".into()
+        } else {
+            "已打开项目目录".into()
+        },
+        location: "local".into(),
+        workspace_path: Some(canonical_string.clone()),
+        launch_jar: detected.launch_jar.clone(),
+        pid: None,
+        runtime_generation: None,
+        started_at: None,
+        operation_state: "idle".into(),
+        core_ready: is_server && detected.core_ready,
+        last_error: None,
+        lifecycle_phase: lifecycle_phase.into(),
+        service_settings: ServiceSettings::default(),
+    };
+    if is_server {
+        if let Some(content) =
+            read_bounded_text(&root.join("server.properties"), 2 * 1024 * 1024).await
+        {
+            data.configs.insert(id.clone(), content);
+        }
+        data.logs.entry(id.clone()).or_default().push(format!(
+            "[{} INFO]: 已打开已有服务器目录，自动读取核心、端口、EULA 和启动文件。",
+            Local::now().format("%H:%M:%S")
+        ));
+    } else {
+        data.logs.entry(id.clone()).or_default().push(format!(
+            "[{} INFO]: 已打开已有项目目录。",
+            Local::now().format("%H:%M:%S")
+        ));
+    }
+    data.servers.push(server.clone());
+    persist(&state, &data).await.map_err(internal)?;
+    // Do not write sculk.yml or any other file into an externally owned tree.
+    Ok(Json(ImportWorkspaceResponse {
+        server,
+        directory: canonical_string,
+        detected,
+        warnings,
+        files,
+    }))
+}
 async fn create_server(
     State(state): State<AppState>,
     Json(request): Json<CreateServerRequest>,
@@ -1396,6 +2086,8 @@ async fn create_server(
         port: request.port,
         task: "环境初始化".into(),
         location: "local".into(),
+        workspace_path: None,
+        launch_jar: None,
         pid: None,
         runtime_generation: None,
         started_at: None,
@@ -1480,6 +2172,8 @@ async fn create_project(
         port: 0,
         task: "项目已就绪".into(),
         location: request.location.unwrap_or_else(default_location),
+        workspace_path: None,
+        launch_jar: None,
         pid: None,
         runtime_generation: None,
         started_at: None,
@@ -1584,9 +2278,25 @@ async fn provision_server(
     {
         return Err((StatusCode::CONFLICT, "已有核心下载任务在进行中".into()));
     }
-    let core_ready = fs::metadata(runtime::server_directory(&id).join("server.jar"))
+    let current_server = state
+        .inner
+        .read()
         .await
-        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0);
+        .servers
+        .iter()
+        .find(|server| server.id == id)
+        .cloned()
+        .ok_or((StatusCode::NOT_FOUND, "server not found".into()))?;
+    if current_server.workspace_path.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "已有目录只支持直接启动和文件管理，不需要执行核心初始化".into(),
+        ));
+    }
+    let core_ready =
+        fs::metadata(workspace_directory_for_server(&current_server).join("server.jar"))
+            .await
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0);
     let (server, provision_task) = {
         let mut data = state.inner.write().await;
         let server_index = data
@@ -1708,6 +2418,8 @@ async fn plan_server(
         port: 0,
         task: "规划中 · 等待对话确定方案".into(),
         location: "local".into(),
+        workspace_path: None,
+        launch_jar: None,
         pid: None,
         runtime_generation: None,
         started_at: None,
@@ -1787,6 +2499,12 @@ async fn delete_server(
         .find(|server| server.id == id)
         .cloned()
         .ok_or((StatusCode::NOT_FOUND, "workspace not found".into()))?;
+    if request.delete_files && workspace.workspace_path.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "打开的已有目录归用户所有，只能从列表移除，不能由工作台删除磁盘文件".into(),
+        ));
+    }
     if state
         .downloads
         .read()
@@ -1802,7 +2520,7 @@ async fn delete_server(
     if workspace.kind == "server" && state.processes.read().await.contains_key(&id) {
         let _ = stop_server(state.clone(), id.clone(), false).await?;
     }
-    if workspace.kind == "server" {
+    if workspace.kind == "server" && workspace.workspace_path.is_none() {
         workspace_manifest::remove(&runtime::server_directory(&id))
             .await
             .map_err(internal)?;
@@ -2171,7 +2889,7 @@ async fn start_server(state: AppState, id: String) -> ApiResult<ActionResponse> 
             "server process is already running".into(),
         ));
     }
-    let (server, java_args) = {
+    let (mut server, java_args) = {
         let data = state.inner.read().await;
         let server = data
             .servers
@@ -2182,24 +2900,62 @@ async fn start_server(state: AppState, id: String) -> ApiResult<ActionResponse> 
         if let Some(message) = server_start_blocker(&server, &data.tasks) {
             return Err((StatusCode::CONFLICT, message));
         }
-        let java_args = server_java_args(server.memory_gb).map_err(|_| {
-            (
-                StatusCode::CONFLICT,
-                "服务器内存配置无效，必须在 2 到 64 GB 之间".into(),
-            )
-        })?;
+        let java_args = server_java_args_for_launch(server.memory_gb, server.launch_jar.as_deref())
+            .map_err(|_| {
+                (
+                    StatusCode::CONFLICT,
+                    "服务器内存配置无效，必须在 2 到 64 GB 之间".into(),
+                )
+            })?;
         (server, java_args)
     };
-    let directory = runtime::server_directory(&id);
-    if !fs::metadata(directory.join("server.jar"))
+    let directory = workspace_directory_for_server(&server);
+    let launch_jar = launch_jar_name(&server).map_err(|error| (StatusCode::CONFLICT, error))?;
+    if !fs::metadata(directory.join(&launch_jar))
         .await
         .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
     {
         record_server_operation_error(&state, &id, "server.jar is missing or empty").await;
         return Err((
             StatusCode::CONFLICT,
-            "server.jar 尚未就绪，请先执行初始化任务".into(),
+            format!("{launch_jar} 尚未就绪，请先检查已有目录中的核心文件"),
         ));
+    }
+    if server.workspace_path.is_some() {
+        let properties_path = directory.join("server.properties");
+        if let Some(content) = read_bounded_text(&properties_path, 2 * 1024 * 1024).await {
+            let properties =
+                server_import::parse_server_properties(content.as_bytes()).map_err(|error| {
+                    (
+                        StatusCode::CONFLICT,
+                        format!("server.properties 无法解析：{error}"),
+                    )
+                })?;
+            if let Some(port) = properties
+                .get("server-port")
+                .and_then(|value| value.parse::<u16>().ok())
+            {
+                if port >= 1024 {
+                    server.port = port;
+                }
+            }
+            let eula = read_bounded_text(&directory.join("eula.txt"), 64 * 1024)
+                .await
+                .and_then(|value| server_import::parse_eula(value.as_bytes()).ok().flatten());
+            if eula != Some(true) {
+                record_server_operation_error(&state, &id, "eula.txt 未设置 eula=true，启动已阻止")
+                    .await;
+                return Err((
+                    StatusCode::CONFLICT,
+                    "已有服务器目录尚未接受 Minecraft EULA（需要 eula=true）".into(),
+                ));
+            }
+        } else {
+            return Err((
+                StatusCode::CONFLICT,
+                "已有服务器目录缺少 server.properties".into(),
+            ));
+        }
     }
     ensure_server_port_available(server.port).await?;
     let required_java = runtime::required_java_major(&server.version);
@@ -2380,9 +3136,24 @@ async fn reset_failed_start(state: &AppState, id: &str, generation: Uuid) {
 }
 
 async fn record_server_operation_error(state: &AppState, id: &str, error: &str) {
-    let core_ready = fs::metadata(runtime::server_directory(id).join("server.jar"))
-        .await
-        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0);
+    let location = {
+        let data = state.inner.read().await;
+        data.servers
+            .iter()
+            .find(|server| server.id == id)
+            .map(|server| {
+                (
+                    workspace_directory_for_server(server),
+                    launch_jar_name(server).unwrap_or_else(|_| "server.jar".into()),
+                )
+            })
+    };
+    let core_ready = match location {
+        Some((directory, launch)) => fs::metadata(directory.join(launch))
+            .await
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0),
+        None => false,
+    };
     let mut data = state.inner.write().await;
     if let Some(server) = data.servers.iter_mut().find(|server| server.id == id) {
         server.operation_state = "idle".into();
@@ -3056,16 +3827,642 @@ async fn run_command(
     persist(&state, &data).await.map_err(internal)?;
     Ok(Json(CommandResponse { lines }))
 }
+
+const MAX_BUILD_OUTPUT_BYTES: usize = 1024 * 1024;
+const BUILD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const BUILD_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuildTool {
+    Maven,
+    Gradle,
+}
+
+impl BuildTool {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "maven" => Some(Self::Maven),
+            "gradle" => Some(Self::Gradle),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Maven => "maven",
+            Self::Gradle => "gradle",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Maven => "Maven",
+            Self::Gradle => "Gradle",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BuildCommand {
+    source: &'static str,
+    executable: PathBuf,
+    command_label: String,
+    via_shell: bool,
+}
+
+struct BuildInspection {
+    info: BuildBuilderInfo,
+    command: Option<BuildCommand>,
+}
+
+enum WrapperInspection {
+    Missing,
+    Available(PathBuf),
+    Rejected,
+}
+
+enum BuildOutputEvent {
+    Data(Vec<u8>),
+    Closed,
+}
+
+struct BuildProcessOutcome {
+    success: bool,
+    exit_code: Option<i32>,
+    duration_ms: u64,
+    output: Vec<u8>,
+    output_truncated: bool,
+}
+
+fn build_action_args(tool: BuildTool, action: &str) -> Option<Vec<&'static str>> {
+    match (tool, action.trim().to_ascii_lowercase().as_str()) {
+        (BuildTool::Maven, "clean") => Some(vec!["-B", "-ntp", "clean"]),
+        (BuildTool::Maven, "compile") => Some(vec!["-B", "-ntp", "compile"]),
+        (BuildTool::Maven, "package") => Some(vec!["-B", "-ntp", "package"]),
+        // Maven has no standalone `build` goal; package is its normal complete
+        // artifact-producing lifecycle for a plugin project.
+        (BuildTool::Maven, "build") => Some(vec!["-B", "-ntp", "package"]),
+        (BuildTool::Gradle, "clean") => Some(vec!["--no-daemon", "--console=plain", "clean"]),
+        // `classes` covers Java and Kotlin source sets without accepting an
+        // arbitrary Gradle task from the request body.
+        (BuildTool::Gradle, "compile") => Some(vec!["--no-daemon", "--console=plain", "classes"]),
+        (BuildTool::Gradle, "package" | "build") => {
+            Some(vec!["--no-daemon", "--console=plain", "build"])
+        }
+        _ => None,
+    }
+}
+
+fn build_wrapper_name(tool: BuildTool) -> &'static str {
+    #[cfg(windows)]
+    {
+        match tool {
+            BuildTool::Maven => "mvnw.cmd",
+            BuildTool::Gradle => "gradlew.bat",
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        match tool {
+            BuildTool::Maven => "mvnw",
+            BuildTool::Gradle => "gradlew",
+        }
+    }
+}
+
+fn build_descriptor_names(tool: BuildTool) -> &'static [&'static str] {
+    match tool {
+        BuildTool::Maven => &["pom.xml"],
+        BuildTool::Gradle => &["build.gradle", "build.gradle.kts"],
+    }
+}
+
+fn build_path_names(tool: BuildTool) -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        match tool {
+            BuildTool::Maven => &["mvn.cmd", "mvn.bat", "mvn.exe", "mvn"],
+            BuildTool::Gradle => &["gradle.bat", "gradle.cmd", "gradle.exe", "gradle"],
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        match tool {
+            BuildTool::Maven => &["mvn"],
+            BuildTool::Gradle => &["gradle"],
+        }
+    }
+}
+
+fn is_build_executable(metadata: &std::fs::Metadata) -> bool {
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+async fn inspect_build_wrapper(root: &StdPath, tool: BuildTool) -> WrapperInspection {
+    let path = root.join(build_wrapper_name(tool));
+    let metadata = match fs::symlink_metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return WrapperInspection::Missing;
+        }
+        Err(_) => return WrapperInspection::Rejected,
+    };
+    if metadata.file_type().is_symlink() || !is_build_executable(&metadata) {
+        return WrapperInspection::Rejected;
+    }
+    WrapperInspection::Available(path)
+}
+
+fn find_build_path_executable(tool: BuildTool) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&path) {
+        for name in build_path_names(tool) {
+            let candidate = directory.join(name);
+            let Ok(metadata) = candidate.metadata() else {
+                continue;
+            };
+            if is_build_executable(&metadata) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+async fn find_build_descriptor(root: &StdPath, tool: BuildTool) -> Option<String> {
+    for name in build_descriptor_names(tool) {
+        let path = root.join(name);
+        let Ok(metadata) = fs::symlink_metadata(&path).await else {
+            continue;
+        };
+        if metadata.is_file() && !metadata.file_type().is_symlink() {
+            return Some((*name).into());
+        }
+    }
+    None
+}
+
+fn build_command_label(path: &StdPath) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("build-tool")
+        .to_string()
+}
+
+fn build_via_shell(path: &StdPath) -> bool {
+    #[cfg(windows)]
+    {
+        path.extension().is_some_and(|extension| {
+            matches!(
+                extension.to_string_lossy().to_ascii_lowercase().as_str(),
+                "cmd" | "bat"
+            )
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+fn is_build_shell_label(tool: BuildTool, label: &str) -> bool {
+    build_wrapper_name(tool).eq_ignore_ascii_case(label)
+        || build_path_names(tool)
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(label))
+}
+
+async fn inspect_build_tool(root: &StdPath, tool: BuildTool) -> BuildInspection {
+    let descriptor = find_build_descriptor(root, tool).await;
+    let wrapper_name = build_wrapper_name(tool).to_string();
+    let wrapper = match inspect_build_wrapper(root, tool).await {
+        WrapperInspection::Available(path) => Some((path, wrapper_name)),
+        WrapperInspection::Missing | WrapperInspection::Rejected => None,
+    };
+    let wrapper_display = wrapper.as_ref().map(|(_, name)| name.clone());
+    let command = wrapper
+        .as_ref()
+        .map(|(path, wrapper)| BuildCommand {
+            source: "wrapper",
+            executable: path.clone(),
+            command_label: wrapper.clone(),
+            via_shell: build_via_shell(path),
+        })
+        .or_else(|| {
+            find_build_path_executable(tool).map(|path| BuildCommand {
+                source: "path",
+                command_label: build_command_label(&path),
+                executable: path.clone(),
+                via_shell: build_via_shell(&path),
+            })
+        });
+    let available = descriptor.is_some() && command.is_some();
+    let info = BuildBuilderInfo {
+        tool: tool.as_str().into(),
+        label: tool.label().into(),
+        source: command.as_ref().map(|command| command.source.into()),
+        available,
+        descriptor,
+        wrapper: wrapper_display,
+    };
+    BuildInspection {
+        info,
+        command: available.then_some(command).flatten(),
+    }
+}
+
+async fn project_build_root(state: &AppState, id: &str) -> Result<PathBuf, (StatusCode, String)> {
+    let workspace = {
+        let data = state.inner.read().await;
+        data.servers
+            .iter()
+            .find(|server| server.id == id)
+            .cloned()
+            .ok_or((StatusCode::NOT_FOUND, "workspace not found".into()))?
+    };
+    require_project_kind(&workspace, "project build")?;
+    let root = workspace_directory_for_server(&workspace);
+    let metadata = fs::symlink_metadata(&root).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            (
+                StatusCode::NOT_FOUND,
+                "project workspace directory was not found".into(),
+            )
+        } else {
+            (StatusCode::FORBIDDEN, format!("无法访问项目目录：{error}"))
+        }
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "项目根目录不能是符号链接或 junction".into(),
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err((StatusCode::CONFLICT, "项目根路径不是目录".into()));
+    }
+    let mut cursor = root.clone();
+    loop {
+        if let Ok(item) = fs::symlink_metadata(&cursor).await
+            && item.file_type().is_symlink()
+        {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "项目路径包含符号链接或 junction，已拒绝构建".into(),
+            ));
+        }
+        if !cursor.pop() {
+            break;
+        }
+    }
+    Ok(root)
+}
+
+async fn get_project_build(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> ApiResult<BuildDiscoveryResponse> {
+    let root = project_build_root(&state, &id).await?;
+    let mut builders = Vec::with_capacity(2);
+    let mut detected_tool = None;
+    for tool in [BuildTool::Maven, BuildTool::Gradle] {
+        let inspection = inspect_build_tool(&root, tool).await;
+        if detected_tool.is_none() && inspection.info.available {
+            detected_tool = Some(tool.as_str().to_string());
+        }
+        builders.push(inspection.info);
+    }
+    Ok(Json(BuildDiscoveryResponse {
+        builders,
+        detected_tool,
+    }))
+}
+
+async fn run_project_build(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<BuildRequest>,
+) -> ApiResult<BuildResultResponse> {
+    let tool = BuildTool::parse(&request.tool).ok_or((
+        StatusCode::BAD_REQUEST,
+        "tool must be maven or gradle".into(),
+    ))?;
+    let action = request.action.trim().to_ascii_lowercase();
+    if build_action_args(tool, &action).is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "action must be clean, compile, package, or build".into(),
+        ));
+    }
+    let root = project_build_root(&state, &id).await?;
+    let workspace_lock = server_operation_lock(&state, &id).await;
+    let files_lock = server_operation_lock(&state, &format!("files:{id}")).await;
+    let _workspace_guard = workspace_lock.try_lock().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            "项目当前正在执行其他工作区操作".into(),
+        )
+    })?;
+    let _files_guard = files_lock.try_lock().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            "项目文件正在修改，请稍后重试构建".into(),
+        )
+    })?;
+    let inspection = inspect_build_tool(&root, tool).await;
+    let command = inspection.command.ok_or((
+        StatusCode::CONFLICT,
+        format!("未检测到可用的 {} 构建器或项目描述文件", tool.label()),
+    ))?;
+    let args = build_action_args(tool, &action).expect("action was validated above");
+    let command_text = format!(
+        "{} {}",
+        command.command_label,
+        args.iter().copied().collect::<Vec<_>>().join(" ")
+    );
+    if command.via_shell && !is_build_shell_label(tool, &command.command_label) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "构建脚本名称不在允许列表中，已拒绝启动".into(),
+        ));
+    }
+    let mut process = if command.via_shell {
+        #[cfg(windows)]
+        {
+            let mut process = tokio::process::Command::new("cmd.exe");
+            // `cmd /c` parses its command text. Keep workspace paths out of
+            // that text and invoke only an internally allowlisted script name.
+            process
+                .arg("/d")
+                .arg("/s")
+                .arg("/v:off")
+                .arg("/c")
+                .arg("call")
+                .arg(&command.command_label);
+            process.args(&args);
+            process
+        }
+        #[cfg(not(windows))]
+        {
+            tokio::process::Command::new(&command.executable)
+        }
+    } else {
+        let mut process = tokio::process::Command::new(&command.executable);
+        process.args(&args);
+        process
+    };
+    if command.via_shell {
+        #[cfg(not(windows))]
+        process.args(&args);
+    }
+    process
+        .current_dir(&root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("CI", "true");
+    for name in [
+        "MAVEN_OPTS",
+        "MAVEN_CONFIG",
+        "GRADLE_OPTS",
+        "JAVA_TOOL_OPTIONS",
+        "_JAVA_OPTIONS",
+    ] {
+        process.env_remove(name);
+    }
+    #[cfg(windows)]
+    if command.via_shell && command.source == "path" {
+        let parent = command.executable.parent().ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "构建器路径不包含父目录".into(),
+        ))?;
+        let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(parent.to_path_buf()).chain(std::env::split_paths(&inherited_path)),
+        )
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("无法配置构建器 PATH：{error}"),
+            )
+        })?;
+        process.env("PATH", path);
+    }
+    process_platform::configure_managed_command(&mut process).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("无法配置构建进程隔离：{error}"),
+        )
+    })?;
+    let guard = process_platform::create_process_guard().map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("无法创建构建进程托管对象：{error}"),
+        )
+    })?;
+    let mut child = process.spawn().map_err(|error| {
+        (
+            StatusCode::CONFLICT,
+            format!("无法启动 {}：{error}", command.command_label),
+        )
+    })?;
+    let pid = child.id().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "构建进程未返回 PID".into(),
+    ))?;
+    if let Err(error) = process_platform::bind_process_to_guard(&guard, pid) {
+        terminate_untracked_child_with_guard(&mut child, pid, Some(&guard)).await;
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("无法将构建进程绑定到托管对象，构建已取消：{error}"),
+        ));
+    }
+    let stdout = child.stdout.take().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "无法连接构建进程标准输出".into(),
+    ))?;
+    let stderr = child.stderr.take().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "无法连接构建进程错误输出".into(),
+    ))?;
+    let outcome = run_build_process(child, pid, guard, stdout, stderr).await;
+    Ok(Json(BuildResultResponse {
+        tool: tool.as_str().into(),
+        action,
+        command: command_text,
+        success: outcome.success,
+        exit_code: outcome.exit_code,
+        duration_ms: outcome.duration_ms,
+        output: String::from_utf8_lossy(&outcome.output).into_owned(),
+        output_truncated: outcome.output_truncated,
+    }))
+}
+
+async fn read_build_output<R>(mut reader: R, sender: mpsc::Sender<BuildOutputEvent>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let mut buffer = [0u8; 8 * 1024];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(size) => {
+                if sender
+                    .send(BuildOutputEvent::Data(buffer[..size].to_vec()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    }
+    let _ = sender.send(BuildOutputEvent::Closed).await;
+}
+
+fn append_build_output(output: &mut Vec<u8>, truncated: &mut bool, chunk: &[u8]) {
+    if chunk.len() >= MAX_BUILD_OUTPUT_BYTES {
+        output.clear();
+        output.extend_from_slice(&chunk[chunk.len() - MAX_BUILD_OUTPUT_BYTES..]);
+        *truncated = true;
+        return;
+    }
+    output.extend_from_slice(chunk);
+    if output.len() > MAX_BUILD_OUTPUT_BYTES {
+        let remove = output.len() - MAX_BUILD_OUTPUT_BYTES;
+        output.drain(..remove);
+        *truncated = true;
+    }
+}
+
+async fn run_build_process(
+    mut child: Child,
+    pid: u32,
+    guard: process_platform::ProcessGuard,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+) -> BuildProcessOutcome {
+    let started = Instant::now();
+    let (sender, mut receiver) = mpsc::channel(64);
+    let stdout_task = tokio::spawn(read_build_output(stdout, sender.clone()));
+    let stderr_task = tokio::spawn(read_build_output(stderr, sender.clone()));
+    drop(sender);
+    let mut output = Vec::new();
+    let mut output_truncated = false;
+    let mut streams_closed = 0usize;
+    let mut receiver_closed = false;
+    let mut status = None;
+    let mut timed_out = false;
+    let mut drain_until = None;
+    loop {
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit)) => {
+                    status = Some(exit);
+                    let _ = process_platform::cleanup_remaining_tree(pid, Some(&guard));
+                    drain_until = Some(Instant::now() + BUILD_OUTPUT_DRAIN_TIMEOUT);
+                }
+                Ok(None) => {
+                    if !timed_out && started.elapsed() >= BUILD_TIMEOUT {
+                        timed_out = true;
+                        let _ = process_platform::start_kill_tree(&mut child, pid, Some(&guard));
+                        status = timeout(Duration::from_secs(5), child.wait())
+                            .await
+                            .ok()
+                            .and_then(Result::ok);
+                        let _ = process_platform::cleanup_remaining_tree(pid, Some(&guard));
+                        drain_until = Some(Instant::now() + BUILD_OUTPUT_DRAIN_TIMEOUT);
+                    }
+                }
+                Err(error) => {
+                    append_build_output(
+                        &mut output,
+                        &mut output_truncated,
+                        format!("构建进程状态读取失败：{error}\n").as_bytes(),
+                    );
+                    let _ = process_platform::start_kill_tree(&mut child, pid, Some(&guard));
+                    status = timeout(Duration::from_secs(5), child.wait())
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
+                    let _ = process_platform::cleanup_remaining_tree(pid, Some(&guard));
+                    drain_until = Some(Instant::now() + BUILD_OUTPUT_DRAIN_TIMEOUT);
+                }
+            }
+        }
+        // Closing stdout/stderr is not proof that the build process exited: a
+        // wrapper may detach a child while leaving the command process alive.
+        // Keep polling until we have both an exit status and drained streams.
+        if streams_closed >= 2 && status.is_some() {
+            break;
+        }
+        if let Some(deadline) = drain_until
+            && Instant::now() >= deadline
+        {
+            break;
+        }
+        tokio::select! {
+            event = receiver.recv(), if !receiver_closed => match event {
+                Some(BuildOutputEvent::Data(chunk)) => append_build_output(&mut output, &mut output_truncated, &chunk),
+                Some(BuildOutputEvent::Closed) => streams_closed += 1,
+                None => {
+                    streams_closed = 2;
+                    receiver_closed = true;
+                }
+            },
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+    drop(receiver);
+    for task in [stdout_task, stderr_task] {
+        let _ = timeout(Duration::from_secs(1), task).await;
+    }
+    let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let success = !timed_out && status.as_ref().is_some_and(|status| status.success());
+    let exit_code = status.as_ref().and_then(|status| status.code());
+    BuildProcessOutcome {
+        success,
+        exit_code,
+        duration_ms,
+        output,
+        output_truncated,
+    }
+}
+
 async fn get_config(
     Path(id): Path<String>,
     State(state): State<AppState>,
 ) -> ApiResult<ConfigResponse> {
-    let data = state.inner.read().await;
-    let content = data
-        .configs
-        .get(&id)
-        .cloned()
-        .ok_or((StatusCode::NOT_FOUND, "config not found".into()))?;
+    let (root, cached) = {
+        let data = state.inner.read().await;
+        let server = data
+            .servers
+            .iter()
+            .find(|server| server.id == id)
+            .cloned()
+            .ok_or((StatusCode::NOT_FOUND, "server not found".into()))?;
+        (
+            workspace_directory_for_server(&server),
+            data.configs.get(&id).cloned(),
+        )
+    };
+    let content = match read_bounded_text(&root.join("server.properties"), 2 * 1024 * 1024).await {
+        Some(content) => content,
+        None => cached.ok_or((StatusCode::NOT_FOUND, "config not found".into()))?,
+    };
     Ok(Json(ConfigResponse {
         content,
         updated_at: Local::now().to_rfc3339(),
@@ -3076,14 +4473,32 @@ async fn update_config(
     State(state): State<AppState>,
     Json(request): Json<ConfigUpdate>,
 ) -> ApiResult<ConfigResponse> {
+    if request.content.len() > 2 * 1024 * 1024 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "配置文件不能超过 2 MiB".into(),
+        ));
+    }
+    let root = ensure_workspace(&state, &id).await?;
+    let content = request.content;
+    let content_for_write = content.clone();
+    workspace_fs::within_workspace(root, move |workspace| {
+        reject_workspace_symlink(workspace, StdPath::new("server.properties"))?;
+        workspace.write(
+            StdPath::new("server.properties"),
+            content_for_write.as_bytes(),
+        )
+    })
+    .await
+    .map_err(workspace_io_error)?;
     let mut data = state.inner.write().await;
     if !data.servers.iter().any(|server| server.id == id) {
         return Err((StatusCode::NOT_FOUND, "server not found".into()));
     }
-    data.configs.insert(id, request.content.clone());
+    data.configs.insert(id, content.clone());
     persist(&state, &data).await.map_err(internal)?;
     Ok(Json(ConfigResponse {
-        content: request.content,
+        content,
         updated_at: Local::now().to_rfc3339(),
     }))
 }
@@ -3752,10 +5167,10 @@ fn is_protected_server_artifact(path: &StdPath) -> bool {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| {
-                matches!(
-                    name.to_ascii_lowercase().as_str(),
-                    "server.jar" | "server.jar.part" | "server.jar.backup"
-                )
+                let lower = name.to_ascii_lowercase();
+                lower.ends_with(".jar")
+                    || lower.ends_with(".jar.part")
+                    || lower.ends_with(".jar.backup")
             })
 }
 
@@ -3830,6 +5245,11 @@ async fn ensure_workspace(state: &AppState, id: &str) -> Result<PathBuf, (Status
             .cloned()
             .ok_or((StatusCode::NOT_FOUND, "workspace not found".into()))?
     };
+    if workspace.workspace_path.is_some() {
+        let root = workspace_directory_for_server(&workspace);
+        let canonical = canonical_external_workspace(root.to_string_lossy().as_ref()).await?;
+        return Ok(canonical);
+    }
     if workspace.kind == "project" {
         let root = runtime::project_directory(id);
         fs::create_dir_all(&root)
@@ -3857,6 +5277,9 @@ pub(crate) async fn ensure_provision_workspace(state: &AppState, id: &str) -> Re
             .ok_or_else(|| "server not found".to_string())?;
         if server.kind != "server" {
             return Err("operation 'provision' is only available for server workspaces".into());
+        }
+        if server.workspace_path.is_some() {
+            return Err("外部服务器目录不需要下载或生成初始化文件".into());
         }
         (
             data.configs.get(id).cloned().unwrap_or_default(),
@@ -4697,6 +6120,20 @@ pub(crate) fn require_server_kind(
     }
 }
 
+fn require_project_kind(
+    workspace: &ServerInfo,
+    operation: &str,
+) -> Result<(), (StatusCode, String)> {
+    if workspace.kind == "project" {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::CONFLICT,
+            format!("operation '{operation}' is only available for project workspaces"),
+        ))
+    }
+}
+
 fn default_operation_state() -> String {
     "idle".into()
 }
@@ -4778,12 +6215,19 @@ fn validate_memory_gb(memory_gb: u8) -> Result<(), &'static str> {
 }
 
 fn server_java_args(memory_gb: u8) -> Result<Vec<String>, &'static str> {
+    server_java_args_for_launch(memory_gb, None)
+}
+
+fn server_java_args_for_launch(
+    memory_gb: u8,
+    launch_jar: Option<&str>,
+) -> Result<Vec<String>, &'static str> {
     validate_memory_gb(memory_gb)?;
     Ok(vec![
         format!("-Xms{}G", memory_gb.min(INITIAL_HEAP_GB)),
         format!("-Xmx{memory_gb}G"),
         "-jar".into(),
-        "server.jar".into(),
+        launch_jar.unwrap_or("server.jar").into(),
         "nogui".into(),
     ])
 }
@@ -5071,6 +6515,7 @@ fn initial_state() -> PersistedState {
         logs: HashMap::new(),
         mirrors: seed_mirrors(),
         players: Vec::new(),
+        player_management: player_management::PlayerManagementState::default(),
         feedback: Vec::new(),
         polls: Vec::new(),
         integrations: seed_integrations(),
@@ -5104,6 +6549,8 @@ mod tests {
             port: 25565,
             task: task.into(),
             location: "本地".into(),
+            workspace_path: None,
+            launch_jar: None,
             pid: None,
             runtime_generation: None,
             started_at: None,
@@ -5584,6 +7031,44 @@ mod tests {
 
         assert_eq!(error.0, StatusCode::CONFLICT);
         assert!(error.1.contains("only available for server workspaces"));
+    }
+
+    #[test]
+    fn project_build_actions_and_tools_are_strictly_allowlisted() {
+        assert_eq!(BuildTool::parse("maven"), Some(BuildTool::Maven));
+        assert_eq!(BuildTool::parse(" GRADLE "), Some(BuildTool::Gradle));
+        assert_eq!(BuildTool::parse("shell"), None);
+        assert!(build_action_args(BuildTool::Maven, "clean").is_some());
+        assert!(build_action_args(BuildTool::Gradle, "compile").is_some());
+        assert!(build_action_args(BuildTool::Gradle, "package").is_some());
+        assert!(build_action_args(BuildTool::Maven, "build").is_some());
+        assert!(build_action_args(BuildTool::Maven, "-DskipTests package").is_none());
+        assert!(build_action_args(BuildTool::Gradle, "publish").is_none());
+    }
+
+    #[test]
+    fn project_build_rejects_server_workspaces() {
+        let server = test_server("server-build", "stopped", "idle");
+        let error = require_project_kind(&server, "project build").unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        let mut project = server;
+        project.kind = "project".into();
+        assert!(require_project_kind(&project, "project build").is_ok());
+    }
+
+    #[test]
+    fn build_output_limit_keeps_only_the_latest_mib() {
+        let mut output = Vec::new();
+        let mut truncated = false;
+        append_build_output(
+            &mut output,
+            &mut truncated,
+            &vec![b'a'; MAX_BUILD_OUTPUT_BYTES],
+        );
+        append_build_output(&mut output, &mut truncated, b"tail");
+        assert!(truncated);
+        assert_eq!(output.len(), MAX_BUILD_OUTPUT_BYTES);
+        assert_eq!(&output[output.len() - 4..], b"tail");
     }
 
     #[test]

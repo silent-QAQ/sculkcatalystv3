@@ -566,12 +566,26 @@ async fn settle_provision_server(
     ready: bool,
     error: Option<&str>,
 ) {
-    if error == Some(PROVISION_CANCELLED) {
-        let _ = fs::remove_file(runtime::server_directory(server_id).join("server.jar.part")).await;
-    }
-    let core_ready = fs::metadata(runtime::server_directory(server_id).join("server.jar"))
+    let workspace_root = state
+        .inner
+        .read()
         .await
-        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0);
+        .servers
+        .iter()
+        .find(|server| server.id == server_id)
+        .map(crate::workspace_directory_for_server);
+    if error == Some(PROVISION_CANCELLED) {
+        if let Some(root) = workspace_root.as_ref() {
+            let _ = fs::remove_file(root.join("server.jar.part")).await;
+        }
+    }
+    let core_ready = if let Some(root) = workspace_root.as_ref() {
+        fs::metadata(root.join("server.jar"))
+            .await
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+    } else {
+        false
+    };
     let mut data = state.inner.write().await;
     if let Some(server) = data
         .servers

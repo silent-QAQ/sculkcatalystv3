@@ -12,6 +12,8 @@ base64 = "0.22"
 cap-std = "4.0.2"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
+fastnbt = "2.6.2"
+flate2 = "1"
 fs2 = "0.4"
 hmac = "0.12"
 rand = "0.8"
@@ -42,5 +44,4 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-flate2 = "1"
 tar = "0.4"
