@@ -88,6 +88,7 @@ backend="$(resolve_local_path "${SCULK_BACKEND_BIN:-backend/target-local/release
 static_dir="$(resolve_local_path "${SCULK_STATIC_DIR:-frontend/dist}")"
 data_dir="$(resolve_local_path "${SCULK_DATA_DIR:-backend/data}")"
 pid_file="$runtime_dir/backend.pid"
+public_backend_pid_file="$runtime_dir/public-backend.pid"
 
 process_is_running() {
   local pid="$1"
@@ -138,6 +139,9 @@ if [[ ! -f "$static_dir/index.html" ]]; then
 fi
 
 mkdir -p -- "$runtime_dir" "$data_dir"
+if [[ "${SCULK_PUBLIC_PROXY_MANAGED:-}" != true ]]; then
+  rm -f -- "$public_backend_pid_file"
+fi
 command -v flock >/dev/null 2>&1 || { printf '%s\n' 'flock is required to start the local backend safely.' >&2; exit 1; }
 exec 9>"$runtime_dir/backend.start.lock"
 if ! flock -n 9; then
@@ -182,6 +186,7 @@ for cloud_var in $(compgen -v | grep -E '^SCULK_CLOUD_' || true); do
 done
 export SCULK_DISABLE_CLOUD=true
 unset SCULK_ALLOW_CODEX_FULL SCULK_CODEX_TRUSTED_COMMAND
+unset SCULK_PUBLIC_PROXY_MANAGED
 if [[ "$enable_codex_full_access" == true ]]; then
   export SCULK_ALLOW_CODEX_FULL=true
   export SCULK_CODEX_TRUSTED_COMMAND="$codex_command"

@@ -172,23 +172,28 @@ function Write-PackageReadme([string]$Path) {
     $content = @'
 # Sculk Catalyst V3 本地部署
 
-这是仅供本机使用的部署包，服务默认只监听 `127.0.0.1:8787`。
+本部署包提供本机运行和受保护的公网 HTTPS 两种模式。运行状态、服务器文件和配置会写入 `backend\data`；升级时请保留该目录。此包不附带 Codex CLI，请在本机单独安装并登录后，再在工作台设置中选择 `codex.cmd`。
 
-在 PowerShell 中启动：
+## 仅本机运行
 
-```powershell
-.\scripts\start-local.ps1
-```
+双击 `Start-Local.bat`，服务默认只监听 `127.0.0.1:8787`。启动后访问 <http://127.0.0.1:8787>。
 
-停止服务：
+## 公网 HTTPS
 
-```powershell
-.\scripts\stop-local.ps1
-```
+双击 `Start-Public-HTTPS.bat`。该模式仍让后端只监听 `127.0.0.1:8787`，由带 Basic Auth 的 Caddy HTTPS 反向代理对外提供访问。开始前必须：
 
-启动后访问 <http://127.0.0.1:8787>。运行状态、服务器文件和配置会写入 `backend\data`；升级时请保留该目录。此包不附带 Codex CLI，请在本机单独安装并登录后，再在工作台设置中选择 `codex.cmd`。
+- 单独安装 Caddy，并确保 `caddy.exe` 在 `PATH` 中；
+- 将公网域名的 DNS 指向这台服务器；
+- 允许公网访问服务器的 TCP `80` 和 `443`；
+- 不要在防火墙、路由器、容器或云安全组中暴露或映射后端 `8787` 端口。
 
-需要授予 Codex 完整权限时，请先停止服务，再显式指定同一个原生 CLI：
+首次启动会要求输入域名和 ACME 邮箱，并输出一次性管理员密码。公网模式不授予 Codex 完整权限；不要通过公网代理授予能执行宿主命令的 Codex 完整权限。
+
+## 停止服务
+
+本机模式双击 `Stop-Local.bat`，公网模式双击 `Stop-Public.bat`。
+
+需要在本机模式授予 Codex 完整权限时，请先停止服务，再在 PowerShell 中显式指定同一个原生 CLI：
 
 ```powershell
 .\scripts\stop-local.ps1
@@ -197,6 +202,20 @@ $codexCommand = (Get-Command codex.cmd -CommandType Application).Path
 ```
 '@
     Set-Content -LiteralPath $Path -Value $content -Encoding UTF8
+}
+
+function Write-PackageLauncher([string]$Path, [string]$ScriptName, [string]$Arguments = '') {
+    $content = @"
+@echo off
+setlocal
+cd /d "%~dp0"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\$ScriptName" $Arguments
+set "exitCode=%ERRORLEVEL%"
+if not "%exitCode%"=="0" echo Command failed with exit code %exitCode%.
+pause
+exit /b %exitCode%
+"@
+    Set-Content -LiteralPath $Path -Value $content -Encoding ASCII
 }
 
 $root = Get-FullPath (Split-Path $PSScriptRoot -Parent)
@@ -294,11 +313,17 @@ try {
     Copy-Item -Path (Join-Path $staticDirectory '*') -Destination $packageStatic -Recurse -Force
     Copy-Item -LiteralPath (Join-Path $root 'scripts\start-local.ps1') -Destination (Join-Path $packageScripts 'start-local.ps1') -Force
     Copy-Item -LiteralPath (Join-Path $root 'scripts\stop-local.ps1') -Destination (Join-Path $packageScripts 'stop-local.ps1') -Force
+    Copy-Item -LiteralPath (Join-Path $root 'scripts\start-public.ps1') -Destination (Join-Path $packageScripts 'start-public.ps1') -Force
+    Copy-Item -LiteralPath (Join-Path $root 'scripts\stop-public.ps1') -Destination (Join-Path $packageScripts 'stop-public.ps1') -Force
     Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $packageDirectory 'LICENSE') -Force
     Copy-Item -LiteralPath (Join-Path $root 'NOTICE') -Destination (Join-Path $packageDirectory 'NOTICE') -Force
     Copy-Item -LiteralPath (Join-Path $root 'LICENSES') -Destination (Join-Path $packageDirectory 'LICENSES') -Recurse -Force
     New-Item -ItemType Directory -Force -Path (Join-Path $packageDirectory 'backend\data') | Out-Null
     Write-PackageReadme (Join-Path $packageDirectory 'README.md')
+    Write-PackageLauncher (Join-Path $packageDirectory 'Start-Local.bat') 'start-local.ps1'
+    Write-PackageLauncher (Join-Path $packageDirectory 'Start-Public-HTTPS.bat') 'start-public.ps1' '-ConfirmPublicAdminConsole'
+    Write-PackageLauncher (Join-Path $packageDirectory 'Stop-Local.bat') 'stop-local.ps1'
+    Write-PackageLauncher (Join-Path $packageDirectory 'Stop-Public.bat') 'stop-public.ps1'
 
     # These files are only useful to Cloud, Agent, or Website deployments.
     Remove-ManagedPath $outputRoot (Join-Path $packageStatic 'downloads')
@@ -324,8 +349,14 @@ try {
         $required = @(
             "$releaseName/backend/target-local/release/backend.exe",
             "$releaseName/frontend/dist/index.html",
+            "$releaseName/Start-Local.bat",
+            "$releaseName/Start-Public-HTTPS.bat",
+            "$releaseName/Stop-Local.bat",
+            "$releaseName/Stop-Public.bat",
             "$releaseName/scripts/start-local.ps1",
             "$releaseName/scripts/stop-local.ps1",
+            "$releaseName/scripts/start-public.ps1",
+            "$releaseName/scripts/stop-public.ps1",
             "$releaseName/README.md"
         )
         foreach ($entry in $required) {

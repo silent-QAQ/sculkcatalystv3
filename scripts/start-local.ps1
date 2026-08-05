@@ -35,6 +35,7 @@ $backend = Join-Path $root 'backend\target-local\release\backend.exe'
 $staticDir = Join-Path $root 'frontend\dist'
 $backendDir = Join-Path $root 'backend'
 $pidFile = Join-Path $runtime 'backend.pid'
+$publicBackendPidFile = Join-Path $runtime 'public-backend.pid'
 $backendPid = $null
 
 function Resolve-CodexFullAccessCommand([bool]$Enabled, [string]$Command) {
@@ -74,6 +75,7 @@ function Start-BackendWithCodexAccess(
     $previousFullAccess = [Environment]::GetEnvironmentVariable('SCULK_ALLOW_CODEX_FULL', 'Process')
     $previousTrustedCommand = [Environment]::GetEnvironmentVariable('SCULK_CODEX_TRUSTED_COMMAND', 'Process')
     $previousCloudDisabled = [Environment]::GetEnvironmentVariable('SCULK_DISABLE_CLOUD', 'Process')
+    $previousPublicProxyManaged = [Environment]::GetEnvironmentVariable('SCULK_PUBLIC_PROXY_MANAGED', 'Process')
     $cloudEnvironment = @{}
     foreach ($entry in Get-ChildItem Env:) {
         if ($entry.Name -match '^(?:DATABASE_URL|REDIS_URL|SCULK_MASTER_KEY|SCULK_ALLOWED_ORIGINS|SCULK_CLOUD_|SCULK_POSTGRES_|SCULK_REDIS_)') {
@@ -86,6 +88,7 @@ function Start-BackendWithCodexAccess(
         [Environment]::SetEnvironmentVariable('SCULK_ALLOW_CODEX_FULL', $null, 'Process')
         [Environment]::SetEnvironmentVariable('SCULK_CODEX_TRUSTED_COMMAND', $null, 'Process')
         [Environment]::SetEnvironmentVariable('SCULK_DISABLE_CLOUD', 'true', 'Process')
+        [Environment]::SetEnvironmentVariable('SCULK_PUBLIC_PROXY_MANAGED', $null, 'Process')
         if ($EnableFullAccess) {
             [Environment]::SetEnvironmentVariable('SCULK_ALLOW_CODEX_FULL', 'true', 'Process')
             [Environment]::SetEnvironmentVariable('SCULK_CODEX_TRUSTED_COMMAND', $TrustedCodexCommand, 'Process')
@@ -100,6 +103,7 @@ function Start-BackendWithCodexAccess(
         [Environment]::SetEnvironmentVariable('SCULK_ALLOW_CODEX_FULL', $previousFullAccess, 'Process')
         [Environment]::SetEnvironmentVariable('SCULK_CODEX_TRUSTED_COMMAND', $previousTrustedCommand, 'Process')
         [Environment]::SetEnvironmentVariable('SCULK_DISABLE_CLOUD', $previousCloudDisabled, 'Process')
+        [Environment]::SetEnvironmentVariable('SCULK_PUBLIC_PROXY_MANAGED', $previousPublicProxyManaged, 'Process')
         foreach ($name in $cloudEnvironment.Keys) {
             [Environment]::SetEnvironmentVariable($name, $cloudEnvironment[$name], 'Process')
         }
@@ -113,6 +117,16 @@ if (-not (Test-Path -LiteralPath $backend)) {
 }
 if (-not (Test-Path -LiteralPath (Join-Path $staticDir 'index.html'))) {
     throw 'Frontend production bundle is not built.'
+}
+
+# A normal local launch invalidates the marker used by start-public.ps1. The
+# marker is retained only for the temporary handoff from that script.
+if (-not [string]::Equals(
+    [Environment]::GetEnvironmentVariable('SCULK_PUBLIC_PROXY_MANAGED', 'Process'),
+    'true',
+    [System.StringComparison]::OrdinalIgnoreCase
+)) {
+    Remove-Item -LiteralPath $publicBackendPidFile -Force -ErrorAction SilentlyContinue
 }
 
 if (Test-Path -LiteralPath $pidFile) {

@@ -11,8 +11,12 @@ on:
       - scripts/package-local.sh
       - scripts/start-local.ps1
       - scripts/start-local.sh
+      - scripts/start-public.ps1
+      - scripts/start-public.sh
       - scripts/stop-local.ps1
       - scripts/stop-local.sh
+      - scripts/stop-public.ps1
+      - scripts/stop-public.sh
       - LICENSE
       - NOTICE
       - LICENSES/**

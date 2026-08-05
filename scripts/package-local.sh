@@ -236,34 +236,104 @@ install -m 0755 -- "$backend_binary" "$package_backend/backend"
 cp -a -- "$static_directory"/. "$package_static/"
 install -m 0755 -- "$root/scripts/start-local.sh" "$package_scripts/start-local.sh"
 install -m 0755 -- "$root/scripts/stop-local.sh" "$package_scripts/stop-local.sh"
+install -m 0755 -- "$root/scripts/start-public.sh" "$package_scripts/start-public.sh"
+install -m 0755 -- "$root/scripts/stop-public.sh" "$package_scripts/stop-public.sh"
 install -m 0644 -- "$root/LICENSE" "$package_directory/LICENSE"
 install -m 0644 -- "$root/NOTICE" "$package_directory/NOTICE"
 cp -a -- "$root/LICENSES" "$package_directory/LICENSES"
 
+cat > "$package_directory/start-local.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+exec "$root/scripts/start-local.sh" "$@"
+EOF
+cat > "$package_directory/start-public.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+exec "$root/scripts/start-public.sh" --confirm-public-admin-console "$@"
+EOF
+cat > "$package_directory/stop-local.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+exec "$root/scripts/stop-local.sh" "$@"
+EOF
+cat > "$package_directory/stop-public.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+exec "$root/scripts/stop-public.sh" "$@"
+EOF
+cat > "$package_directory/stop.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+"$root/scripts/stop-public.sh" "$@"
+exec "$root/scripts/stop-local.sh" "$@"
+EOF
+chmod 0755 -- \
+  "$package_directory/start-local.sh" \
+  "$package_directory/start-public.sh" \
+  "$package_directory/stop-local.sh" \
+  "$package_directory/stop-public.sh" \
+  "$package_directory/stop.sh"
+
 cat > "$package_directory/README.md" <<'EOF'
 # Sculk Catalyst V3 本地部署
 
-这是仅供本机使用的部署包，服务默认只监听 `127.0.0.1:8787`。
+本部署包提供本机运行和受保护的公网 HTTPS 两种模式。运行状态、服务器文件和配置会写入 `backend/data`；升级时请保留该目录。此包不附带 Codex CLI，请在本机单独安装并登录后，再在工作台设置中选择 `codex`。
 
-启动：
+## 仅本机运行
+
+服务默认只监听 `127.0.0.1:8787`，启动后访问 <http://127.0.0.1:8787>：
 
 ```bash
-./scripts/start-local.sh
+./start-local.sh
 ```
 
-停止服务：
+## 公网 HTTPS
+
+公网模式仍让后端仅监听 `127.0.0.1:8787`，由带 Basic Auth 的 Caddy HTTPS 反向代理对外提供访问。开始前必须：
+
+- 单独安装 Caddy，并确保 `caddy` 在 `PATH` 中；
+- 将公网域名的 DNS 指向这台服务器；
+- 允许公网访问服务器的 TCP `80` 和 `443`；
+- 不要在防火墙、路由器、容器或云安全组中暴露或映射后端 `8787` 端口。
+
+启动时首次会要求输入域名和 ACME 邮箱，并输出一次性管理员密码：
 
 ```bash
-./scripts/stop-local.sh
+./start-public.sh --domain console.example.com --email admin@example.com
 ```
 
-启动后访问 <http://127.0.0.1:8787>。运行状态、服务器文件和配置会写入 `backend/data`；升级时请保留该目录。此包不附带 Codex CLI，请在本机单独安装并登录后，再在工作台设置中选择 `codex`。
+公共模式不授予 Codex 完整权限。不要向公网代理授予能执行宿主命令的 Codex 完整权限。
 
-需要授予 Codex 完整权限时，请先停止服务，再显式指定同一个原生 CLI：
+## 停止服务
+
+仅本机模式：
 
 ```bash
-./scripts/stop-local.sh
-./scripts/start-local.sh --enable-codex-full-access --codex-command "$(command -v codex)"
+./stop-local.sh
+```
+
+公网模式：
+
+```bash
+./stop-public.sh
+```
+
+`stop.sh` 会先停止公网代理，再停止本机后端。仅本机模式下需要授予 Codex 完整权限时，请先停止服务，再显式指定同一个原生 CLI：
+
+```bash
+./stop-local.sh
+./start-local.sh --enable-codex-full-access --codex-command "$(command -v codex)"
 ```
 EOF
 
@@ -281,8 +351,15 @@ entries="$(tar -tzf "$archive")"
 for required in \
   "$release_name/backend/target-local/release/backend" \
   "$release_name/frontend/dist/index.html" \
+  "$release_name/start-local.sh" \
+  "$release_name/start-public.sh" \
+  "$release_name/stop-local.sh" \
+  "$release_name/stop-public.sh" \
+  "$release_name/stop.sh" \
   "$release_name/scripts/start-local.sh" \
   "$release_name/scripts/stop-local.sh" \
+  "$release_name/scripts/start-public.sh" \
+  "$release_name/scripts/stop-public.sh" \
   "$release_name/README.md"; do
   grep -Fqx -- "$required" <<<"$entries" >/dev/null || die "Archive validation failed; required entry is missing: $required"
 done

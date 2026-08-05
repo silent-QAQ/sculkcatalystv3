@@ -339,6 +339,36 @@ Linux 使用同一机制，命令必须是已安装 Codex CLI 的绝对路径：
 ./scripts/start-local.sh --enable-codex-full-access --codex-command "$(command -v codex)"
 ```
 
+### 受保护公网 HTTPS 远程管理
+
+本地工作台没有应用层登录、RBAC 或多管理员隔离，不能把后端绑定到 `0.0.0.0`，也不能在防火墙、路由器、容器或云安全组中映射 `8787`。公网模式始终让后端只监听 `127.0.0.1:8787`，由 Caddy 在 `80/443` 提供自动 HTTPS，并对静态页面、API、WebSocket 与对象路径统一 Basic Auth。
+
+公网模式的外部前提不能被启动脚本代替：公网 DNS 必须已指向此主机、TCP `80/443` 必须可从互联网访问、Caddy 必须已经安装并具备绑定这些端口的权限。Linux 建议使用官方 Caddy 包或为专用运行账户授予端口绑定能力；不要为了启动工作台而不加区分地以 root 运行整个后端。Caddy 配置和密码哈希会保存在 `backend/data/public-proxy`，应仅对部署账户可读。
+
+Windows 首次启动会询问域名与 ACME 邮箱，并只显示一次随机管理员密码：
+
+```powershell
+.\scripts\start-public.ps1 -ConfirmPublicAdminConsole
+```
+
+Linux 对应命令：
+
+```bash
+./scripts/start-public.sh --confirm-public-admin-console
+```
+
+如 Caddy 不在 `PATH`，分别传入 `-CaddyCommand <绝对路径>` 或 `--caddy-command <绝对路径>`。需要重置公网管理员密码时，先停止公网服务，再在同一命令后追加 `-ResetCredentials` 或 `--reset-credentials`。停止命令如下：
+
+```powershell
+.\scripts\stop-public.ps1
+```
+
+```bash
+./scripts/stop-public.sh
+```
+
+公网脚本会拒绝代理一个由普通本地启动流程创建的后端，以免已授予 Codex 完整权限的进程被意外暴露。公网模式不支持 Codex 完整权限、任意宿主命令执行或 Cloud；需要这些能力时，仅在受信任本机使用本地模式。
+
 ### 本地分发包
 
 日常修改仍使用上面的直接构建和启动流程。只有需要分发独立本地部署包时，才在对应系统执行打包脚本：
@@ -354,7 +384,7 @@ chmod +x scripts/package-local.sh
 
 可用 `-Version 0.1.0` 或 `--version 0.1.0` 指定分发版本；省略时取 `backend/Cargo.toml` 的包版本。产物分别是 `artifacts/generated/local/sculk-catalyst-local-windows-x86_64-<version>.zip` 与 `artifacts/generated/local/sculk-catalyst-local-linux-<arch>-<version>.tar.gz`，每个归档都会生成同名 `.sha256` 校验文件。默认在归档输出目录内的隔离前端工作区执行 `npm ci`；若已有可用依赖且希望缩短打包时间，Windows 使用 `-SkipDependencyInstall`，Linux 使用 `--skip-dependency-install`，脚本会只读复制源 `frontend/node_modules`。
 
-打包的 Rust target、前端工作区和 staging 目录都位于 `artifacts/generated/local` 下，完成后会自动清理；日常开发的 `backend/target-local`、`frontend/dist`、Cloud 构建和官网构建不会被覆盖。分发包只包含本地后端、前端、启动/停止脚本和许可证，不复制 `backend/data`、`state.json`、`dist-cloud`、`dist-website`、Cloud Agent 下载物或官网静态资源。推送到 `main` 后，GitHub Actions 的 `local-distribution` 工作流会并行构建 Windows x86_64 ZIP 与 Linux x86_64 tar.gz，并将二者及校验文件作为 14 天有效的构建产物上传。
+打包的 Rust target、前端工作区和 staging 目录都位于 `artifacts/generated/local` 下，完成后会自动清理；日常开发的 `backend/target-local`、`frontend/dist`、Cloud 构建和官网构建不会被覆盖。Windows 分发包根目录提供 `Start-Local.bat`、`Start-Public-HTTPS.bat`、`Stop-Local.bat` 与 `Stop-Public.bat`；Linux 包提供同名语义的 `start-local.sh`、`start-public.sh`、`stop-local.sh` 与 `stop-public.sh`。分发包只包含本地后端、前端、两种模式的启动/停止脚本和许可证，不复制 `backend/data`、`state.json`、`dist-cloud`、`dist-website`、Cloud Agent 下载物或官网静态资源。推送到 `main` 后，GitHub Actions 的 `local-distribution` 工作流会并行构建 Windows x86_64 ZIP 与 Linux x86_64 tar.gz，并将二者及校验文件作为 14 天有效的构建产物上传。
 
 ### 健康检查
 
