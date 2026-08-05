@@ -939,8 +939,9 @@ const openDirectoryModeLabel=computed(()=>workspaceMode.value==='project'?'项�
 const openDirectoryDetectedRows=computed(()=>{
   const detected=openDirectorySummary.value?.detected
   if(!detected||typeof detected!=='object')return[]
-  const labels:Record<string,string>={name:'名称',core:'核心',version:'Minecraft 版本',port:'端口',memory_gb:'内存上限',core_ready:'核心状态',java_major:'Java 版本',server_properties:'server.properties',sculk_manifest:'sculk.yml'}
-  return Object.entries(detected).filter(([,value])=>value!==null&&value!==undefined).map(([key,value])=>({key,label:labels[key]??key,value:formatOpenDirectoryValue(value)}))
+  const labels:Record<string,string>={kind:'类型',name:'名称',core:'核心',version:'Minecraft 版本',port:'端口',memory_gb:'内存上限',max_players:'最大玩家',core_ready:'核心状态',eula_accepted:'EULA',launch_jar:'启动核心',config_files:'配置文件',jar_candidates:'JAR 候选',script_candidates:'启动脚本'}
+  const visibleKeys=['kind','name','core','version','port','memory_gb','max_players','core_ready','eula_accepted','launch_jar','config_files','jar_candidates','script_candidates']
+  return visibleKeys.flatMap(key=>{const value=detected[key];return value===null||value===undefined?[]:[{key,label:labels[key]??key,value:formatOpenDirectoryValue(value)}]})
 })
 function formatOpenDirectoryValue(value:unknown):string{
   if(typeof value==='boolean')return value?'已检测到':'未检测到'

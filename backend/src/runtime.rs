@@ -501,18 +501,16 @@ async fn fetch_package_metadata(
     platform: JavaPackagePlatform,
 ) -> Result<AdoptiumPackage, InstallError> {
     match fetch_msl_package_metadata(client, major, platform).await {
-        Ok(package) => return Ok(package),
+        Ok(package) => Ok(package),
         Err(msl_error) => match fetch_adoptium_package_metadata(client, major, platform).await {
-            Ok(package) => return Ok(package),
-            Err(adoptium_error) => {
-                return Err(InstallError::new(
-                    adoptium_error.kind,
-                    format!(
-                        "MSL 镜像未提供 Java {major} {}：{}；Eclipse Adoptium 回退也失败：{}",
-                        platform.label, msl_error.message, adoptium_error.message
-                    ),
-                ));
-            }
+            Ok(package) => Ok(package),
+            Err(adoptium_error) => Err(InstallError::new(
+                adoptium_error.kind,
+                format!(
+                    "MSL 镜像未提供 Java {major} {}：{}；Eclipse Adoptium 回退也失败：{}",
+                    platform.label, msl_error.message, adoptium_error.message
+                ),
+            )),
         },
     }
 }

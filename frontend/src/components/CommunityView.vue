@@ -40,6 +40,7 @@ interface Item {
   name?: string | null
   lore: string[]
   container_kind?: 'shulker_box' | 'bundle' | 'container' | null
+  container_size?: number | null
   contents?: Item[]
 }
 
@@ -55,20 +56,16 @@ interface Inventory {
 interface PlayerProfile extends PlayerListItem {
   note?: string | null
   tags: string[]
+  snapshot_available: boolean
   inventory: Inventory
   ender_chest: Inventory
 }
 
 interface PlayerSource {
   kind: string
+  available: boolean
   label: string
   detail: string
-}
-
-interface PlayerListResponse {
-  players: PlayerListItem[]
-  source: PlayerSource
-  total: number
 }
 
 interface PapiField {
@@ -76,12 +73,6 @@ interface PapiField {
   label: string
   placeholder: string
   enabled: boolean
-}
-
-interface PapiFieldsResponse {
-  fields: PapiField[]
-  available: boolean
-  detail: string
 }
 
 interface PapiValue {
@@ -92,10 +83,99 @@ interface PapiValue {
   status: PapiValueStatus
 }
 
-interface PlayerPapiResponse {
-  available: boolean
-  detail: string
-  values: PapiValue[]
+interface RawPlayerProfile {
+  display_name?: string | null
+  role?: string | null
+  note?: string | null
+  tags?: string[]
+  updated_at?: string | null
+}
+
+interface RawPlayerPosition {
+  x: number
+  y: number
+  z: number
+}
+
+interface RawInventorySlot {
+  slot: number
+  item?: RawPlayerItem | null
+}
+
+interface RawInventory {
+  slots?: RawInventorySlot[]
+}
+
+interface RawPlayerItem {
+  id: string
+  count?: number
+  name?: string | null
+  lore?: string[]
+  container?: {
+    kind?: string
+    size?: number
+    slots?: RawInventorySlot[]
+  } | null
+}
+
+interface RawPlayerRecord {
+  key: string
+  uuid?: string | null
+  name: string
+  profile?: RawPlayerProfile
+  status: string
+  source: string
+  level?: number | null
+  dimension?: string | null
+  position?: RawPlayerPosition | null
+  updated_at?: string | null
+}
+
+interface RawPlayerDetail extends RawPlayerRecord {
+  experience_progress?: number | null
+  total_experience?: number | null
+  health?: number | null
+  food_level?: number | null
+  inventory?: RawInventory | null
+  ender_chest?: RawInventory | null
+}
+
+interface RawPlayerListResponse {
+  source: {
+    kind: string
+    available: boolean
+    world?: string | null
+    detail?: string
+  }
+  players: RawPlayerRecord[]
+  total: number
+}
+
+interface RawPlayerDetailResponse {
+  player: RawPlayerDetail
+  source: RawPlayerListResponse['source']
+}
+
+interface RawPapiFieldsResponse {
+  detected: boolean
+  runtime_available: boolean
+  fields: PapiField[]
+  message?: string
+}
+
+interface RawPapiValue {
+  id: string
+  label: string
+  placeholder: string
+  value?: string | null
+  status: string
+}
+
+interface RawPlayerPapiResponse {
+  detected: boolean
+  runtime_available: boolean
+  fields: RawPapiValue[]
+  message?: string
 }
 
 interface Feedback {
@@ -190,6 +270,7 @@ const serverFeedback = computed(() => feedback.value.filter((item) => item.serve
 const serverPolls = computed(() => polls.value.filter((poll) => poll.server_id === props.serverId))
 const activeContainerPreview = computed(() => pinnedContainer.value ?? hoveredContainer.value)
 const inventoryCells = computed(() => toInventoryGrid(profile.value?.inventory, 36))
+const equipmentCells = computed(() => toEquipmentGrid(profile.value?.inventory))
 const enderChestCells = computed(() => toInventoryGrid(profile.value?.ender_chest, 27))
 
 function errorMessage(error: unknown) {
@@ -198,6 +279,105 @@ function errorMessage(error: unknown) {
 
 function cloneFields(fields: PapiField[]) {
   return fields.map((field) => ({ ...field }))
+}
+
+function normalizeSource(value: RawPlayerListResponse['source'] | null | undefined): PlayerSource | null {
+  if (!value) return null
+  const world = value.world?.trim()
+  return {
+    kind: value.kind,
+    available: Boolean(value.available),
+    label: value.available
+      ? `世界玩家数据${world ? ` · ${world}` : ''}`
+      : '世界玩家数据不可用',
+    detail: value.detail || (value.available
+      ? '来自世界 playerdata 的离线快照，在线玩家可能存在保存延迟。'
+      : '未发现可读取的世界 playerdata。'),
+  }
+}
+
+function normalizePosition(value: RawPlayerPosition | null | undefined, dimension?: string | null): PlayerPosition | null {
+  if (!value || ![value.x, value.y, value.z].every(Number.isFinite)) return null
+  return {
+    world: dimension?.trim() || '未知维度',
+    x: value.x,
+    y: value.y,
+    z: value.z,
+  }
+}
+
+function normalizeItem(value: RawPlayerItem | null | undefined): Item | null {
+  if (!value || typeof value.id !== 'string' || !value.id) return null
+  const container = value.container
+  const containerSize = Number(container?.size)
+  const contents = container?.slots
+    ?.map((entry) => {
+      const item = normalizeItem(entry.item)
+      if (item && Number.isInteger(entry.slot)) item.slot = entry.slot
+      return item
+    })
+    .filter((item): item is Item => item !== null)
+  const kind = container?.kind
+  return {
+    id: value.id,
+    count: Number.isFinite(value.count) ? Math.max(0, Number(value.count)) : 1,
+    name: value.name ?? null,
+    lore: Array.isArray(value.lore) ? value.lore.filter((line): line is string => typeof line === 'string') : [],
+    container_kind: kind === 'shulker_box' || kind === 'bundle' ? kind : kind ? 'container' : null,
+    container_size: Number.isInteger(containerSize) && containerSize > 0 ? containerSize : null,
+    contents,
+  }
+}
+
+function normalizeInventory(value: RawInventory | null | undefined): Inventory {
+  return {
+    slots: Array.isArray(value?.slots)
+      ? value.slots
+        .map((entry) => ({
+          slot: Number(entry.slot),
+          item: normalizeItem(entry.item),
+        }))
+        .filter((entry) => Number.isInteger(entry.slot) && (entry.slot >= 0 && entry.slot < 54 || entry.slot >= 100 && entry.slot <= 103 || entry.slot === -106))
+      : [],
+  }
+}
+
+function normalizePlayerRecord(value: RawPlayerRecord, sourceWorld?: string | null): PlayerListItem {
+  const profile = value.profile ?? {}
+  return {
+    id: value.key,
+    uuid: value.uuid ?? undefined,
+    name: value.name,
+    status: value.status,
+    display_name: profile.display_name ?? null,
+    role: profile.role ?? null,
+    level: value.level ?? null,
+    position: normalizePosition(value.position, value.dimension || sourceWorld),
+    updated_at: value.updated_at ?? profile.updated_at ?? null,
+    source: value.source,
+  }
+}
+
+function normalizePlayerDetail(value: RawPlayerDetail, sourceWorld?: string | null): PlayerProfile {
+  const profile = value.profile ?? {}
+  return {
+    ...normalizePlayerRecord(value, sourceWorld),
+    note: profile.note ?? null,
+    tags: Array.isArray(profile.tags) ? profile.tags.filter((tag): tag is string => typeof tag === 'string') : [],
+    snapshot_available: Boolean(value.inventory || value.ender_chest),
+    inventory: normalizeInventory(value.inventory),
+    ender_chest: normalizeInventory(value.ender_chest),
+  }
+}
+
+function normalizePapiAvailability(detected: boolean, runtimeAvailable: boolean) {
+  return Boolean(detected && runtimeAvailable)
+}
+
+function normalizePapiStatus(status: string): PapiValueStatus {
+  if (status === 'available') return 'ok'
+  if (status === 'unresolved') return 'unresolved'
+  return 'unavailable'
 }
 
 function normalizeProfile(value: PlayerProfile): PlayerProfile {
@@ -225,10 +405,12 @@ async function loadPlayers() {
   playerLoading.value = true
   playerError.value = ''
   try {
-    const response = await apiRequest<PlayerListResponse>(`/api/servers/${encodeURIComponent(serverId)}/players?${params}`)
+    const response = await apiRequest<RawPlayerListResponse>(`/api/servers/${encodeURIComponent(serverId)}/players?${params}`)
     if (request !== playerRequest || serverId !== props.serverId) return
-    players.value = Array.isArray(response.players) ? response.players : []
-    playerSource.value = response.source ?? null
+    players.value = Array.isArray(response.players)
+      ? response.players.map((player) => normalizePlayerRecord(player, response.source?.world))
+      : []
+    playerSource.value = normalizeSource(response.source)
     playerTotal.value = Number.isFinite(response.total) ? response.total : players.value.length
   } catch (error) {
     if (request !== playerRequest || serverId !== props.serverId) return
@@ -261,12 +443,12 @@ async function loadPapiFields() {
   papiLoading.value = true
   papiError.value = ''
   try {
-    const response = await apiRequest<PapiFieldsResponse>(`/api/servers/${encodeURIComponent(serverId)}/papi/fields`)
+    const response = await apiRequest<RawPapiFieldsResponse>(`/api/servers/${encodeURIComponent(serverId)}/papi/fields`)
     if (serverId !== props.serverId) return
     papiFields.value = Array.isArray(response.fields) ? response.fields : []
     papiDraft.value = cloneFields(papiFields.value)
-    papiAvailable.value = response.available
-    papiDetail.value = response.detail || (response.available ? 'PlaceholderAPI 已连接' : 'PlaceholderAPI 当前不可用')
+    papiAvailable.value = normalizePapiAvailability(response.detected, response.runtime_available)
+    papiDetail.value = response.message || (papiAvailable.value ? 'PlaceholderAPI 已连接' : 'PlaceholderAPI 当前不可用')
   } catch (error) {
     if (serverId !== props.serverId) return
     papiFields.value = []
@@ -327,9 +509,10 @@ async function openProfile(player: PlayerListItem) {
   const request = ++profileRequest
   profileLoading.value = true
   try {
-    const response = await apiRequest<PlayerProfile>(`${playerPath(player.id)}`)
+    const response = await apiRequest<RawPlayerDetailResponse>(`${playerPath(player.id)}`)
     if (request !== profileRequest || serverId !== props.serverId || selectedPlayer.value?.id !== player.id) return
-    profile.value = normalizeProfile(response)
+    profile.value = normalizeProfile(normalizePlayerDetail(response.player, response.source?.world))
+    playerSource.value = normalizeSource(response.source) || playerSource.value
     resetProfileDraft(profile.value)
     void loadPlayerPapi(profile.value.id)
   } catch (error) {
@@ -364,7 +547,8 @@ function openPapiManager() {
 
 function newPapiFieldId() {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
-  return `papi-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const hex = () => Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, '0')
+  return `${hex()}-${hex().slice(0, 4)}-4${hex().slice(0, 3)}-8${hex().slice(0, 3)}-${hex()}${hex().slice(0, 4)}`
 }
 
 function addPapiField() {
@@ -391,14 +575,14 @@ async function savePapiFields() {
   papiSaving.value = true
   papiSaveError.value = ''
   try {
-    const response = await apiRequest<PapiFieldsResponse>(`/api/servers/${encodeURIComponent(props.serverId)}/papi/fields`, {
+    const response = await apiRequest<RawPapiFieldsResponse>(`/api/servers/${encodeURIComponent(props.serverId)}/papi/fields`, {
       method: 'PUT',
       body: JSON.stringify({ fields }),
     })
     papiFields.value = Array.isArray(response.fields) ? response.fields : []
     papiDraft.value = cloneFields(papiFields.value)
-    papiAvailable.value = response.available
-    papiDetail.value = response.detail || (response.available ? 'PlaceholderAPI 已连接' : 'PlaceholderAPI 当前不可用')
+    papiAvailable.value = normalizePapiAvailability(response.detected, response.runtime_available)
+    papiDetail.value = response.message || (papiAvailable.value ? 'PlaceholderAPI 已连接' : 'PlaceholderAPI 当前不可用')
     showPapiManager.value = false
     if (profile.value) void loadPlayerPapi(profile.value.id)
   } catch (error) {
@@ -414,11 +598,19 @@ async function loadPlayerPapi(playerId: string) {
   playerPapiLoading.value = true
   playerPapiError.value = ''
   try {
-    const response = await apiRequest<PlayerPapiResponse>(`${playerPath(playerId)}/papi`)
+    const response = await apiRequest<RawPlayerPapiResponse>(`${playerPath(playerId)}/papi`)
     if (request !== papiRequest || serverId !== props.serverId || profile.value?.id !== playerId) return
-    papiAvailable.value = response.available
-    papiDetail.value = response.detail || (response.available ? 'PlaceholderAPI 已连接' : 'PlaceholderAPI 当前不可用')
-    playerPapiValues.value = Array.isArray(response.values) ? response.values : []
+    papiAvailable.value = normalizePapiAvailability(response.detected, response.runtime_available)
+    papiDetail.value = response.message || (papiAvailable.value ? 'PlaceholderAPI 已连接' : 'PlaceholderAPI 当前不可用')
+    playerPapiValues.value = Array.isArray(response.fields)
+      ? response.fields.map((field) => ({
+        field_id: field.id,
+        label: field.label,
+        placeholder: field.placeholder,
+        value: field.value ?? null,
+        status: normalizePapiStatus(field.status),
+      }))
+      : []
   } catch (error) {
     if (request === papiRequest && serverId === props.serverId) {
       playerPapiError.value = errorMessage(error)
@@ -435,7 +627,7 @@ async function saveProfile() {
   profileSaving.value = true
   profileError.value = ''
   try {
-    const response = await apiRequest<PlayerProfile>(playerPath(playerId), {
+    const response = await apiRequest<RawPlayerDetailResponse>(playerPath(playerId), {
       method: 'PUT',
       body: JSON.stringify({
         display_name: profileDraft.value.display_name.trim(),
@@ -444,9 +636,10 @@ async function saveProfile() {
         tags: profileDraft.value.tags.split(/[,，\n]/).map((tag) => tag.trim()).filter(Boolean),
       }),
     })
-    const updated = normalizeProfile(response)
+    const updated = normalizeProfile(normalizePlayerDetail(response.player, response.source?.world))
     if (profile.value?.id !== playerId) return
     profile.value = updated
+    playerSource.value = normalizeSource(response.source) || playerSource.value
     selectedPlayer.value = { ...selectedPlayer.value!, ...updated }
     players.value = players.value.map((player) => player.id === playerId ? { ...player, ...updated } : player)
     resetProfileDraft(updated)
@@ -475,15 +668,39 @@ function toInventoryGrid(inventory: Inventory | undefined, minimumSlots: number)
   return Array.from({ length }, (_, slot) => ({ slot, item: itemBySlot.get(slot) ?? null }))
 }
 
+function toEquipmentGrid(inventory: Inventory | undefined): GridCell[] {
+  const itemBySlot = new Map<number, Item>()
+  for (const entry of inventory?.slots ?? []) {
+    if ([100, 101, 102, 103, -106].includes(entry.slot) && entry.item) itemBySlot.set(entry.slot, entry.item)
+  }
+  return [103, 102, 101, 100, -106].map((slot) => ({ slot, item: itemBySlot.get(slot) ?? null }))
+}
+
+function equipmentLabel(slot: number) {
+  if (slot === 103) return '头盔'
+  if (slot === 102) return '胸甲'
+  if (slot === 101) return '护腿'
+  if (slot === 100) return '靴子'
+  return '副手'
+}
+
 function containerCells(item: Item): GridCell[] {
+  const maximumSlots = 72
   const contents = Array.isArray(item.contents) ? item.contents : []
   const itemBySlot = new Map<number, Item>()
   contents.forEach((entry, index) => {
     const slot = Number.isInteger(entry.slot) && (entry.slot as number) >= 0 ? entry.slot as number : index
-    if (slot < 54) itemBySlot.set(slot, entry)
+    if (slot < maximumSlots) itemBySlot.set(slot, entry)
   })
   const largestSlot = Math.max(8, ...itemBySlot.keys())
-  const length = Math.min(54, Math.max(9, Math.ceil((largestSlot + 1) / 9) * 9))
+  const declaredSize = Number.isInteger(item.container_size) && (item.container_size as number) > 0
+    ? item.container_size as number
+    : 0
+  const length = Math.min(maximumSlots, Math.max(
+    9,
+    Math.ceil(declaredSize / 9) * 9,
+    Math.ceil((largestSlot + 1) / 9) * 9,
+  ))
   return Array.from({ length }, (_, slot) => ({ slot, item: itemBySlot.get(slot) ?? null }))
 }
 
@@ -667,7 +884,7 @@ onUnmounted(() => {
         <div>
           <small>PLAYER DIRECTORY</small>
           <b>玩家列表</b>
-          <em class="source-status" :class="{available: !!playerSource}"><Database/>{{ playerSource?.label || '数据源尚未返回' }}</em>
+          <em class="source-status" :class="{available: playerSource?.available}"><Database/>{{ playerSource?.label || '数据源尚未返回' }}</em>
         </div>
         <div class="player-tools">
           <label class="player-search"><Search/><input v-model="query" placeholder="搜索名称、身份或 UUID"/></label>
@@ -769,8 +986,16 @@ onUnmounted(() => {
             </section>
 
             <section class="inventory-section">
-              <header><div><small>INVENTORY</small><b>背包</b><em>{{ inventoryCells.filter((cell) => cell.item).length }} / {{ inventoryCells.length }} 个格位有物品</em></div></header>
-              <div class="inventory-layout" :class="{'has-preview':!!activeContainerPreview}">
+              <header><div><small>INVENTORY</small><b>背包</b><em>{{ profile.snapshot_available ? `${inventoryCells.filter((cell) => cell.item).length} / ${inventoryCells.length} 个格位有物品` : '世界快照不可用' }}</em></div></header>
+              <div v-if="!profile.snapshot_available" class="inventory-unavailable"><Database/><span>当前仅有在线控制台记录，尚未保存到世界玩家数据。</span></div>
+              <template v-else>
+                <div class="equipment-strip" aria-label="装备栏与副手">
+                  <span class="equipment-caption">装备与副手</span>
+                  <button v-for="cell in equipmentCells" :key="cell.slot" class="equipment-cell" :class="[cell.item ? itemClass(cell.item) : 'empty', {active:activeContainerPreview === cell.item}]" :disabled="!cell.item" :title="cell.item ? itemTooltip(cell.item) : equipmentLabel(cell.slot)" @mouseenter="previewContainer(cell.item)" @focus="previewContainer(cell.item)" @click="toggleContainerPreview(cell.item)">
+                    <small>{{ equipmentLabel(cell.slot) }}</small><Box v-if="cell.item"/><i v-if="cell.item && cell.item.count > 1">{{ cell.item.count }}</i>
+                  </button>
+                </div>
+                <div class="inventory-layout" :class="{'has-preview':!!activeContainerPreview}">
                 <div class="inventory-grid" aria-label="背包物品格">
                   <button v-for="cell in inventoryCells" :key="cell.slot" class="inventory-slot" :class="[cell.item ? itemClass(cell.item) : 'empty', {active:activeContainerPreview === cell.item}]" :disabled="!cell.item" :title="cell.item ? itemTooltip(cell.item) : `格位 ${cell.slot + 1}`" @mouseenter="previewContainer(cell.item)" @mouseleave="clearContainerPreview(cell.item)" @focus="previewContainer(cell.item)" @blur="clearContainerPreview(cell.item)" @click="toggleContainerPreview(cell.item)">
                     <Box v-if="cell.item"/><span v-if="cell.item" class="item-name">{{ itemShortName(cell.item) }}</span><i v-if="cell.item && cell.item.count > 1">{{ cell.item.count }}</i>
@@ -783,12 +1008,14 @@ onUnmounted(() => {
                     <button v-for="cell in containerCells(activeContainerPreview)" :key="cell.slot" class="nested-slot" :class="cell.item ? itemClass(cell.item) : 'empty'" :disabled="!cell.item" :title="cell.item ? itemTooltip(cell.item) : `格位 ${cell.slot + 1}`" @mouseenter="previewContainer(cell.item)" @focus="previewContainer(cell.item)" @click="toggleContainerPreview(cell.item)"><Box v-if="cell.item"/><i v-if="cell.item && cell.item.count > 1">{{ cell.item.count }}</i></button>
                   </div>
                 </aside>
-              </div>
+                </div>
+              </template>
             </section>
 
             <section class="inventory-section">
-              <header><div><small>ENDER CHEST</small><b>末影箱</b><em>{{ enderChestCells.filter((cell) => cell.item).length }} / {{ enderChestCells.length }} 个格位有物品</em></div></header>
-              <div class="inventory-layout" :class="{'has-preview':!!activeContainerPreview}">
+              <header><div><small>ENDER CHEST</small><b>末影箱</b><em>{{ profile.snapshot_available ? `${enderChestCells.filter((cell) => cell.item).length} / ${enderChestCells.length} 个格位有物品` : '世界快照不可用' }}</em></div></header>
+              <div v-if="!profile.snapshot_available" class="inventory-unavailable"><Database/><span>当前仅有在线控制台记录，尚未保存到世界玩家数据。</span></div>
+              <div v-else class="inventory-layout" :class="{'has-preview':!!activeContainerPreview}">
                 <div class="inventory-grid ender-grid" aria-label="末影箱物品格">
                   <button v-for="cell in enderChestCells" :key="cell.slot" class="inventory-slot" :class="[cell.item ? itemClass(cell.item) : 'empty', {active:activeContainerPreview === cell.item}]" :disabled="!cell.item" :title="cell.item ? itemTooltip(cell.item) : `格位 ${cell.slot + 1}`" @mouseenter="previewContainer(cell.item)" @mouseleave="clearContainerPreview(cell.item)" @focus="previewContainer(cell.item)" @blur="clearContainerPreview(cell.item)" @click="toggleContainerPreview(cell.item)">
                     <Box v-if="cell.item"/><span v-if="cell.item" class="item-name">{{ itemShortName(cell.item) }}</span><i v-if="cell.item && cell.item.count > 1">{{ cell.item.count }}</i>
@@ -841,5 +1068,5 @@ onUnmounted(() => {
 
 <style scoped>
 .community-scroll{position:relative;flex:1;overflow:auto;padding:18px;color:#e8edf2}.community-hero,.player-management-card,.feedback-card,.poll-card,.poll-creator,.papi-status-card{border:1px solid rgba(255,255,255,.075);border-radius:8px;background:#11161c}.community-hero{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px;background:linear-gradient(120deg,rgba(156,140,255,.07),rgba(50,213,176,.035) 52%,#11161c)}.community-hero>div:first-child{display:flex;align-items:center;gap:12px}.community-hero>div:first-child>span{width:43px;height:43px;display:grid;place-items:center;border-radius:8px;color:#a89cff;background:rgba(156,140,255,.1)}.community-hero svg{width:20px}.community-hero p{display:flex;flex-direction:column;margin:0}.community-hero small,.player-management-card header small,.feedback-card header small,.poll-card header small,.poll-creator header small,.papi-status-card header small,.modal-header small,.profile-overview small,.inventory-section small,.papi-values-section small{color:#66727f;font-size:8px;text-transform:uppercase}.community-hero b{margin-top:4px;font-size:15px}.community-hero em{margin-top:5px;color:#6c7885;font:normal 8px Inter}.hero-actions{display:flex;align-items:center;gap:7px}.icon-button{width:30px;height:30px;display:grid;place-items:center;padding:0;border:1px solid rgba(255,255,255,.08);border-radius:6px;color:#85919d;background:#161d24}.icon-button:hover:not(:disabled){color:#dce4ea;border-color:rgba(50,213,176,.22);background:rgba(50,213,176,.07)}.icon-button:disabled{opacity:.45;cursor:not-allowed}.icon-button svg{width:14px}.papi-button,.save-button,.text-button,.row-action,.add-field,.papi-status-card footer button{height:31px;display:flex;align-items:center;justify-content:center;gap:6px;padding:0 10px;border:1px solid rgba(156,140,255,.22);border-radius:6px;color:#c0b7ff;background:rgba(156,140,255,.08);font-size:9px}.papi-button svg,.save-button svg,.row-action svg,.add-field svg,.papi-status-card footer button svg{width:13px}.player-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin-top:10px}.player-stats article{display:flex;align-items:center;gap:10px;padding:13px;border:1px solid rgba(255,255,255,.075);border-radius:8px;background:#12171d}.player-stats article>span{width:32px;height:32px;display:grid;place-items:center;flex:none;border-radius:7px}.player-stats svg{width:16px}.mint{color:#32d5b0;background:rgba(50,213,176,.09)}.green{color:#82d98d;background:rgba(83,190,100,.1)}.violet{color:#a99dff;background:rgba(156,140,255,.1)}.amber{color:#f3a75c;background:rgba(243,167,92,.09)}.player-stats p{display:flex;min-width:0;flex-direction:column;margin:0}.player-stats small{color:#697582;font-size:8px}.player-stats b{margin-top:2px;font-size:14px}.player-stats em{overflow:hidden;margin-top:2px;color:#56616e;font:normal 7px Inter;text-overflow:ellipsis;white-space:nowrap}.player-management-card{margin-top:10px;padding:15px}.player-card-header,.feedback-card>header,.poll-card>header,.poll-creator>header,.papi-status-card>header{display:flex;align-items:center;justify-content:space-between;gap:12px}.player-card-header>div:first-child,.feedback-card header>div,.poll-card header>div,.poll-creator header>div,.papi-status-card header>div{display:flex;min-width:0;flex-direction:column}.player-card-header b,.feedback-card header b,.poll-card header b,.poll-creator header b,.papi-status-card header b{margin-top:4px;font-size:12px}.source-status{display:flex;align-items:center;gap:4px;margin-top:5px;color:#d3a36e;font:normal 8px Inter}.source-status.available{color:#70ceb7}.source-status svg{width:11px}.player-tools{display:flex;align-items:center;gap:6px}.player-search{height:30px;display:flex;align-items:center;gap:6px;padding:0 9px;border:1px solid rgba(255,255,255,.08);border-radius:6px;color:#65717e;background:#0e1318}.player-search svg{width:13px}.player-search input{width:180px;min-width:0;border:0;outline:0;color:#d1d9e0;background:transparent;font-size:9px}.source-detail{margin:9px 0 0;color:#6d7985;font-size:8px;line-height:1.5}.inline-error{display:flex;align-items:flex-start;gap:7px;margin:10px 0 0;padding:9px;border-radius:6px;color:#ec989e;background:rgba(255,107,114,.065);font-size:8px;line-height:1.55}.inline-error svg{width:13px;flex:none}.player-table-wrap{min-width:0;margin-top:12px;overflow-x:auto}.player-table{min-width:720px}.table-head,.player-row{display:grid;grid-template-columns:minmax(180px,1.55fr) .75fr .55fr minmax(155px,1.25fr) minmax(114px,.95fr) 64px;align-items:center;gap:8px}.table-head{min-height:30px;padding:0 8px;color:#687480;font-size:7px;text-transform:uppercase}.table-head>span{padding-left:6px}.sort-button{height:26px;display:flex;align-items:center;gap:2px;padding:0 6px;border:0;border-radius:5px;color:inherit;background:transparent;font-size:7px;text-align:left;text-transform:uppercase}.sort-button:hover,.sort-button.active{color:#c9d2da;background:rgba(255,255,255,.045)}.sort-button svg{width:11px}.player-row{min-height:54px;padding:7px 8px;border-top:1px solid rgba(255,255,255,.055);color:#7c8794;font-size:8px}.player-row:hover{background:rgba(50,213,176,.025)}.player-identity{display:flex;align-items:center;min-width:0;gap:8px;padding:0;border:0;color:inherit;background:transparent;text-align:left}.player-identity i{width:28px;height:28px;display:grid;place-items:center;flex:none;border-radius:6px;color:#8ee2cf;background:rgba(50,213,176,.09);font:normal 10px Inter}.player-identity span{display:flex;min-width:0;flex-direction:column}.player-identity b{overflow:hidden;color:#c9d0d8;font-size:9px;text-overflow:ellipsis;white-space:nowrap}.player-identity small{overflow:hidden;margin-top:4px;color:#66727f;font-size:7px;text-overflow:ellipsis;white-space:nowrap}.player-status{width:max-content;padding:3px 6px;border-radius:5px;color:#697683;background:rgba(255,255,255,.05);font:normal 7px Inter}.player-status.online{color:#67d2b6;background:rgba(50,213,176,.08)}.player-status.banned{color:#ff9096;background:rgba(255,107,114,.08)}.level-value{color:#c7d0d8;font:600 10px Inter}.position-value{display:flex;align-items:center;min-width:0;gap:5px}.position-value svg{width:12px;color:#aa9eff}.position-value em{overflow:hidden;color:#8995a0;font:normal 8px Inter;text-overflow:ellipsis;white-space:nowrap}.player-row time{overflow:hidden;color:#65717d;font:7px Inter;text-overflow:ellipsis;white-space:nowrap}.row-action{height:27px;padding:0 7px;border-color:rgba(255,255,255,.08);color:#9ba7b3;background:#171d24;font-size:7px}.table-state{min-height:130px;display:flex;align-items:center;justify-content:center;gap:8px;color:#687480;font-size:9px}.table-state svg{width:18px}.content-grid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(250px,.82fr);gap:10px;margin-top:10px}.feedback-card,.poll-card,.poll-creator,.papi-status-card{padding:15px}.content-grid>aside{display:grid;align-content:start;gap:10px}.feedback-card header>button{display:flex;align-items:center;gap:4px;border:0;color:#a99dff;background:transparent;font-size:8px}.feedback-card header svg{width:13px}.feedback-card>article{display:flex;gap:8px;padding:9px 0;border-top:1px solid rgba(255,255,255,.055)}.feedback-card>article>span{width:6px;height:6px;flex:none;margin-top:3px;border-radius:50%;background:#818c98}.feedback-card>article>span.positive{background:#32d5b0}.feedback-card>article>span.negative{background:#ff747b}.feedback-card>article p{display:flex;flex-direction:column;margin:0}.feedback-card>article b{font-size:8px}.feedback-card>article small{margin-top:4px;color:#687480;font-size:7px;line-height:1.5}.community-empty{display:flex;align-items:center;justify-content:center;gap:7px;min-height:82px;color:#65717d;font-size:8px;text-align:center}.community-empty svg{width:15px}.cluster-result{padding:9px;margin-top:7px;border-radius:6px;color:#9bcfc3;background:rgba(50,213,176,.05);font-size:8px;line-height:1.5}.cluster-result span{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}.cluster-result i{padding:2px 4px;border-radius:4px;background:rgba(50,213,176,.07);font-style:normal}.poll-card>article{padding-top:10px;margin-top:10px;border-top:1px solid rgba(255,255,255,.055)}.poll-card>article>b{display:block;margin-bottom:8px;font-size:9px}.poll-card>article>button{width:100%;display:flex;justify-content:space-between;padding:7px 8px;margin-top:5px;border:1px solid rgba(255,255,255,.065);border-radius:6px;color:#87929f;background:#0e1318;font-size:7px;text-align:left}.poll-card>article>button:hover{border-color:rgba(156,140,255,.2)}.poll-card em{color:#a69bf4;font-style:normal}.papi-status-card{border-color:rgba(156,140,255,.14);background:rgba(156,140,255,.035)}.papi-status-card.available{border-color:rgba(50,213,176,.17);background:rgba(50,213,176,.035)}.papi-status-card>p{display:flex;align-items:flex-start;gap:6px;margin:12px 0 0;color:#77838f;font-size:8px;line-height:1.55}.papi-status-card>p i{width:6px;height:6px;flex:none;margin-top:3px;border-radius:50%;background:#d4a76e}.papi-status-card.available>p i{background:#32d5b0}.papi-status-card footer{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:12px}.papi-status-card footer>span{color:#66727f;font-size:7px}.papi-status-card footer button{height:26px;padding:0 7px;border-color:rgba(156,140,255,.18);font-size:7px}.poll-creator{margin-top:10px}.poll-creator>input,.option-inputs input{width:100%;height:31px;padding:0 9px;border:1px solid rgba(255,255,255,.08);border-radius:6px;outline:0;color:#cbd2da;background:#0e1318;font-size:8px}.option-inputs{display:grid;grid-template-columns:repeat(2,1fr);gap:7px;margin-top:7px}.poll-creator footer{display:flex;justify-content:flex-end;gap:6px;margin-top:9px}.poll-creator footer button{height:27px;display:flex;align-items:center;gap:4px;padding:0 8px;border:1px solid rgba(255,255,255,.08);border-radius:6px;color:#85909d;background:#171d24;font-size:7px}.poll-creator footer button.primary{border:0;color:#161121;background:#a89cff}.poll-creator footer svg{width:11px}.community-modal-backdrop{position:fixed;inset:0;z-index:70;display:grid;place-items:center;padding:20px;background:rgba(2,5,8,.72);backdrop-filter:blur(10px)}.player-modal,.papi-manager-modal{display:flex;flex-direction:column;width:min(1100px,calc(100vw - 40px));max-height:calc(100vh - 40px);overflow:hidden;border:1px solid rgba(255,255,255,.12);border-radius:8px;background:#12171d;box-shadow:0 30px 100px rgba(0,0,0,.55)}.papi-manager-modal{width:min(760px,calc(100vw - 40px))}.modal-header{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;padding:18px 20px;border-bottom:1px solid rgba(255,255,255,.07);background:#10151b}.modal-header h2{margin:5px 0 0;font-size:16px}.modal-header p{display:flex;gap:7px;margin:7px 0 0;color:#697582;font-size:8px}.modal-header p>span.available{color:#70ceb7}.profile-body{min-height:0;overflow:auto;padding:18px 20px 24px}.profile-state{min-height:240px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:9px;color:#6c7884;font-size:9px;text-align:center}.profile-state svg{width:24px}.profile-state.error{color:#e79a9e}.profile-state button{height:28px;display:flex;align-items:center;gap:5px;margin-top:4px;padding:0 9px;border:1px solid rgba(255,107,114,.2);border-radius:6px;color:#ef9da2;background:rgba(255,107,114,.06);font-size:8px}.profile-state button svg{width:12px}.profile-overview,.inventory-section,.papi-values-section{margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,.065)}.profile-overview{margin-top:0;padding-top:0;border-top:0}.profile-overview>header,.inventory-section>header,.papi-values-section>header{display:flex;align-items:center;justify-content:space-between;gap:10px}.profile-overview header>div:first-child,.inventory-section header>div,.papi-values-section header>div{display:flex;min-width:0;flex-direction:column}.profile-overview header b,.inventory-section header b,.papi-values-section header b{margin-top:4px;font-size:12px}.inventory-section header em,.papi-values-section header em{margin-top:4px;color:#697582;font:normal 8px Inter;text-transform:none}.papi-values-section header em.available{color:#70ceb7}.profile-actions,.papi-values-section>header>span{display:flex;align-items:center;gap:6px}.text-button{border-color:rgba(255,255,255,.08);color:#8995a1;background:#171d24}.save-button{border:0;color:#06251e;background:#32d5b0;font-weight:700}.save-button:disabled,.text-button:disabled{opacity:.5;cursor:not-allowed}.profile-facts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:12px}.profile-facts>p{display:flex;min-width:0;flex-direction:column;gap:5px;margin:0;padding:9px;border-radius:6px;background:#0e1318}.profile-facts small{color:#64717d;font-size:7px}.profile-facts b{overflow:hidden;color:#c7d0d8;font-size:9px;text-overflow:ellipsis;white-space:nowrap}.profile-facts p.wide{grid-column:span 2}.profile-facts p.wide b{display:flex;align-items:center;gap:5px;overflow:visible;white-space:normal}.profile-facts p.wide b svg{width:12px;color:#a99dff}.profile-facts .tags span{display:flex;flex-wrap:wrap;gap:4px}.profile-facts .tags i{padding:3px 5px;border-radius:4px;color:#9ce1cf;background:rgba(50,213,176,.08);font:normal 7px Inter}.profile-facts .note b{color:#99a6b2;font-weight:400;line-height:1.5}.profile-edit-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:12px}.profile-edit-form label{display:flex;flex-direction:column;gap:5px;color:#7c8995;font-size:8px}.profile-edit-form label.wide{grid-column:1/-1}.profile-edit-form input,.profile-edit-form textarea,.papi-field-list input{width:100%;border:1px solid rgba(255,255,255,.08);border-radius:6px;outline:0;color:#d6dde4;background:#0d1217;font-size:9px}.profile-edit-form input{height:32px;padding:0 9px}.profile-edit-form textarea{padding:8px 9px;resize:vertical;line-height:1.5}.profile-edit-form input:focus,.profile-edit-form textarea:focus,.papi-field-list input:focus{border-color:rgba(50,213,176,.34)}.inventory-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(210px,.38fr);gap:12px;margin-top:12px}.inventory-layout:has(.container-preview:only-child){grid-template-columns:1fr}.inventory-grid,.nested-grid{display:grid;grid-template-columns:repeat(9,minmax(0,1fr));gap:4px}.inventory-slot,.nested-slot{position:relative;aspect-ratio:1;min-width:0;display:flex;align-items:center;justify-content:center;padding:2px;border:1px solid rgba(255,255,255,.09);border-radius:4px;color:#93a1ad;background:#10161d}.inventory-slot:disabled,.nested-slot:disabled{cursor:default}.inventory-slot:not(:disabled):hover,.inventory-slot:not(:disabled):focus,.inventory-slot.active{border-color:rgba(50,213,176,.55);outline:0;background:rgba(50,213,176,.08)}.inventory-slot.shulker,.nested-slot.shulker{color:#bc8ee9;border-color:rgba(185,128,231,.35);background:rgba(185,128,231,.08)}.inventory-slot.bundle,.nested-slot.bundle{color:#ebbc7e;border-color:rgba(234,184,114,.34);background:rgba(234,184,114,.08)}.inventory-slot.container,.nested-slot.container{color:#82b4e9;border-color:rgba(109,164,225,.34);background:rgba(109,164,225,.08)}.inventory-slot svg,.nested-slot svg{width:15px}.inventory-slot .item-name{position:absolute;right:3px;bottom:2px;left:3px;overflow:hidden;color:#d4dce2;font:6px Inter;text-align:center;text-overflow:ellipsis;white-space:nowrap}.inventory-slot>i,.nested-slot>i{position:absolute;right:2px;bottom:1px;color:#fff;font:700 8px Inter;text-shadow:0 1px 2px #000}.container-preview{min-width:0;padding:11px;border:1px solid rgba(156,140,255,.2);border-radius:7px;background:#0d1217}.container-preview>header{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.container-preview header>div{display:flex;min-width:0;flex-direction:column}.container-preview small{color:#9f93e8;font-size:7px;text-transform:uppercase}.container-preview b{overflow:hidden;margin-top:4px;color:#d5d9e9;font-size:9px;text-overflow:ellipsis;white-space:nowrap}.container-preview>p{margin:8px 0;color:#697582;font-size:7px}.nested-slot svg{width:11px}.papi-state{display:flex;align-items:center;justify-content:center;gap:7px;min-height:70px;margin-top:10px;color:#6c7885;font-size:8px}.papi-state svg{width:15px}.papi-values{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:10px}.papi-values article{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:6px;padding:9px;border:1px solid rgba(50,213,176,.12);border-radius:6px;background:#0e1419}.papi-values article.unresolved{border-color:rgba(243,167,92,.18)}.papi-values article.unavailable{border-color:rgba(255,107,114,.16)}.papi-values p{display:flex;min-width:0;flex-direction:column;margin:0}.papi-values small{color:#82909c;font-size:7px;text-transform:none}.papi-values code{overflow:hidden;margin-top:3px;color:#7f73cc;font:7px 'Cascadia Code',monospace;text-overflow:ellipsis;white-space:nowrap}.papi-values b{overflow:hidden;color:#c7d9d5;font-size:9px;text-align:right;text-overflow:ellipsis;white-space:nowrap}.papi-values em{grid-column:2;color:#68cdb3;font:normal 7px Inter}.papi-values article.unresolved em{color:#e5aa70}.papi-values article.unavailable em{color:#e78f95}.manager-backdrop{z-index:80}.papi-manager-modal>main{min-height:0;overflow:auto;padding:18px 20px}.manager-hint{margin:0;color:#71808c;font-size:9px;line-height:1.6}.papi-field-list{display:grid;gap:7px;margin-top:14px}.papi-field-list article{display:grid;grid-template-columns:70px minmax(110px,.65fr) minmax(180px,1.3fr) 30px;align-items:end;gap:7px;padding:9px;border:1px solid rgba(255,255,255,.07);border-radius:6px;background:#0e1318}.papi-field-list label{display:flex;flex-direction:column;gap:4px;color:#75818d;font-size:7px}.papi-field-list label.field-enabled{height:31px;align-items:center;justify-content:flex-start;flex-direction:row;gap:5px;color:#8996a1}.papi-field-list input{height:31px;padding:0 8px}.papi-field-list .field-enabled input{width:auto;height:auto;accent-color:#32d5b0}.delete-field{height:31px;color:#e78c92}.add-field{height:30px;margin-top:10px;border-color:rgba(50,213,176,.18);color:#8fe2cd;background:rgba(50,213,176,.06)}.papi-manager-modal>footer{height:58px;display:flex;align-items:center;justify-content:flex-end;gap:7px;padding:0 20px;border-top:1px solid rgba(255,255,255,.07);background:#10151b}.spin{animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}@media(max-width:1050px){.player-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.content-grid{grid-template-columns:1fr}.content-grid>aside{grid-template-columns:repeat(2,minmax(0,1fr))}.inventory-layout{grid-template-columns:1fr}.container-preview{max-width:420px}.papi-values{grid-template-columns:1fr}}@media(max-width:700px){.community-scroll{padding:12px}.community-hero{align-items:flex-start;flex-direction:column}.hero-actions{width:100%;justify-content:flex-end}.player-card-header{align-items:flex-start;flex-direction:column}.player-tools{width:100%}.player-search{flex:1}.player-search input{width:100%}.content-grid>aside{grid-template-columns:1fr}.option-inputs,.profile-edit-form,.profile-facts{grid-template-columns:1fr}.profile-facts p.wide{grid-column:auto}.community-modal-backdrop{padding:8px}.player-modal,.papi-manager-modal{width:100%;max-height:calc(100vh - 16px)}.modal-header,.profile-body,.papi-manager-modal>main{padding-right:14px;padding-left:14px}.papi-field-list article{grid-template-columns:1fr 30px}.papi-field-list label.field-enabled{grid-column:1}.papi-field-list label:not(.field-enabled){grid-column:1}.papi-field-list .delete-field{grid-column:2;grid-row:1;align-self:center}.inventory-grid{gap:3px}.inventory-slot .item-name{display:none}}
-.inventory-layout{grid-template-columns:1fr}.inventory-layout.has-preview{grid-template-columns:minmax(0,1fr) minmax(210px,.38fr)}.modal-header-actions{display:flex;align-items:center;gap:6px}@media(max-width:1050px){.inventory-layout.has-preview{grid-template-columns:1fr}}
+.inventory-layout{grid-template-columns:1fr}.inventory-layout.has-preview{grid-template-columns:minmax(0,1fr) minmax(210px,.38fr)}.modal-header-actions{display:flex;align-items:center;gap:6px}.inventory-unavailable{display:flex;align-items:center;justify-content:center;gap:8px;min-height:82px;margin-top:12px;padding:12px;border:1px dashed rgba(255,255,255,.1);border-radius:6px;color:#71808c;background:#0e1318;font-size:8px;text-align:center}.inventory-unavailable svg{width:16px;color:#d4a76e}.equipment-strip{display:flex;align-items:center;gap:6px;margin-top:12px;padding:8px 9px;border:1px solid rgba(255,255,255,.065);border-radius:6px;background:#0e1318}.equipment-caption{margin-right:3px;color:#697582;font-size:8px;white-space:nowrap}.equipment-cell{position:relative;width:48px;height:48px;display:flex;align-items:center;justify-content:center;flex:none;padding:11px 2px 2px;border:1px solid rgba(255,255,255,.09);border-radius:4px;color:#93a1ad;background:#10161d}.equipment-cell small{position:absolute;top:3px;right:2px;left:2px;overflow:hidden;color:#687480;font-size:6px;line-height:1;text-align:center;text-overflow:ellipsis;white-space:nowrap}.equipment-cell svg{width:15px}.equipment-cell>i{position:absolute;right:2px;bottom:1px;color:#fff;font:700 8px Inter;text-shadow:0 1px 2px #000}.equipment-cell:not(:disabled):hover,.equipment-cell:not(:disabled):focus,.equipment-cell.active{border-color:rgba(50,213,176,.55);outline:0;background:rgba(50,213,176,.08)}.equipment-cell.shulker{color:#bc8ee9;border-color:rgba(185,128,231,.35);background:rgba(185,128,231,.08)}.equipment-cell.bundle{color:#ebbc7e;border-color:rgba(234,184,114,.34);background:rgba(234,184,114,.08)}.equipment-cell.container{color:#82b4e9;border-color:rgba(109,164,225,.34);background:rgba(109,164,225,.08)}@media(max-width:1050px){.inventory-layout.has-preview{grid-template-columns:1fr}}@media(max-width:700px){.equipment-strip{overflow-x:auto;align-items:stretch}.equipment-caption{align-self:center}.equipment-cell{width:46px;height:46px}}
 </style>

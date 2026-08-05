@@ -17,6 +17,7 @@ use tokio::fs;
 /// directory or an accidentally mounted filesystem.
 pub(crate) const MAX_INSPECTED_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 20_000;
+const MAX_SCRIPT_MEMORY_SCAN_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct JarCandidate {
@@ -48,8 +49,16 @@ pub(crate) struct ExistingServerInspection {
     pub(crate) max_players: Option<u32>,
     /// `None` means the file is absent or did not contain a valid `eula` key.
     pub(crate) eula_accepted: Option<bool>,
+    /// Whether an EULA file was found, including files with invalid contents.
+    /// This lets `kind=auto` still recognize a partially initialized server.
+    pub(crate) eula_present: bool,
     pub(crate) jar_candidates: Vec<JarCandidate>,
     pub(crate) launch_scripts: Vec<LaunchScriptCandidate>,
+    /// An unambiguous heap-size hint read from the candidate launch scripts.
+    /// The value is expressed in whole GB and is always constrained to the
+    /// same 2-64 GB range used by the server manager.
+    #[serde(default)]
+    pub(crate) memory_gb_hint: Option<u8>,
     /// Set only when selection is unambiguous (or a root `server.jar` exists).
     pub(crate) recommended_jar: Option<String>,
     pub(crate) core_hint: Option<String>,
@@ -126,6 +135,7 @@ pub(crate) async fn inspect_existing_directory(
 
     let server_port = parse_port(properties.get("server-port"), &mut warnings);
     let max_players = parse_max_players(properties.get("max-players"), &mut warnings);
+    let eula_present = eula_bytes.is_some();
     let eula_accepted = match eula_bytes {
         Some(bytes) => match parse_eula(&bytes) {
             Ok(value) => value,
@@ -144,6 +154,7 @@ pub(crate) async fn inspect_existing_directory(
     }
 
     let (jar_candidates, launch_scripts) = scan_launch_artifacts(&canonical, &mut warnings).await?;
+    let memory_gb_hint = infer_memory_gb_hint(&canonical, &launch_scripts, &mut warnings).await;
     let recommended_jar = recommend_jar(&jar_candidates);
     if jar_candidates.is_empty() {
         warnings.push("未找到根目录 JAR 核心文件；不会自动执行启动脚本".into());
@@ -153,7 +164,7 @@ pub(crate) async fn inspect_existing_directory(
 
     let (core_hint, minecraft_version_hint) = recommended_jar
         .as_deref()
-        .and_then(|jar| infer_jar_hints(jar))
+        .and_then(infer_jar_hints)
         .unwrap_or((None, None));
     if !launch_scripts.is_empty() {
         warnings.push("检测到启动脚本；出于安全原因仅报告脚本，不会自动执行".into());
@@ -165,13 +176,124 @@ pub(crate) async fn inspect_existing_directory(
         server_port,
         max_players,
         eula_accepted,
+        eula_present,
         jar_candidates,
         launch_scripts,
+        memory_gb_hint,
         recommended_jar,
         core_hint,
         minecraft_version_hint,
         warnings,
     })
+}
+
+/// Read candidate launch scripts without executing them and derive a heap-size
+/// hint only when every script that declares `-Xmx` agrees.  A script may be
+/// replaced between directory enumeration and this read; `read_optional_file`
+/// repeats the regular-file and size checks so a replaced symlink is ignored.
+async fn infer_memory_gb_hint(
+    directory: &Path,
+    scripts: &[LaunchScriptCandidate],
+    warnings: &mut Vec<String>,
+) -> Option<u8> {
+    let mut hints = BTreeMap::<u8, Vec<String>>::new();
+    let mut inspected_bytes = 0u64;
+    for script in scripts {
+        let remaining = MAX_SCRIPT_MEMORY_SCAN_BYTES.saturating_sub(inspected_bytes);
+        if script.size > remaining {
+            warnings.push(format!(
+                "启动脚本内存检测达到 {} MiB 上限，后续脚本未读取",
+                MAX_SCRIPT_MEMORY_SCAN_BYTES / (1024 * 1024)
+            ));
+            break;
+        }
+        let path = directory.join(&script.path);
+        let bytes = match read_optional_file(&path).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => continue,
+            Err(error) => {
+                warnings.push(format!("启动脚本 {} 未读取：{error}", script.path));
+                continue;
+            }
+        };
+        let bytes_len = bytes.len() as u64;
+        if bytes_len > remaining {
+            warnings.push(format!(
+                "启动脚本内存检测达到 {} MiB 上限，后续脚本未读取",
+                MAX_SCRIPT_MEMORY_SCAN_BYTES / (1024 * 1024)
+            ));
+            break;
+        }
+        inspected_bytes += bytes_len;
+        if let Some(hint) = parse_memory_gb_hint(&bytes) {
+            hints.entry(hint).or_default().push(script.path.clone());
+        }
+    }
+
+    if hints.len() == 1 {
+        return hints.keys().next().copied();
+    }
+    if hints.len() > 1 {
+        let values = hints
+            .keys()
+            .map(|value| format!("{value} GB"))
+            .collect::<Vec<_>>()
+            .join("、");
+        warnings.push(format!(
+            "启动脚本检测到互相冲突的 -Xmx 内存值（{values}），已不自动采用"
+        ));
+    }
+    None
+}
+
+/// Parse the last `-XmxN[G|M]` option in a script.  JVM options are ASCII, so
+/// the scanner intentionally accepts only decimal integers and a G/M suffix;
+/// decimal values, K/T suffixes and values outside 2-64 GB are ignored.  A
+/// final invalid option therefore cannot accidentally fall back to an older
+/// value in the same script.
+fn parse_memory_gb_hint(bytes: &[u8]) -> Option<u8> {
+    let text = String::from_utf8_lossy(bytes);
+    let lower = text.as_bytes();
+    let marker = b"-xmx";
+    let mut cursor = 0usize;
+    let mut last_value = None;
+    while cursor + marker.len() <= lower.len() {
+        let Some(relative) = lower[cursor..]
+            .windows(marker.len())
+            .position(|window| window.eq_ignore_ascii_case(marker))
+        else {
+            break;
+        };
+        let start = cursor + relative;
+        let value_start = start + marker.len();
+        let mut value_end = value_start;
+        while value_end < lower.len() && lower[value_end].is_ascii_digit() {
+            value_end += 1;
+        }
+        if value_end == value_start || value_end >= lower.len() {
+            last_value = Some(None);
+            cursor = value_start;
+            continue;
+        }
+        let unit = lower[value_end].to_ascii_lowercase();
+        let boundary = lower.get(value_end + 1).copied();
+        let valid_boundary = boundary.is_none_or(|value| !value.is_ascii_alphanumeric());
+        let amount = std::str::from_utf8(&lower[value_start..value_end])
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok());
+        let converted = if valid_boundary {
+            match (amount, unit) {
+                (Some(amount), b'g') => u8::try_from(amount).ok(),
+                (Some(amount), b'm') if amount % 1024 == 0 => u8::try_from(amount / 1024).ok(),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        last_value = Some(converted.filter(|value| (2..=64).contains(value)));
+        cursor = value_end + 1;
+    }
+    last_value.flatten()
 }
 
 /// Parse Minecraft's root `server.properties` file.  The parser intentionally
@@ -229,7 +351,7 @@ pub(crate) fn parse_eula(bytes: &[u8]) -> Result<Option<bool>, String> {
 }
 
 fn parse_port(value: Option<&String>, warnings: &mut Vec<String>) -> Option<u16> {
-    let Some(value) = value else { return None };
+    let value = value?;
     match value.parse::<u16>() {
         Ok(port) if port >= 1024 => Some(port),
         Ok(_) => {
@@ -244,7 +366,7 @@ fn parse_port(value: Option<&String>, warnings: &mut Vec<String>) -> Option<u16>
 }
 
 fn parse_max_players(value: Option<&String>, warnings: &mut Vec<String>) -> Option<u32> {
-    let Some(value) = value else { return None };
+    let value = value?;
     match value.parse::<u32>() {
         Ok(players) if players > 0 => Some(players),
         Ok(_) => {
@@ -310,7 +432,7 @@ async fn scan_launch_artifacts(
         let metadata = entry
             .metadata()
             .await
-            .map_err(|error| format!("无法读取 {} 元数据：{error}", name))?;
+            .map_err(|error| format!("无法读取 {name} 元数据：{error}"))?;
         let modified = metadata
             .modified()
             .ok()
@@ -503,6 +625,47 @@ mod tests {
         assert_eq!(parse_eula(b"# no value\n").unwrap(), None);
     }
 
+    #[test]
+    fn memory_hint_accepts_whole_gb_and_mb_values_in_the_safe_range() {
+        assert_eq!(
+            parse_memory_gb_hint(b"java -Xmx2G -jar server.jar"),
+            Some(2)
+        );
+        assert_eq!(
+            parse_memory_gb_hint(b"java -Xmx8192M -jar server.jar"),
+            Some(8)
+        );
+        assert_eq!(
+            parse_memory_gb_hint(b"java -XMX65536m -jar server.jar"),
+            Some(64)
+        );
+        assert_eq!(parse_memory_gb_hint(b"java -Xmx1G -jar server.jar"), None);
+        assert_eq!(
+            parse_memory_gb_hint(b"java -Xmx65537M -jar server.jar"),
+            None
+        );
+        assert_eq!(
+            parse_memory_gb_hint(b"java -Xmx1536M -jar server.jar"),
+            None
+        );
+        assert_eq!(parse_memory_gb_hint(b"java -Xmx4T -jar server.jar"), None);
+    }
+
+    #[test]
+    fn memory_hint_uses_the_last_xmx_option_and_rejects_embedded_tokens() {
+        assert_eq!(
+            parse_memory_gb_hint(b"java -Xmx4G -Xmx12G -jar server.jar"),
+            Some(12)
+        );
+        assert_eq!(parse_memory_gb_hint(b"java -Xmx8GB -jar server.jar"), None);
+        assert_eq!(
+            parse_memory_gb_hint(b"java -Xmx8Gfoo -jar server.jar"),
+            None
+        );
+        assert_eq!(parse_memory_gb_hint(b"java -Xmx8G -Xmx"), None);
+        assert_eq!(parse_memory_gb_hint(b"echo -Xmx8Gbytes"), None);
+    }
+
     #[tokio::test]
     async fn inspection_detects_artifacts_and_derives_unambiguous_hints() {
         let root = temp_directory("sculk-import");
@@ -519,26 +682,57 @@ mod tests {
         fs::write(root.join("paper-1.21.4-120.jar"), b"jar")
             .await
             .unwrap();
-        fs::write(root.join("run.bat"), b"java -jar paper-1.21.4-120.jar")
-            .await
-            .unwrap();
+        fs::write(
+            root.join("run.bat"),
+            b"@echo off\r\njava -Xmx4096M -jar paper-1.21.4-120.jar\r\n",
+        )
+        .await
+        .unwrap();
 
         let result = inspect_existing_directory(&root).await.unwrap();
         assert_eq!(result.server_port, Some(25566));
         assert_eq!(result.max_players, Some(12));
         assert_eq!(result.eula_accepted, Some(true));
+        assert!(result.eula_present);
         assert_eq!(
             result.recommended_jar.as_deref(),
             Some("paper-1.21.4-120.jar")
         );
         assert_eq!(result.core_hint.as_deref(), Some("Paper"));
         assert_eq!(result.minecraft_version_hint.as_deref(), Some("1.21.4"));
+        assert_eq!(result.memory_gb_hint, Some(4));
         assert_eq!(result.launch_scripts[0].kind, "bat");
         assert!(
             result
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("启动脚本"))
+        );
+
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inspection_ignores_conflicting_script_memory_hints() {
+        let root = temp_directory("sculk-import-memory-conflict");
+        fs::create_dir_all(&root).await.unwrap();
+        fs::write(root.join("run.bat"), b"java -Xmx4G -jar server.jar")
+            .await
+            .unwrap();
+        fs::write(
+            root.join("start.sh"),
+            b"#!/bin/sh\nexec java -Xmx8G -jar server.jar",
+        )
+        .await
+        .unwrap();
+
+        let result = inspect_existing_directory(&root).await.unwrap();
+        assert_eq!(result.memory_gb_hint, None);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("冲突") && warning.contains("-Xmx"))
         );
 
         fs::remove_dir_all(root).await.unwrap();

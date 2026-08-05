@@ -283,7 +283,7 @@ fn task_result_text(task: &crate::TaskInfo) -> String {
                 .as_deref()
                 .unwrap_or("请打开任务详情检查执行事件。")
         ),
-        _ => return String::new(),
+        _ => String::new(),
     }
 }
 
@@ -336,9 +336,9 @@ pub(crate) fn reconcile_task_results(data: &mut PersistedState) -> bool {
         })
         .cloned()
         .collect::<Vec<_>>();
-    terminal_tasks.iter().fold(false, |changed, task| {
-        sync_task_result(data, task) || changed
-    })
+    terminal_tasks
+        .iter()
+        .any(|task| sync_task_result(data, task))
 }
 
 fn forked(original: &Conversation) -> Conversation {

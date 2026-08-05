@@ -31,6 +31,7 @@ const MAX_NESTED_ITEMS: usize = 64;
 const MAX_CONTAINER_DEPTH: usize = 4;
 const MAX_PAPI_FIELDS: usize = 10;
 const MAX_PAPI_PLACEHOLDER_BYTES: usize = 128;
+const MAX_AUXILIARY_FILE_BYTES: usize = 2 * 1024 * 1024;
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
 
@@ -514,12 +515,11 @@ async fn collect_player_records(
                     let online = online_names
                         .iter()
                         .any(|candidate| candidate.eq_ignore_ascii_case(&name));
+                    if let Some(error) = player.error {
+                        warnings.push(format!("无法读取玩家数据 {uuid}：{error}"));
+                    }
                     if online {
                         known_online_names.insert(name.to_ascii_lowercase());
-                    }
-                    if let Some(error) = player.error {
-                        warnings.push(format!("无法读取玩家数据 {}：{error}", uuid));
-                        continue;
                     }
                     records.push(PlayerRecord {
                         key: uuid.to_string(),
@@ -591,10 +591,40 @@ async fn player_data_source(root: &StdPath) -> (Option<PathBuf>, PlayerDataSourc
     )
 }
 
+async fn read_workspace_file(
+    root: &StdPath,
+    relative: &StdPath,
+    maximum_bytes: usize,
+) -> Option<Vec<u8>> {
+    let root = root.to_owned();
+    let relative = relative.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let workspace = CapDir::open_ambient_dir(root, ambient_authority()).ok()?;
+        super::reject_workspace_symlink(&workspace, &relative).ok()?;
+        let metadata = workspace.symlink_metadata(&relative).ok()?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return None;
+        }
+        let file = workspace.open(&relative).ok()?;
+        let mut bytes = Vec::new();
+        file.take((maximum_bytes as u64).saturating_add(1))
+            .read_to_end(&mut bytes)
+            .ok()?;
+        (bytes.len() <= maximum_bytes).then_some(bytes)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 async fn configured_world_name(root: &StdPath) -> Option<String> {
-    let properties = fs::read_to_string(root.join("server.properties"))
-        .await
-        .ok();
+    let properties = read_workspace_file(
+        root,
+        StdPath::new("server.properties"),
+        MAX_AUXILIARY_FILE_BYTES,
+    )
+    .await
+    .and_then(|bytes| String::from_utf8(bytes).ok());
     properties
         .as_deref()
         .and_then(|content| {
@@ -755,7 +785,11 @@ async fn load_player_names(root: &StdPath) -> HashMap<Uuid, String> {
         "ops.json",
         "banned-players.json",
     ] {
-        let Ok(content) = fs::read_to_string(root.join(filename)).await else {
+        let Some(content) =
+            read_workspace_file(root, StdPath::new(filename), MAX_AUXILIARY_FILE_BYTES)
+                .await
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+        else {
             continue;
         };
         let Ok(entries) = serde_json::from_str::<Vec<JsonValue>>(&content) else {
@@ -788,9 +822,20 @@ async fn load_player_names(root: &StdPath) -> HashMap<Uuid, String> {
 
 async fn online_player_names(state: &AppState, server_id: &str) -> Vec<String> {
     let telemetry = state.telemetry.read().await;
-    telemetry
-        .get(server_id)
-        .and_then(|record| record.value.player_names.clone())
+    let Some(record) = telemetry.get(server_id) else {
+        return Vec::new();
+    };
+    if record.value.availability != "available"
+        || record
+            .player_list_observed_at
+            .is_none_or(|observed_at| observed_at.elapsed() >= super::TELEMETRY_STALE_AFTER)
+    {
+        return Vec::new();
+    }
+    record
+        .value
+        .player_names
+        .clone()
         .unwrap_or_default()
         .into_iter()
         .filter(|name| is_valid_player_name(name))
@@ -1362,22 +1407,33 @@ fn is_valid_player_name(value: &str) -> bool {
 }
 
 async fn placeholder_api_detected(root: &StdPath) -> bool {
-    let Ok(mut entries) = fs::read_dir(root.join("plugins")).await else {
-        return false;
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let Ok(metadata) = fs::symlink_metadata(entry.path()).await else {
-            continue;
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            continue;
+    let root = root.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let workspace = CapDir::open_ambient_dir(root, ambient_authority()).ok()?;
+        let plugins = StdPath::new("plugins");
+        super::reject_workspace_symlink(&workspace, plugins).ok()?;
+        let metadata = workspace.metadata(plugins).ok()?;
+        if !metadata.is_dir() {
+            return None;
         }
-        let filename = entry.file_name().to_string_lossy().to_ascii_lowercase();
-        if filename.ends_with(".jar") && filename.contains("placeholderapi") {
-            return true;
+        let entries = workspace.read_dir(plugins).ok()?;
+        for entry in entries {
+            let entry = entry.ok()?;
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_symlink() || !file_type.is_file() {
+                continue;
+            }
+            let filename = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if filename.ends_with(".jar") && filename.contains("placeholderapi") {
+                return Some(true);
+            }
         }
-    }
-    false
+        Some(false)
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
 }
 
 fn papi_status_message(detected: bool, runtime_available: bool, server: &ServerInfo) -> String {

@@ -574,10 +574,10 @@ async fn settle_provision_server(
         .iter()
         .find(|server| server.id == server_id)
         .map(crate::workspace_directory_for_server);
-    if error == Some(PROVISION_CANCELLED) {
-        if let Some(root) = workspace_root.as_ref() {
-            let _ = fs::remove_file(root.join("server.jar.part")).await;
-        }
+    if error == Some(PROVISION_CANCELLED)
+        && let Some(root) = workspace_root.as_ref()
+    {
+        let _ = fs::remove_file(root.join("server.jar.part")).await;
     }
     let core_ready = if let Some(root) = workspace_root.as_ref() {
         fs::metadata(root.join("server.jar"))

@@ -1232,6 +1232,7 @@ fn agent_efforts(kind: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+#[cfg(test)]
 fn workspace_directory(workspace_id: &str, kind: &str) -> PathBuf {
     if kind == "project" {
         crate::runtime::project_directory(workspace_id)
@@ -2202,8 +2203,7 @@ async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::
                         format!("已绑定 {core} {version}，自动分配 {memory_gb} GB，准备初始化");
                     server.last_error = None;
                     let config = format!(
-                        "# {}\nserver-port={}\nmax-players={}\nview-distance=10\nsimulation-distance=8\nonline-mode=true\ndifficulty=normal\npvp=true\nmotd=§3{} §8| §fPowered by Sculk Catalyst",
-                        server_name, port, max_players, server_name
+                        "# {server_name}\nserver-port={port}\nmax-players={max_players}\nview-distance=10\nsimulation-distance=8\nonline-mode=true\ndifficulty=normal\npvp=true\nmotd=§3{server_name} §8| §fPowered by Sculk Catalyst"
                     );
                     data.configs.insert(server_id.clone(), config);
                     data.logs.entry(server_id).or_default();
@@ -2754,7 +2754,7 @@ async fn read_cli_output<R: AsyncRead + Unpin>(
                 ));
             }
             Ok(Err(error)) => return CliOutputRead::Failed(error.to_string()),
-            Ok(Ok(bytes)) if bytes.is_empty() => (0, redactor.finish(), true),
+            Ok(Ok([])) => (0, redactor.finish(), true),
             Ok(Ok(bytes)) => {
                 if !output_budget.try_consume(bytes.len()) {
                     return CliOutputRead::OutputLimit;

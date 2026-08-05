@@ -191,6 +191,10 @@ POST /api/servers 负责创建项目和工作区，并返回随后立即执行�
 
 初始化中后端退出时，同一任务会在下次启动时回到队列。已经原子安装完成的 server.jar 会直接复用；未完成的 `.part` 不作为可信核心，传输会从头开始。
 
+#### 打开已有目录
+
+控制中心的“打开已有目录”可直接接管本机已有的服务器或通用项目目录。请求 `POST /api/servers/import`（兼容别名 `POST /api/workspaces/open`）时传入本机绝对路径和工作区类型。服务器目录接入时只读扫描根目录的 `server.properties`、`eula.txt`、核心 JAR 和启动脚本，并自动读取端口、最大玩家数、核心/版本提示以及脚本中的一致 `-Xmx` 内存值；不会执行脚本或写入 `sculk.yml`。启动前会重新读取配置并要求 `eula=true`，外部目录只允许从列表移除，不会被工作台删除磁盘文件。
+
 #### 智能规划创建
 
 POST /api/servers/plan 创建一个 planning 状态项目和“开服规划”对话，但不创建服务器目录和文件。规划对话会询问目标玩法、玩家数量和版本偏好，再由后续方案决定核心和部署参数。
@@ -668,14 +672,21 @@ Rust 后端支持两种目录写接口凭证：浏览器管理页使用 `SCULK_C
 
 ### 11.1 玩家管理
 
-社区页面展示玩家名称、在线状态、角色、余额、游戏时长、延迟和加入时间，并支持搜索。
+社区页面按服务器显示真实玩家快照，支持按游戏名、UUID、显示名、身份、标签或备注搜索，并可按玩家、在线状态、等级和更新时间排序。
 
-POST /api/players/{id}/action 支持 kick、ban 和 warn 三类操作。请求包含 execute：
+- 玩家快照从 `world/playerdata/*.dat` 的压缩 NBT 中读取，展示等级、维度、坐标、背包、装备栏、副手和末影箱。
+- 潜影盒和收纳袋可展开查看已读取的内部物品；物品名称、数量和 Lore 可在格位中查看。
+- 可维护展示名称、身份、标签和管理备注，这些资料持久化在 Sculk 的管理状态中，不会直接改写在线玩家的游戏 NBT。
+- 可配置最多 10 个 PlaceholderAPI 变量字段；服务器运行且检测到 PlaceholderAPI 后，可按玩家即时解析并显示变量值。
 
-- execute=false：仅返回操作预览和原因。
-- execute=true：更新本地玩家状态；kick 变为 offline，ban 变为 banned，warn 只记录响应。
+接口：
 
-当前未接入游戏内管理、RCON、插件消息或真实玩家数据库，因此玩家数据不能代表线上服实时状态。
+- `GET /api/servers/{server_id}/players?query=&sort=&order=`
+- `GET`、`PUT /api/servers/{server_id}/players/{player_key}`
+- `GET`、`PUT /api/servers/{server_id}/papi/fields`
+- `GET /api/servers/{server_id}/players/{player_key}/papi`
+
+世界玩家数据是保存快照，在线状态和背包可能存在保存延迟。若玩家仅由受管控制台识别、尚未写入世界数据，界面会明确标记快照不可用。PlaceholderAPI 的 JAR 检测不等同于插件成功启用，查询失败会返回可见状态而不会伪造变量值。
 
 ### 11.2 经济运营
 

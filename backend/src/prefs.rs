@@ -549,8 +549,10 @@ mod tests {
 
     #[test]
     fn menu_typography_rejects_unknown_font_and_invalid_color() {
-        let mut appearance = AppearanceSettings::default();
-        appearance.menu_font_family = "unknown".into();
+        let mut appearance = AppearanceSettings {
+            menu_font_family: "unknown".into(),
+            ..AppearanceSettings::default()
+        };
         assert!(validate_appearance(&appearance).is_err());
 
         appearance.menu_font_family = "mono".into();

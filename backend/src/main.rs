@@ -97,6 +97,7 @@ struct ServerTelemetry {
 struct TelemetryRecord {
     generation: Uuid,
     observed_at: Instant,
+    player_list_observed_at: Option<Instant>,
     value: ServerTelemetry,
 }
 
@@ -192,7 +193,7 @@ fn default_lifecycle_phase() -> String {
     "create".into()
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ServiceSettings {
     #[serde(default)]
     pub(crate) social: SocialServiceSettings,
@@ -227,18 +228,6 @@ pub(crate) struct SocialServiceSettings {
 #[derive(Deserialize)]
 struct UpdateServerLifecycleRequest {
     phase: String,
-}
-
-impl Default for ServiceSettings {
-    fn default() -> Self {
-        Self {
-            social: SocialServiceSettings::default(),
-            economy: false,
-            player_support: false,
-            game_operations: false,
-            content_improvement: false,
-        }
-    }
 }
 
 impl Default for SocialServiceSettings {
@@ -981,6 +970,7 @@ struct DetectedWorkspace {
     version: String,
     port: u16,
     memory_gb: u8,
+    memory_gb_hint: Option<u8>,
     max_players: u32,
     core_ready: bool,
     eula_accepted: bool,
@@ -1470,125 +1460,6 @@ fn launch_jar_name(server: &ServerInfo) -> Result<String, String> {
     Ok(name.to_string())
 }
 
-pub(crate) fn workspace_directory_for_id(data: &PersistedState, id: &str) -> Option<PathBuf> {
-    data.servers
-        .iter()
-        .find(|server| server.id == id)
-        .map(workspace_directory_for_server)
-}
-
-fn import_name_from_properties(properties: &HashMap<String, String>, root: &StdPath) -> String {
-    let motd = properties
-        .get("motd")
-        .map(|value| value.trim().trim_matches('"').trim())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_default();
-    let motd = motd
-        .chars()
-        .filter(|character| !character.is_control())
-        .collect::<String>();
-    if !motd.is_empty() {
-        return motd.chars().take(64).collect();
-    }
-    root.file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or("已有工作区")
-        .chars()
-        .take(64)
-        .collect()
-}
-
-fn parse_properties(content: &str) -> HashMap<String, String> {
-    content
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim_start_matches('\u{feff}').trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
-                return None;
-            }
-            let (key, value) = line.split_once('=')?;
-            let key = key.trim();
-            if key.is_empty() {
-                return None;
-            }
-            Some((key.to_string(), value.trim().to_string()))
-        })
-        .collect()
-}
-
-fn parse_u16_property(properties: &HashMap<String, String>, key: &str) -> Option<u16> {
-    properties.get(key)?.trim().parse().ok()
-}
-
-fn parse_memory_from_text(text: &str) -> Option<u8> {
-    let lower = text.to_ascii_lowercase();
-    let marker = "-xmx";
-    let start = lower.find(marker)? + marker.len();
-    let digits: String = lower[start..]
-        .chars()
-        .take_while(|character| character.is_ascii_digit())
-        .collect();
-    if digits.is_empty() {
-        return None;
-    }
-    let amount: u32 = digits.parse().ok()?;
-    let suffix = lower[start + digits.len()..].chars().next();
-    let gb = match suffix {
-        Some('g') => amount,
-        Some('m') => amount / 1024,
-        _ => return None,
-    };
-    u8::try_from(gb)
-        .ok()
-        .filter(|value| (MIN_MEMORY_GB..=MAX_MEMORY_GB).contains(value))
-}
-
-fn detect_core_version(
-    jar: Option<&str>,
-    properties: &HashMap<String, String>,
-) -> (String, String) {
-    let lower = jar.unwrap_or_default().to_ascii_lowercase();
-    let core = if lower.contains("purpur") {
-        "Purpur"
-    } else if lower.contains("paper") {
-        "Paper"
-    } else if lower.contains("folia") {
-        "Folia"
-    } else if lower.contains("leaves") {
-        "Leaves"
-    } else if lower.contains("spigot") {
-        "Spigot"
-    } else if lower.contains("fabric") {
-        "Fabric"
-    } else if lower.contains("neoforge") {
-        "NeoForge"
-    } else if lower.contains("forge") {
-        "Forge"
-    } else if lower.contains("velocity") {
-        "Velocity"
-    } else if lower.contains("bukkit") {
-        "Bukkit"
-    } else if jar.is_some() {
-        "Vanilla"
-    } else {
-        ""
-    };
-    let version = properties
-        .get("minecraft-version")
-        .or_else(|| properties.get("version"))
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            lower
-                .split(|character: char| !character.is_ascii_digit() && character != '.')
-                .find(|token| token.matches('.').count() >= 1 && token.len() >= 3)
-                .map(ToString::to_string)
-        })
-        .unwrap_or_default();
-    (core.into(), version)
-}
-
 async fn read_bounded_text(path: &StdPath, limit: usize) -> Option<String> {
     let metadata = fs::symlink_metadata(path).await.ok()?;
     if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > limit as u64 {
@@ -1596,168 +1467,6 @@ async fn read_bounded_text(path: &StdPath, limit: usize) -> Option<String> {
     }
     let bytes = fs::read(path).await.ok()?;
     Some(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-async fn inspect_existing_workspace(
-    root: &StdPath,
-    requested_kind: &str,
-    requested_name: Option<&str>,
-    requested_memory: Option<u8>,
-    requested_port: Option<u16>,
-) -> Result<(DetectedWorkspace, Vec<String>, Vec<String>), (StatusCode, String)> {
-    let mut files = Vec::new();
-    let mut jars = Vec::new();
-    let mut scripts = Vec::new();
-    let mut entries = fs::read_dir(root)
-        .await
-        .map_err(|error| (StatusCode::FORBIDDEN, format!("无法读取目录内容：{error}")))?;
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|error| (StatusCode::FORBIDDEN, format!("读取目录内容失败：{error}")))?
-    {
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)
-            .await
-            .map_err(|error| (StatusCode::FORBIDDEN, format!("无法读取目录项：{error}")))?;
-        if metadata.file_type().is_symlink() {
-            continue;
-        }
-        let Some(name) = entry.file_name().to_str().map(ToString::to_string) else {
-            continue;
-        };
-        files.push(name.clone());
-        if !metadata.is_file() {
-            continue;
-        }
-        if name.eq_ignore_ascii_case("server.jar")
-            || name.to_ascii_lowercase().ends_with(".jar")
-                && !name.to_ascii_lowercase().ends_with(".part")
-        {
-            jars.push(name.clone());
-        }
-        if matches!(
-            name.to_ascii_lowercase().as_str(),
-            "start.sh" | "start.ps1" | "start.bat" | "run.sh" | "run.ps1" | "run.bat"
-        ) {
-            scripts.push(name);
-        }
-    }
-    files.sort();
-    jars.sort_by_key(|name| {
-        if name.eq_ignore_ascii_case("server.jar") {
-            0
-        } else {
-            1
-        }
-    });
-    scripts.sort();
-    let properties_content = read_bounded_text(&root.join("server.properties"), 2 * 1024 * 1024)
-        .await
-        .unwrap_or_default();
-    let properties = parse_properties(&properties_content);
-    let requested_kind = requested_kind.trim().to_ascii_lowercase();
-    let is_server = match requested_kind.as_str() {
-        "server" => true,
-        "project" => false,
-        "auto" | "" => {
-            !properties.is_empty()
-                || !jars.is_empty()
-                || fs::try_exists(root.join("eula.txt")).await.unwrap_or(false)
-        }
-        _ => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "kind 必须是 server、project 或 auto".into(),
-            ));
-        }
-    };
-    let kind = if is_server { "server" } else { "project" };
-    let launch_jar = if is_server {
-        jars.first().cloned()
-    } else {
-        None
-    };
-    let (core, version) = detect_core_version(launch_jar.as_deref(), &properties);
-    let mut warnings = Vec::new();
-    let detected_port = parse_u16_property(&properties, "server-port").unwrap_or(25565);
-    let port = requested_port.unwrap_or(detected_port);
-    if is_server && !properties_content.is_empty() && !properties.contains_key("server-port") {
-        warnings.push("server.properties 未包含 server-port，已使用 25565".into());
-    }
-    if is_server && jars.is_empty() {
-        warnings.push("未找到服务端 JAR；导入后可先补充核心文件，再启动服务器".into());
-    } else if is_server && jars.len() > 1 {
-        warnings.push(format!(
-            "检测到多个 JAR，已选择 {}；可在导入后调整",
-            jars[0]
-        ));
-    }
-    let eula_accepted = read_bounded_text(&root.join("eula.txt"), 64 * 1024)
-        .await
-        .map(|content| {
-            parse_properties(&content)
-                .get("eula")
-                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
-        })
-        .unwrap_or(false);
-    if is_server && !eula_accepted {
-        warnings.push("eula.txt 未明确设置 eula=true，启动前仍需接受 EULA".into());
-    }
-    let script_memory = {
-        let mut detected = None;
-        for script in &scripts {
-            if let Some(content) = read_bounded_text(&root.join(script), 256 * 1024).await {
-                detected = parse_memory_from_text(&content);
-                if detected.is_some() {
-                    break;
-                }
-            }
-        }
-        detected
-    };
-    let mut memory_gb = requested_memory
-        .filter(|value| (MIN_MEMORY_GB..=MAX_MEMORY_GB).contains(value))
-        .or(script_memory)
-        .unwrap_or(DEFAULT_MEMORY_GB);
-    if !(MIN_MEMORY_GB..=MAX_MEMORY_GB).contains(&memory_gb) {
-        memory_gb = DEFAULT_MEMORY_GB;
-    }
-    let name = requested_name
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| import_name_from_properties(&properties, root));
-    validate_server_name(&name)
-        .or_else(|_| validate_project_name(&name))
-        .map_err(|message| (StatusCode::BAD_REQUEST, message.into()))?;
-    let max_players = properties
-        .get("max-players")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(60);
-    let mut config_files = Vec::new();
-    for name in ["server.properties", "eula.txt", "sculk.yml"] {
-        if fs::try_exists(root.join(name)).await.unwrap_or(false) {
-            config_files.push(name.to_string());
-        }
-    }
-    let detected = DetectedWorkspace {
-        kind: kind.into(),
-        name,
-        core,
-        version,
-        port,
-        memory_gb,
-        max_players,
-        core_ready: launch_jar.is_some(),
-        eula_accepted,
-        launch_jar,
-        config_files,
-        jar_candidates: jars,
-        script_candidates: scripts,
-        properties,
-    };
-    Ok((detected, warnings, files))
 }
 
 /// Adapt the bounded inspector to the dashboard's compact import response.
@@ -1777,7 +1486,11 @@ async fn inspect_existing_workspace_safe(
     let is_server = match requested_kind.as_str() {
         "server" => true,
         "project" => false,
-        "auto" | "" => !inspection.properties.is_empty() || !inspection.jar_candidates.is_empty(),
+        "auto" | "" => {
+            !inspection.properties.is_empty()
+                || !inspection.jar_candidates.is_empty()
+                || inspection.eula_present
+        }
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -1816,8 +1529,10 @@ async fn inspect_existing_workspace_safe(
     if !is_server {
         warnings.retain(|warning| !warning.contains("EULA") && !warning.contains("JAR"));
     }
+    let memory_gb_hint = inspection.memory_gb_hint;
     let memory_gb = requested_memory
         .filter(|value| (MIN_MEMORY_GB..=MAX_MEMORY_GB).contains(value))
+        .or(memory_gb_hint)
         .unwrap_or(DEFAULT_MEMORY_GB);
     let properties = inspection
         .properties
@@ -1851,6 +1566,7 @@ async fn inspect_existing_workspace_safe(
             .unwrap_or_default(),
         port,
         memory_gb,
+        memory_gb_hint,
         max_players: inspection.max_players.unwrap_or(60),
         core_ready: is_server && inspection.recommended_jar.is_some(),
         eula_accepted: inspection.eula_accepted == Some(true),
@@ -1878,7 +1594,7 @@ async fn import_workspace(
     Json(request): Json<ImportWorkspaceRequest>,
 ) -> ApiResult<ImportWorkspaceResponse> {
     let root = canonical_external_workspace(&request.path).await?;
-    let (mut detected, mut warnings, files) = inspect_existing_workspace_safe(
+    let (detected, mut warnings, files) = inspect_existing_workspace_safe(
         &root,
         &request.kind,
         request.name.as_deref(),
@@ -2483,10 +2199,10 @@ async fn delete_server(
             Err(error) => return Err(error),
         }
     }
-    if let Some(status) = state.downloads.read().await.get(&id) {
-        if download::is_active(status) {
-            status.cancel.store(true, Ordering::Release);
-        }
+    if let Some(status) = state.downloads.read().await.get(&id)
+        && download::is_active(status)
+    {
+        status.cancel.store(true, Ordering::Release);
     }
     let operation = server_operation_lock(&state, &id).await;
     let _guard = operation.lock().await;
@@ -2652,6 +2368,7 @@ async fn initialize_telemetry(state: &AppState, id: &str, generation: Uuid, core
         TelemetryRecord {
             generation,
             observed_at: Instant::now(),
+            player_list_observed_at: None,
             value: telemetry,
         },
     );
@@ -2678,6 +2395,7 @@ async fn record_telemetry_observation(
         .or_insert_with(|| TelemetryRecord {
             generation,
             observed_at: Instant::now(),
+            player_list_observed_at: None,
             value: ServerTelemetry {
                 availability: "unavailable".into(),
                 source: "managed_java_console".into(),
@@ -2702,6 +2420,7 @@ async fn record_telemetry_observation(
             max_players,
             player_names,
         } => {
+            record.player_list_observed_at = Some(Instant::now());
             record.value.online = Some(online);
             record.value.max_players = Some(max_players);
             record.value.player_names = Some(player_names);
@@ -2909,12 +2628,15 @@ async fn start_server(state: AppState, id: String) -> ApiResult<ActionResponse> 
             })?;
         (server, java_args)
     };
-    let directory = workspace_directory_for_server(&server);
+    // Revalidate an externally owned directory immediately before launching.
+    // The path may have been replaced after import, so the registration-time
+    // canonicalization alone is not sufficient.
+    let directory = ensure_workspace(&state, &id).await?;
     let launch_jar = launch_jar_name(&server).map_err(|error| (StatusCode::CONFLICT, error))?;
-    if !fs::metadata(directory.join(&launch_jar))
-        .await
-        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
-    {
+    let launch_metadata = fs::symlink_metadata(directory.join(&launch_jar)).await;
+    if !launch_metadata.is_ok_and(|metadata| {
+        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() > 0
+    }) {
         record_server_operation_error(&state, &id, "server.jar is missing or empty").await;
         return Err((
             StatusCode::CONFLICT,
@@ -2934,10 +2656,9 @@ async fn start_server(state: AppState, id: String) -> ApiResult<ActionResponse> 
             if let Some(port) = properties
                 .get("server-port")
                 .and_then(|value| value.parse::<u16>().ok())
+                && port >= 1024
             {
-                if port >= 1024 {
-                    server.port = port;
-                }
+                server.port = port;
             }
             let eula = read_bounded_text(&directory.join("eula.txt"), 64 * 1024)
                 .await
@@ -4214,11 +3935,7 @@ async fn run_project_build(
         format!("未检测到可用的 {} 构建器或项目描述文件", tool.label()),
     ))?;
     let args = build_action_args(tool, &action).expect("action was validated above");
-    let command_text = format!(
-        "{} {}",
-        command.command_label,
-        args.iter().copied().collect::<Vec<_>>().join(" ")
-    );
+    let command_text = format!("{} {}", command.command_label, args.to_vec().join(" "));
     if command.via_shell && !is_build_shell_label(tool, &command.command_label) {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -6655,6 +6372,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn importing_a_server_uses_script_memory_hint_unless_explicitly_overridden() {
+        let root =
+            std::env::temp_dir().join(format!("sculk-import-memory-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&root).await.unwrap();
+        fs::write(root.join("server.properties"), "server-port=25567\n")
+            .await
+            .unwrap();
+        fs::write(root.join("eula.txt"), "eula=true\n")
+            .await
+            .unwrap();
+        fs::write(root.join("server.jar"), b"jar").await.unwrap();
+        fs::write(root.join("start.bat"), b"java -Xmx6144M -jar server.jar")
+            .await
+            .unwrap();
+
+        let (detected, _, _) = inspect_existing_workspace_safe(&root, "server", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(detected.memory_gb_hint, Some(6));
+        assert_eq!(detected.memory_gb, 6);
+
+        let (overridden, _, _) =
+            inspect_existing_workspace_safe(&root, "server", None, Some(12), None)
+                .await
+                .unwrap();
+        assert_eq!(overridden.memory_gb_hint, Some(6));
+        assert_eq!(overridden.memory_gb, 12);
+
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn backend_shutdown_is_idempotent_for_an_idle_state() {
         let id = format!("shutdown-{}", Uuid::new_v4().simple());
         let (state, state_directory) = test_state_with_workspace(&id, "project").await;
@@ -7706,6 +7455,7 @@ mod tests {
             Some(&TelemetryRecord {
                 generation,
                 observed_at: Instant::now() - TELEMETRY_STALE_AFTER - Duration::from_secs(1),
+                player_list_observed_at: None,
                 value: value.clone(),
             }),
         );
@@ -7717,6 +7467,7 @@ mod tests {
             Some(&TelemetryRecord {
                 generation: Uuid::new_v4(),
                 observed_at: Instant::now(),
+                player_list_observed_at: None,
                 value,
             }),
         );
