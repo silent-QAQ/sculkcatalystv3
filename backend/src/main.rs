@@ -2957,6 +2957,7 @@ async fn start_server(state: AppState, id: String) -> ApiResult<ActionResponse> 
             ));
         }
     }
+    ensure_registered_server_port_available(&state, &id, server.port).await?;
     ensure_server_port_available(server.port).await?;
     let required_java = runtime::required_java_major(&server.version);
     let java = runtime::detect_java_for_major(&runtime::data_root(), required_java).await;
@@ -3189,6 +3190,26 @@ async fn ensure_server_port_available(port: u16) -> Result<(), (StatusCode, Stri
             )
         })?;
     drop(listener);
+    Ok(())
+}
+
+async fn ensure_registered_server_port_available(
+    state: &AppState,
+    id: &str,
+    port: u16,
+) -> Result<(), (StatusCode, String)> {
+    if port == 0 {
+        return Err((StatusCode::BAD_REQUEST, "服务器端口无效".into()));
+    }
+    let data = state.inner.read().await;
+    if data.servers.iter().any(|server| {
+        server.id != id && server.kind == "server" && server.port != 0 && server.port == port
+    }) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("服务器端口 {port} 已被其他工作区登记"),
+        ));
+    }
     Ok(())
 }
 
@@ -4155,6 +4176,12 @@ async fn run_project_build(
     State(state): State<AppState>,
     Json(request): Json<BuildRequest>,
 ) -> ApiResult<BuildResultResponse> {
+    if state.shutting_down.load(Ordering::Acquire) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "后端正在关闭，暂时不能启动构建".into(),
+        ));
+    }
     let tool = BuildTool::parse(&request.tool).ok_or((
         StatusCode::BAD_REQUEST,
         "tool must be maven or gradle".into(),
@@ -4334,7 +4361,7 @@ where
 }
 
 fn append_build_output(output: &mut Vec<u8>, truncated: &mut bool, chunk: &[u8]) {
-    if chunk.len() >= MAX_BUILD_OUTPUT_BYTES {
+    if chunk.len() > MAX_BUILD_OUTPUT_BYTES {
         output.clear();
         output.extend_from_slice(&chunk[chunk.len() - MAX_BUILD_OUTPUT_BYTES..]);
         *truncated = true;
@@ -4378,6 +4405,11 @@ async fn run_build_process(
                 Ok(None) => {
                     if !timed_out && started.elapsed() >= BUILD_TIMEOUT {
                         timed_out = true;
+                        append_build_output(
+                            &mut output,
+                            &mut output_truncated,
+                            "\n构建超时（10 分钟），已终止进程树。\n".as_bytes(),
+                        );
                         let _ = process_platform::start_kill_tree(&mut child, pid, Some(&guard));
                         status = timeout(Duration::from_secs(5), child.wait())
                             .await
@@ -4427,8 +4459,11 @@ async fn run_build_process(
         }
     }
     drop(receiver);
-    for task in [stdout_task, stderr_task] {
-        let _ = timeout(Duration::from_secs(1), task).await;
+    for mut task in [stdout_task, stderr_task] {
+        if timeout(Duration::from_secs(1), &mut task).await.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
     }
     let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     let success = !timed_out && status.as_ref().is_some_and(|status| status.success());
@@ -7084,6 +7119,65 @@ mod tests {
         assert!(truncated);
         assert_eq!(output.len(), MAX_BUILD_OUTPUT_BYTES);
         assert_eq!(&output[output.len() - 4..], b"tail");
+    }
+
+    #[test]
+    fn build_output_at_the_exact_limit_is_not_marked_as_truncated() {
+        let mut output = Vec::new();
+        let mut truncated = false;
+        append_build_output(
+            &mut output,
+            &mut truncated,
+            &vec![b'x'; MAX_BUILD_OUTPUT_BYTES],
+        );
+
+        assert_eq!(output.len(), MAX_BUILD_OUTPUT_BYTES);
+        assert!(!truncated);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn project_build_runs_a_wrapper_from_a_workspace_path_with_cmd_metacharacters() {
+        let id = format!("project-build-{}", Uuid::new_v4().simple());
+        let (state, state_directory) = test_state_with_workspace(&id, "project").await;
+        let root = std::env::temp_dir().join(format!("sculk-build-&-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&root).await.unwrap();
+        fs::write(root.join("pom.xml"), "<project/>").await.unwrap();
+        fs::write(
+            root.join("mvnw.cmd"),
+            b"@echo off\r\necho SCULK_BUILD_WRAPPER_OK\r\nexit /b 0\r\n",
+        )
+        .await
+        .unwrap();
+        {
+            let mut data = state.inner.write().await;
+            let project = data
+                .servers
+                .iter_mut()
+                .find(|server| server.id == id)
+                .unwrap();
+            project.workspace_path = Some(root.to_string_lossy().into_owned());
+        }
+
+        let response = run_project_build(
+            Path(id),
+            State(state.clone()),
+            Json(BuildRequest {
+                tool: "maven".into(),
+                action: "build".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert!(response.success);
+        assert_eq!(response.exit_code, Some(0));
+        assert!(response.output.contains("SCULK_BUILD_WRAPPER_OK"));
+
+        drop(state);
+        fs::remove_dir_all(root).await.unwrap();
+        fs::remove_dir_all(state_directory).await.unwrap();
     }
 
     #[test]
