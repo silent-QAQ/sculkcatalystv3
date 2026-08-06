@@ -886,11 +886,9 @@ fn extract_tar_gz_archive_sync(archive: &Path, destination: &Path) -> Result<(),
             "Java 下载包不是有效的 tar.gz 文件",
         )
     })?;
-    let mut entry_count = 0_usize;
     let mut total_size = 0_u64;
-    for entry in entries {
-        entry_count += 1;
-        if entry_count > MAX_ARCHIVE_ENTRIES {
+    for (entry_index, entry) in entries.enumerate() {
+        if entry_index >= MAX_ARCHIVE_ENTRIES {
             return Err(InstallError::new(
                 InstallErrorKind::Archive,
                 "Java 下载包文件数量超过安全限制",
