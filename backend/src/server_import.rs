@@ -574,7 +574,13 @@ fn reject_symlink_components(path: &Path) -> Result<(), String> {
     let mut current = PathBuf::new();
     for component in absolute.components() {
         match component {
-            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            // `C:` is only a Windows path prefix, not a filesystem object.
+            // Calling symlink_metadata on it returns ERROR_INVALID_FUNCTION;
+            // wait until the following root or directory component is present.
+            Component::Prefix(prefix) => {
+                current.push(prefix.as_os_str());
+                continue;
+            }
             Component::RootDir => current.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
             Component::CurDir => {}
             Component::ParentDir => current.push(".."),
@@ -767,6 +773,14 @@ mod tests {
         handle.write_all(b"not a directory").unwrap();
         assert!(canonicalize_existing_directory(&file).is_err());
         std_fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn canonicalization_accepts_a_regular_directory() {
+        let root = temp_directory("sculk-import-directory");
+        std_fs::create_dir_all(&root).unwrap();
+        assert!(canonicalize_existing_directory(&root).is_ok());
+        std_fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

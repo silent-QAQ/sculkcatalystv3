@@ -18,7 +18,13 @@ export async function apiRequest<T>(path: string, options: RequestInit = {}): Pr
   const headers = new Headers(options.headers)
   if (options.body && !(options.body instanceof FormData) && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
 
-  const response = await fetch(apiUrl(path), { ...options, headers })
+  let response: Response
+  try {
+    response = await fetch(apiUrl(path), { ...options, headers })
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') throw error
+    throw new ApiError(0, '无法连接到后端服务，请确认服务正在运行后重试')
+  }
   if (!response.ok) {
     const message = await response.text()
     throw new ApiError(response.status, message || `请求失败（HTTP ${response.status}）`)
