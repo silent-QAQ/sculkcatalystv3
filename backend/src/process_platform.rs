@@ -183,10 +183,10 @@ pub(crate) fn start_kill_tree(
         Err(error) if error.raw_os_error() == Some(libc::ESRCH) => child.start_kill(),
         Err(error) => Err(error),
     };
-    if result.is_ok() {
-        if let Some(guard) = guard {
-            guard.disarm_process_group(pid);
-        }
+    if result.is_ok()
+        && let Some(guard) = guard
+    {
+        guard.disarm_process_group(pid);
     }
     result
 }
@@ -211,10 +211,10 @@ pub(crate) fn cleanup_remaining_tree(pid: u32, guard: Option<&ProcessGuard>) -> 
         Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
         Err(error) => Err(error),
     };
-    if result.is_ok() {
-        if let Some(guard) = guard {
-            guard.disarm_process_group(pid);
-        }
+    if result.is_ok()
+        && let Some(guard) = guard
+    {
+        guard.disarm_process_group(pid);
     }
     result
 }
