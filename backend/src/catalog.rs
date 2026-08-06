@@ -1633,6 +1633,29 @@ pub(crate) fn resolve_core_download(
     minecraft: &str,
     channel: &str,
 ) -> Option<CatalogVersion> {
+    resolve_core_download_matching(catalog, project, minecraft, channel, None)
+}
+
+/// Resolve a core artifact while optionally pinning the catalog's published
+/// artifact version. `minecraft` remains the compatibility version; the two
+/// identifiers intentionally have different meanings.
+pub(crate) fn resolve_core_download_exact(
+    catalog: &CatalogState,
+    project: &str,
+    minecraft: &str,
+    channel: &str,
+    artifact_version: &str,
+) -> Option<CatalogVersion> {
+    resolve_core_download_matching(catalog, project, minecraft, channel, Some(artifact_version))
+}
+
+fn resolve_core_download_matching(
+    catalog: &CatalogState,
+    project: &str,
+    minecraft: &str,
+    channel: &str,
+    artifact_version: Option<&str>,
+) -> Option<CatalogVersion> {
     let project = project.trim().to_ascii_lowercase();
     let minecraft = minecraft.trim();
     let channel = if channel.trim().is_empty() {
@@ -1649,7 +1672,20 @@ pub(crate) fn resolve_core_download(
     {
         return None;
     }
-    resolve_version(&catalog.core_versions, &project, Some(minecraft), &channel)
+    let candidate = if let Some(artifact_version) = artifact_version {
+        catalog.core_versions.iter().find(|version| {
+            version.project.eq_ignore_ascii_case(&project)
+                && version
+                    .version
+                    .eq_ignore_ascii_case(artifact_version.trim())
+                && version.channel.eq_ignore_ascii_case(&channel)
+                && version.status.eq_ignore_ascii_case("published")
+                && matches_minecraft(version, minecraft)
+        })
+    } else {
+        resolve_version(&catalog.core_versions, &project, Some(minecraft), &channel)
+    };
+    candidate
         .filter(|version| validate_version(CatalogKind::Core, version).is_ok())
         .cloned()
 }
@@ -3047,6 +3083,16 @@ mod tests {
         let resolved = resolve_core_download(&catalog, "Paper", "1.21.4", "stable").unwrap();
         assert_eq!(resolved.version, "1.21.4-232");
         assert_eq!(resolved.sha256.len(), 64);
+        assert_eq!(
+            resolve_core_download_exact(&catalog, "paper", "1.21.4", "stable", "1.21.4-232")
+                .unwrap()
+                .id,
+            resolved.id
+        );
+        assert!(
+            resolve_core_download_exact(&catalog, "paper", "1.21.4", "stable", "missing-build")
+                .is_none()
+        );
 
         let id = resolved.id.clone();
         assert!(record_core_download(

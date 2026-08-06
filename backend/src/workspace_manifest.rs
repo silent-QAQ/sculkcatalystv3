@@ -34,8 +34,14 @@ struct ManifestServer {
     status: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     core: String,
+    #[serde(default = "default_core_source")]
+    core_source: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    core_resource_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    core_resource_version: Option<String>,
     #[serde(default)]
     port: u16,
     #[serde(default = "default_memory_gb")]
@@ -89,6 +95,18 @@ fn default_memory_gb() -> u8 {
     8
 }
 
+fn default_core_source() -> String {
+    "catalog".into()
+}
+
+fn normalize_core_source(value: &str) -> String {
+    if value.trim().eq_ignore_ascii_case("local_upload") {
+        "local_upload".into()
+    } else {
+        "catalog".into()
+    }
+}
+
 fn latest_task<'a>(data: &'a PersistedState, server_id: &str) -> Option<&'a TaskInfo> {
     data.tasks.iter().find(|task| task.server_id == server_id)
 }
@@ -139,7 +157,10 @@ fn from_state(data: &PersistedState, server: &ServerInfo) -> SculkManifest {
             id: server.id.clone(),
             status: manifest_status(server, task).into(),
             core: server.core.clone(),
+            core_source: server.core_source.clone(),
             version: server.version.clone(),
+            core_resource_id: server.core_resource_id.clone(),
+            core_resource_version: server.core_resource_version.clone(),
             port: server.port,
             memory_gb: server.memory_gb,
             core_ready: server.core_ready,
@@ -388,7 +409,9 @@ async fn import_one(
         kind: "server".into(),
         name: name.clone(),
         core: manifest.server.core,
-        core_resource_id: None,
+        core_source: normalize_core_source(&manifest.server.core_source),
+        core_resource_id: manifest.server.core_resource_id,
+        core_resource_version: manifest.server.core_resource_version,
         version: manifest.server.version,
         status: if plan_pending {
             "planning".into()
@@ -512,7 +535,9 @@ mod tests {
             kind: "server".into(),
             name: "测试服".into(),
             core: "Paper".into(),
+            core_source: "catalog".into(),
             core_resource_id: None,
+            core_resource_version: None,
             version: "1.21.4".into(),
             status: "stopped".into(),
             players: "0 / 20".into(),
@@ -578,7 +603,10 @@ mod tests {
                 id: "server-12345678".into(),
                 status: "running".into(),
                 core: "Paper".into(),
+                core_source: "catalog".into(),
                 version: "1.21.4".into(),
+                core_resource_id: None,
+                core_resource_version: None,
                 port: 25565,
                 memory_gb: 8,
                 core_ready: true,

@@ -139,7 +139,8 @@ flowchart LR
 
 - GET /api/dashboard：服务器和任务列表。
 - GET /api/system：Java、系统架构、磁盘和内存。
-- GET /api/catalog/cores：创建向导所需的核心与版本。
+- GET /api/resource-catalog/api/catalog/cores：创建向导优先读取远程资源库核心项目；远程不可用时回退 GET /api/catalog/cores 本机目录缓存。
+- GET /api/resource-catalog/api/catalog/cores/{slug}/versions：读取指定核心的 stable 已发布构建和 SHA-256 元数据。
 - GET /api/ai/settings：模型、Agent 和审核模式。
 - GET /api/ui/settings：外观、语言、个性化和连接配置。
 
@@ -178,16 +179,17 @@ data/servers/{server_id}/
 
 #### 普通创建
 
-POST /api/servers 负责创建项目和工作区，并返回随后立即执行的持久化 `provision_task`。创建过程会：
+POST /api/servers 负责创建项目和工作区。请求的 `core_source` 为 `catalog` 时返回并立即执行持久化 `provision_task`；为 `local_upload` 时只创建工作区并等待本地 JAR。资源库模式还会持久化 `core_resource_id` 与精确的 `core_resource_version`。创建过程会：
 
 1. 检查名称非空、位置合法、端口未占用。
 2. 检查 EULA 已确认。
 3. 校验内存范围。
 4. 建立 plugins/ 和 logs/。
 5. 生成 server.properties、eula.txt、start.ps1 和 start.sh；Unix 上的 start.sh 权限为 0755。
-6. 写入并派发 `server_provision` 初始化任务。
-7. 由任务检查工作区和 EULA，下载、校验并原子安装 server.jar，再检查 Java 兼容性。
-8. 将进度、事件、错误、项目、配置和日志持久化；失败或取消后可通过 POST /api/servers/{id}/provision 重试。
+6. 资源库模式写入并派发 `server_provision` 初始化任务；本地上传模式将服务器标记为等待上传。
+7. 资源库任务检查工作区和 EULA，按精确构建下载、校验并原子安装 server.jar，再检查 Java 兼容性。
+8. 本地上传模式调用 `POST /api/servers/{id}/core/upload`，服务端流式计算 SHA-256、限制 256 MiB、校验 ZIP/JAR 与 Manifest 后安装 `server.jar`，随后复用同一初始化任务检查 Java。
+9. 将进度、事件、错误、项目、配置和日志持久化；失败或取消后可重试对应流程。
 
 初始化中后端退出时，同一任务会在下次启动时回到队列。已经原子安装完成的 server.jar 会直接复用；未完成的 `.part` 不作为可信核心，传输会从头开始。
 
@@ -303,12 +305,13 @@ POST /api/runtime/java/install 当前支持安装推荐 Java 21，覆盖 Windows
 
 ### 5.1 下载入口
 
-核心下载专用于把所选核心安装为某个服务器工作区中的 server.jar：
+核心下载专用于把资源库或镜像中的所选核心安装为某个服务器工作区中的 server.jar；本地上传核心走独立安装接口：
 
 - POST /api/servers/{id}/provision：创建、重试或幂等读取首次初始化任务。
 - POST /api/servers/{id}/download/core：创建后台下载任务。
 - GET /api/servers/{id}/download/status：读取阶段、来源、字节数和百分比。
 - POST /api/servers/{id}/download/cancel：请求取消。
+- POST /api/servers/{id}/core/upload：multipart `file` 字段上传本地 `.jar`（最大 256 MiB）；仅允许标记为本地上传且尚未就绪的受管服务器。
 - GET /api/download/mirrors：读取镜像配置。
 - POST /api/download/preview：预览镜像候选地址和优先级。
 
@@ -674,10 +677,11 @@ Rust 后端支持两种目录写接口凭证：浏览器管理页使用 `SCULK_C
 
 社区页面按服务器显示真实玩家快照，支持按游戏名、UUID、显示名、身份、标签或备注搜索，并可按玩家、在线状态、等级和更新时间排序。
 
-- 玩家快照从 `world/playerdata/*.dat` 的压缩 NBT 中读取，展示等级、维度、坐标、背包、装备栏、副手和末影箱。
-- 潜影盒和收纳袋可展开查看已读取的内部物品；物品名称、数量和 Lore 可在格位中查看。
+- 已部署 `SculkCatalystPaperBridge` 时，Paper/Folia 插件通过出站 WebSocket 提供在线状态、等级、维度、坐标、背包、装备栏、副手和末影箱。打开在线玩家详情会按需刷新完整快照。
+- 桥接断开时会立即清空实时在线 presence，但保留短期只读快照并标记为缓存。`world/playerdata/*.dat` 的压缩 NBT 仅用于离线玩家或桥接不可用时的只读兜底；它有保存延迟，不能被当成实时背包或在线状态。
+- 潜影盒和收纳袋可展开查看受限的内部物品预览；物品名称、数量和 Lore 可在格位中查看。原始 NBT、序列化 `ItemStack` 与插件私有数据不会传输。
 - 可维护展示名称、身份、标签和管理备注，这些资料持久化在 Sculk 的管理状态中，不会直接改写在线玩家的游戏 NBT。
-- 可配置最多 10 个 PlaceholderAPI 变量字段；服务器运行且检测到 PlaceholderAPI 后，可按玩家即时解析并显示变量值。
+- 前端可配置最多 10 个 PlaceholderAPI 显示字段。PlaceholderAPI 是可选依赖；桥接插件仅解析其 `config.yml` 的 `papi.fields` 中精确允许的变量，未白名单、未安装、未启用或解析失败都会返回明确状态。
 
 接口：
 
@@ -685,8 +689,16 @@ Rust 后端支持两种目录写接口凭证：浏览器管理页使用 `SCULK_C
 - `GET`、`PUT /api/servers/{server_id}/players/{player_key}`
 - `GET`、`PUT /api/servers/{server_id}/papi/fields`
 - `GET /api/servers/{server_id}/players/{player_key}/papi`
+- `GET /api/servers/{server_id}/bridge/status`
+- `GET /api/bridge/v1/ws`（WebSocket 升级端点，仅供桥接插件连接）
 
-世界玩家数据是保存快照，在线状态和背包可能存在保存延迟。若玩家仅由受管控制台识别、尚未写入世界数据，界面会明确标记快照不可用。PlaceholderAPI 的 JAR 检测不等同于插件成功启用，查询失败会返回可见状态而不会伪造变量值。
+桥接协议为 v2。连接固定经过 `hello_init -> 一次性 challenge -> 签名 hello -> 签名 hello_ack`；成功后会话的双向业务帧都以 HMAC 签名，并携带会话标识、单调序号与时间戳。`payload_json` 使用无填充 Base64URL 封装 UTF-8 JSON，密钥不会写入任何 WebSocket 帧。
+
+部署时使用 Java 21 构建或取得桥接 JAR，放入目标服务器 `plugins/` 目录。插件以 Paper API `1.21.6` 为编译基线并声明 `folia-supported: true`；设置 `enabled`、`server-id`、`backend-ws-url` 和每服独立的 `token` 后重启服务器。生产环境使用 `wss://`，后端推荐用 `SCULK_BRIDGE_TOKENS=server-id=token` 配置同一密钥；PAPI 变量还需要在插件 `papi.fields` 中逐项白名单。
+
+`playerdata` 是保存快照，在线状态和背包可能存在保存延迟。桥接不可用、实时请求超时或字段未提供时，界面会明确标记实时、缓存或离线来源与缺失区段，不会伪造等级、物品数量、空背包或 PAPI 变量值。
+
+当前尚未在真实 Paper/Folia 服务端完成联调。构建和协议测试不能替代目标服务器验证；部署前应验证启停、断线重连、跨区移动、玩家退出、容器预览及所有启用的 PlaceholderAPI 扩展。
 
 ### 11.2 经济运营
 
@@ -935,7 +947,7 @@ PersistedState 包含：
 | --- | --- |
 | REST/JSON | 页面数据、CRUD、任务和设置 |
 | SSE | AI 流式文本、meta、错误和完成事件 |
-| WebSocket | Minecraft 服务器日志历史 + 实时广播 |
+| WebSocket | Minecraft 服务器日志历史 + 实时广播；Paper/Folia 玩家桥接 v2 |
 | 轮询 | dashboard、下载进度和 WebSocket 断线回退 |
 | stdio JSON-RPC | ACP 外部 Agent |
 
@@ -1005,6 +1017,14 @@ POST   /api/polls
 POST   /api/polls/{id}/vote
 POST   /api/feedback/cluster
 POST   /api/players/{id}/action
+GET    /api/servers/{server_id}/players?query=&sort=&order=
+GET    /api/servers/{server_id}/players/{player_key}
+PUT    /api/servers/{server_id}/players/{player_key}
+GET    /api/servers/{server_id}/papi/fields
+PUT    /api/servers/{server_id}/papi/fields
+GET    /api/servers/{server_id}/players/{player_key}/papi
+GET    /api/servers/{server_id}/bridge/status
+GET    /api/bridge/v1/ws
 ~~~
 
 ### 16.5 集成与同步

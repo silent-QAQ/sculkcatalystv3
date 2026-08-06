@@ -2193,7 +2193,9 @@ async fn run_chat_stream(state: AppState, request: ChatStreamRequest, tx: mpsc::
                     };
                     let server = &mut data.servers[server_index];
                     server.core = core.clone();
+                    server.core_source = "catalog".into();
                     server.core_resource_id = resource_id;
+                    server.core_resource_version = None;
                     server.version = version.clone();
                     server.status = "stopped".into();
                     server.port = port;

@@ -74,6 +74,7 @@ enum Source {
     },
     ResourceCenter {
         identifier: String,
+        artifact_version: Option<String>,
     },
     PaperApi {
         project: &'static str,
@@ -110,9 +111,23 @@ fn collect_sources(
         core_identifiers.push(server.core.clone());
     }
     for identifier in &core_identifiers {
-        let Some(version) =
+        let version = if let Some(artifact_version) = server
+            .core_resource_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            catalog::resolve_core_download_exact(
+                &data.catalog,
+                identifier,
+                &server.version,
+                "stable",
+                artifact_version,
+            )
+        } else {
             catalog::resolve_core_download(&data.catalog, identifier, &server.version, "stable")
-        else {
+        };
+        let Some(version) = version else {
             continue;
         };
         sources.push(Source::Catalog {
@@ -127,7 +142,18 @@ fn collect_sources(
     for identifier in &core_identifiers {
         sources.push(Source::ResourceCenter {
             identifier: identifier.clone(),
+            artifact_version: server.core_resource_version.clone(),
         });
+    }
+    // A user-selected artifact must never silently fall back to an unpinned
+    // mirror or an "latest" official build. If the pinned catalog source is
+    // unavailable, surface that failure so the user can choose another build.
+    if server
+        .core_resource_version
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return sources;
     }
     for identifier in &core_identifiers {
         sources.push(Source::MslApi {
@@ -318,6 +344,12 @@ async fn start_download(
                 "已有服务器目录不会被核心下载覆盖；请直接管理目录中的现有核心".into(),
             ));
         }
+        if server.core_source == "local_upload" {
+            return Err((
+                StatusCode::CONFLICT,
+                "该服务器使用本地上传核心，不能改用镜像下载".into(),
+            ));
+        }
     }
     let operation = crate::server_operation_lock(&state, &id).await;
     let _guard = operation.lock().await;
@@ -420,6 +452,9 @@ pub(crate) async fn provision_core(
             .ok_or_else(|| "server not found".to_string())?;
         if server.workspace_path.is_some() {
             return Err("已有服务器目录不支持核心下载或初始化".into());
+        }
+        if server.core_source == "local_upload" {
+            return Err("该服务器等待本地核心上传，不能从资源库下载核心".into());
         }
         let sources = collect_sources(&data, &server, &[]);
         (server.core, server.version, sources)
@@ -1123,11 +1158,20 @@ async fn resolve_source(
             expected_sha256: None,
             catalog_version_id: None,
         }),
-        Source::ResourceCenter { identifier } => {
+        Source::ResourceCenter {
+            identifier,
+            artifact_version,
+        } => {
             let base = crate::resource_sync::resource_base_url()
                 .ok_or_else(|| "资源中心地址未配置".to_string())?;
-            let (project, catalog_version) =
-                resolve_resource_center_version(client, &base, identifier, version).await?;
+            let (project, catalog_version) = resolve_resource_center_version(
+                client,
+                &base,
+                identifier,
+                version,
+                artifact_version.as_deref(),
+            )
+            .await?;
             let download_url = resource_center_download_url(
                 &base,
                 &project.slug,
@@ -1267,6 +1311,7 @@ async fn resolve_resource_center_version(
     base: &str,
     identifier: &str,
     minecraft: &str,
+    artifact_version: Option<&str>,
 ) -> Result<(ResourceCenterProject, ResourceCenterVersion), String> {
     let mut search_url = resource_api_url(
         base,
@@ -1323,18 +1368,29 @@ async fn resolve_resource_center_version(
         .into_iter()
         .filter(|item| item.status.is_empty() || item.status.eq_ignore_ascii_case("published"))
         .filter(|item| item.channel.is_empty() || item.channel.eq_ignore_ascii_case("stable"))
-        .find(|item| {
+        .filter(|item| {
             item.minecraft_versions.is_empty()
                 || item
                     .minecraft_versions
                     .iter()
                     .any(|candidate| candidate.eq_ignore_ascii_case(minecraft))
         })
+        .find(|item| {
+            artifact_version
+                .is_none_or(|expected| item.version.eq_ignore_ascii_case(expected.trim()))
+        })
         .ok_or_else(|| {
-            format!(
-                "资源中心未找到核心 {} 兼容 Minecraft {} 的已发布版本",
-                project.slug, minecraft
-            )
+            if let Some(artifact_version) = artifact_version {
+                format!(
+                    "资源中心未找到核心 {} 的构建 {}（Minecraft {}）",
+                    project.slug, artifact_version, minecraft
+                )
+            } else {
+                format!(
+                    "资源中心未找到核心 {} 兼容 Minecraft {} 的已发布版本",
+                    project.slug, minecraft
+                )
+            }
         })?;
     Ok((project, selected))
 }
@@ -1435,7 +1491,7 @@ fn source_label(source: &Source) -> String {
     match source {
         Source::Catalog { version, .. } => format!("资源目录（{version}）"),
         Source::Mirror { name, .. } => name.clone(),
-        Source::ResourceCenter { identifier } => format!("资源中心（{identifier}）"),
+        Source::ResourceCenter { identifier, .. } => format!("资源中心（{identifier}）"),
         Source::MslApi { project } => format!("MSL 镜像（{project}）"),
         Source::PaperApi { project } => format!("PaperMC 官方源（{project}）"),
         Source::PurpurApi => "PurpurMC 官方源".into(),
@@ -1480,7 +1536,10 @@ fn placeholder_url(value: &str) -> bool {
         .is_some_and(|host| host == RESERVED_HOST || host.ends_with(".example.com"))
 }
 
-async fn install_download(part: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+pub(crate) async fn install_download(
+    part: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<(), String> {
     let backup = target.with_file_name("server.jar.backup");
     match fs::remove_file(&backup).await {
         Ok(()) => {}
@@ -1747,7 +1806,7 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-fn hex_string(bytes: &[u8]) -> String {
+pub(crate) fn hex_string(bytes: &[u8]) -> String {
     let mut result = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         result.push_str(&format!("{byte:02x}"));

@@ -11,6 +11,7 @@ import SettingsView from './features/settings/SettingsView.vue'
 import ProjectBuildManager from './features/project/ProjectBuildManager.vue'
 import WorkspacePanelResizer from './components/WorkspacePanelResizer.vue'
 import { API_BASE, ApiError, apiRequest } from './lib/api'
+import { resourceApiRequest } from './lib/resource-api'
 import { filterDeletedWorkspaceSnapshot } from './lib/dashboard-state'
 import { postSse } from './lib/sse'
 import { writeClipboard } from './lib/clipboard'
@@ -26,6 +27,7 @@ import { MAX_SERVER_TEMPLATE_FILE_BYTES, parseServerTemplateManifest, type Serve
 import { TASK_STATUS_LABELS, TERMINAL_TASK_STATUSES } from './features/automation/types'
 import type { TaskInfo } from './features/automation/types'
 import type { SkillItem } from './features/settings/types'
+import type { CatalogProject, CatalogVersion } from './features/mirror/types'
 
 type Status = 'online' | 'stopped' | 'warning' | 'planning' | 'ready'
 type ServerOperationState = 'idle' | 'provisioning' | 'starting' | 'stopping'
@@ -34,7 +36,7 @@ type Tab = 'overview' | 'files' | 'build' | 'terminal'
 type Surface = 'control' | 'automation' | 'community' | 'integrations' | 'mirror' | 'settings'
 interface SocialServiceSettings { enabled:boolean; qq_bot:boolean; bilibili_bot:boolean; douyin_bot:boolean; sync_interval_seconds:number; burst_interval_seconds:number; burst_recovery_seconds:number }
 interface ServiceSettings { social:SocialServiceSettings; economy:boolean; player_support:boolean; game_operations:boolean; content_improvement:boolean }
-interface ServerItem { id:string; name:string; kind?:WorkspaceKind; core:string; version:string; status:Status; operation_state?:ServerOperationState; core_ready?:boolean; last_error?:string|null; lifecycle_phase?:'create'|'build'|'operate'|'project'; players:string; memory:number; memory_gb?:number; cpu:number; port:number; task:string; location?:string; service_settings?:ServiceSettings }
+interface ServerItem { id:string; name:string; kind?:WorkspaceKind; core:string; version:string; core_source?:CreateCoreSource; core_resource_id?:string|null; core_resource_version?:string|null; status:Status; operation_state?:ServerOperationState; core_ready?:boolean; last_error?:string|null; lifecycle_phase?:'create'|'build'|'operate'|'project'; players:string; memory:number; memory_gb?:number; cpu:number; port:number; task:string; location?:string; service_settings?:ServiceSettings }
 interface ServerTelemetry { availability:'available'|'stale'|'unsupported'|'unavailable'; source:string; collected_at?:string|null; online?:number|null; max_players?:number|null; player_names?:string[]|null; tps_1m?:number|null; mspt_1m?:number|null; detail?:string|null }
 interface Message { id:string; role:'assistant'|'user'; content:string; time:string; actions?:string[]; task_id?:string; task_status?:string; streaming?:boolean; fallback?:boolean; warning?:string; error?:boolean; interrupted?:boolean; retryContent?:string }
 type ChatPhase = 'connecting'|'streaming'|'stopping'|'failed'|'interrupted'
@@ -47,7 +49,6 @@ interface MirrorInfo { id:string; name:string; base_url:string; enabled:boolean;
 interface DownloadCandidate { mirror_id:string; mirror_name:string; url:string; priority:number; region:string; supported:boolean }
 interface FileEntry { name:string;path:string;kind:'folder'|'file';size:number;modified?:number }
 interface ComposerSuggestion { id:string;kind:ComposerTokenKind;label:string;detail:string;value:string;agentId?:string;filePath?:string;skill?:SkillItem }
-interface CatalogCore { slug:string;name:string;minecraft_versions:string[] }
 interface DownloadStatus { task_id:string; phase:string; source:string; received:number; total?:number|null; percent:number; message:string }
 interface OpenDirectoryResponse { server:ServerItem; directory?:string; detected?:Record<string,unknown>|null; warnings?:string[]; files?:string[] }
 interface SpeechRecognitionAlternativeLike { transcript:string }
@@ -89,17 +90,39 @@ const openDirectorySummary = ref<OpenDirectoryResponse|null>(null)
 const dashboardState = ref<'loading'|'ready'|'error'>('loading'), dashboardError = ref('')
 const systemState = ref<'idle'|'loading'|'ready'|'error'>('idle'), systemError = ref('')
 const javaInstallState = ref<'idle'|'installing'|'success'|'error'>('idle'), javaInstallError = ref('')
-const catalogCores = ref<CatalogCore[]>([])
+type CreateCoreSource = 'catalog'|'local_upload'
+interface CreateForm { name:string; location:string; core:string; version:string; memory_gb:number; port:number; eula_accepted:boolean; core_source:CreateCoreSource; core_resource_id:string; core_resource_version:string }
+const catalogCores = ref<CatalogProject[]>([])
+const catalogVersions = ref<CatalogVersion[]>([])
+const catalogLoading = ref(false), catalogVersionsLoading = ref(false)
+const catalogOrigin = ref<'resource'|'local'|'none'>('none'), catalogError = ref('')
+let catalogRequestEpoch = 0
 const tasks = ref<TaskInfo[]>([])
 const pendingConversationTaskRefresh = new Set<string>()
 const focusedTaskId = ref('')
 const mirrors = ref<MirrorInfo[]>([]), selectedMirrorIds = ref<string[]>([]), previewCandidates = ref<DownloadCandidate[]>([]), mirrorPanel = ref(false)
-const createForm = ref({name:'',location:'local',core:'',version:'',memory_gb:8,port:25565,eula_accepted:false})
+const createForm = ref<CreateForm>({name:'',location:'local',core:'',version:'',memory_gb:8,port:25565,eula_accepted:false,core_source:'catalog',core_resource_id:'',core_resource_version:''})
 const projectForm = ref({name:'',location:'local'})
 const importedTemplateTitle = ref('')
 const manifestInput = ref<HTMLInputElement|null>(null)
+const coreUploadInput = ref<HTMLInputElement|null>(null)
+const pendingCoreUploadInput = ref<HTMLInputElement|null>(null)
+const localCoreFile = ref<File|null>(null)
+const pendingCoreUploadServerId = ref('')
+const MAX_CORE_UPLOAD_BYTES = 256 * 1024 * 1024
 const availableCores = computed(() => catalogCores.value.length?catalogCores.value.map(item=>item.name):(systemInfo.value?.cores??[]))
-const createMinecraftVersions = computed(() => catalogCores.value.find(item=>item.name===createForm.value.core)?.minecraft_versions ?? [])
+const selectedCatalogCore = computed(() => catalogCores.value.find(item => item.slug===createForm.value.core_resource_id || item.name===createForm.value.core))
+const createMinecraftVersions = computed(() => {
+  const versions = catalogVersions.value.flatMap(item=>item.minecraft_versions)
+  return [...new Set(versions)].sort((left,right)=>right.localeCompare(left,undefined,{numeric:true}))
+})
+const createArtifactVersions = computed(() => {
+  const minecraftVersion=createForm.value.version.trim()
+  return [...catalogVersions.value]
+    .filter(item=>!minecraftVersion||item.minecraft_versions.length===0||item.minecraft_versions.some(value=>value==='*'||value.localeCompare(minecraftVersion,undefined,{sensitivity:'accent'})===0))
+    .sort((left,right)=>right.released_at.localeCompare(left.released_at))
+})
+const selectedArtifactVersion = computed(() => createArtifactVersions.value.find(item=>item.version===createForm.value.core_resource_version))
 function defaultServiceSettings():ServiceSettings{return{social:{enabled:false,qq_bot:false,bilibili_bot:false,douyin_bot:false,sync_interval_seconds:240,burst_interval_seconds:10,burst_recovery_seconds:240},economy:false,player_support:false,game_operations:false,content_improvement:false}}
 const emptyServer:ServerItem={id:'',name:'未选择工作区',kind:'server',core:'',version:'',status:'stopped',operation_state:'idle',core_ready:false,last_error:null,lifecycle_phase:'create',players:'- / -',memory:0,memory_gb:8,cpu:0,port:0,task:'请创建或选择工作区',location:'local',service_settings:defaultServiceSettings()}
 const workspaceKind = (item:ServerItem):WorkspaceKind => item.kind === 'project' ? 'project' : 'server'
@@ -287,10 +310,19 @@ const memoryIssue = computed(() => {
   return ''
 })
 const parameterIssue = computed(() => {
-  if(!createForm.value.core)return '尚未获取可用核心'
-  if(availableCores.value.length&&!availableCores.value.includes(createForm.value.core))return `本机资源目录不支持核心 ${createForm.value.core}`
-  if(!createForm.value.version)return '尚未获取该核心的 Minecraft 版本'
-  if(createMinecraftVersions.value.length&&!createMinecraftVersions.value.includes(createForm.value.version))return `${createForm.value.core} 当前不支持 Minecraft ${createForm.value.version}`
+  if(!createForm.value.core)return '请填写服务端核心名称'
+  if(createForm.value.core_source==='catalog'){
+    if(catalogLoading.value||catalogVersionsLoading.value)return '正在加载资源库核心版本'
+    if(!catalogCores.value.length)return catalogError.value||'资源库暂时不可用，请改用本地 JAR 上传'
+    if(!availableCores.value.includes(createForm.value.core))return `资源库不支持核心 ${createForm.value.core}`
+    if(!createForm.value.version)return '尚未获取该核心的 Minecraft 版本'
+    if(createMinecraftVersions.value.length&&!createMinecraftVersions.value.includes(createForm.value.version))return `${createForm.value.core} 当前不支持 Minecraft ${createForm.value.version}`
+    if(!createForm.value.core_resource_version)return '请选择资源库中的核心构建版本'
+    if(!selectedArtifactVersion.value)return '所选资源库构建不可用，请重新选择'
+  }else{
+    if(!createForm.value.version)return '请填写本地核心对应的 Minecraft 版本'
+    if(!localCoreFile.value)return '请选择要上传的本地 JAR 核心文件'
+  }
   if(servers.value.some(item=>item.port===Number(createForm.value.port)))return `端口 ${createForm.value.port} 已被现有服务器占用`
   return portIssue.value||memoryIssue.value
 })
@@ -312,7 +344,7 @@ const serverStartBlocker = computed(() => {
   if(serverOperationState.value==='stopping')return '服务器正在停止'
   if(provisionActive.value)return '首次初始化任务仍在执行'
   if(provisionFailed.value)return serverCoreReady.value?'核心已安装，但首次初始化检查未闭环，请重试完成初始化':'首次初始化未完成，请重试或手动下载核心'
-  if(!serverCoreReady.value)return '服务端核心尚未下载并校验'
+  if(!serverCoreReady.value)return server.value.core_source==='local_upload'?'请先上传并校验本地服务端核心':'服务端核心尚未下载并校验'
   if(systemState.value!=='ready')return '尚未取得 Java 环境状态'
   if(!javaReady.value)return systemInfo.value?.java_installed?'当前 Java 版本不兼容':'尚未安装 Java'
   return ''
@@ -993,15 +1025,19 @@ async function switchWorkspaceMode(mode:WorkspaceKind){
   else tab.value=mode==='project'?'files':'overview'
 }
 function syncCreateOptions(){
+  if(createForm.value.core_source!=='catalog')return
   if(!availableCores.value.includes(createForm.value.core)){
     if(importedTemplateTitle.value&&createForm.value.core)return
     createForm.value.core=availableCores.value[0]??''
   }
+  const project=selectedCatalogCore.value
+  if(project&&createForm.value.core_resource_id!==project.slug)createForm.value.core_resource_id=project.slug
   const versions=createMinecraftVersions.value
-  if(!versions.includes(createForm.value.version)){
-    if(importedTemplateTitle.value&&createForm.value.version)return
-    createForm.value.version=versions[0]??''
+  if(versions.length&&!versions.includes(createForm.value.version)){
+    if(!(importedTemplateTitle.value&&createForm.value.version))createForm.value.version=versions[0]
   }
+  const artifacts=createArtifactVersions.value
+  if(artifacts.length&&!artifacts.some(item=>item.version===createForm.value.core_resource_version))createForm.value.core_resource_version=artifacts[0].version
 }
 async function loadSystemInfo(){
   systemState.value='loading';systemError.value=''
@@ -1009,11 +1045,112 @@ async function loadSystemInfo(){
   catch(error){systemInfo.value=null;systemState.value='error';systemError.value=String(error);return false}
 }
 async function loadCreateCatalog(){
-  try{catalogCores.value=await api('/api/catalog/cores')}catch{catalogCores.value=[]}
+  const epoch=++catalogRequestEpoch
+  catalogLoading.value=true;catalogError.value='';catalogOrigin.value='none';catalogVersions.value=[]
+  const asArray=<T,>(payload:unknown):T[]=>Array.isArray(payload)?payload:(payload&&typeof payload==='object'&&Array.isArray((payload as {items?:unknown}).items)?(payload as {items:T[]}).items:[])
+  const usableProjects=(payload:unknown)=>asArray<CatalogProject>(payload).filter(item=>typeof item?.slug==='string'&&typeof item?.name==='string'&&Array.isArray(item.minecraft_versions))
+  try{
+    const remote=usableProjects(await resourceApiRequest<unknown>('/api/catalog/cores?channel=stable'))
+    if(!remote.length)throw new Error('远程资源库没有已发布核心')
+    if(epoch!==catalogRequestEpoch)return
+    catalogCores.value=remote;catalogOrigin.value='resource'
+  }catch(remoteError){
+    try{
+      const local=usableProjects(await api('/api/catalog/cores?channel=stable'))
+      if(!local.length)throw remoteError
+      if(epoch!==catalogRequestEpoch)return
+      catalogCores.value=local;catalogOrigin.value='local'
+      catalogError.value='远程资源库暂时不可用，当前使用本机缓存目录'
+    }catch(error){
+      if(epoch!==catalogRequestEpoch)return
+      catalogCores.value=[];catalogVersions.value=[];catalogError.value=String(error||remoteError)
+    }
+  }finally{
+    if(epoch===catalogRequestEpoch)catalogLoading.value=false
+  }
+  if(epoch!==catalogRequestEpoch)return
   syncCreateOptions()
+  const project=selectedCatalogCore.value
+  if(project)await loadCoreVersions(project.slug)
 }
+
+async function loadCoreVersions(slug:string){
+  const epoch=++catalogRequestEpoch
+  catalogVersionsLoading.value=true;catalogVersions.value=[]
+  const query='?channel=stable'
+  const normalize=(payload:unknown):CatalogVersion[]=>{
+    const raw=Array.isArray(payload)?payload:(payload&&typeof payload==='object'&&Array.isArray((payload as {items?:unknown}).items)?(payload as {items:CatalogVersion[]}).items:[])
+    return raw.filter(item=>item&&String(item.status).toLowerCase()==='published'&&String(item.channel).toLowerCase()==='stable'&&typeof item.version==='string'&&item.version&&Array.isArray(item.minecraft_versions)&&item.size>0&&typeof item.sha256==='string'&&/^[a-f0-9]{64}$/i.test(item.sha256))
+  }
+  try{
+    let versions:CatalogVersion[]
+    if(catalogOrigin.value==='resource')versions=normalize(await resourceApiRequest<unknown>('/api/catalog/cores/'+encodeURIComponent(slug)+'/versions'+query))
+    else versions=normalize(await api('/api/catalog/cores/'+encodeURIComponent(slug)+'/versions'+query))
+    if(!versions.length)throw new Error('该核心没有可用的已发布构建')
+    if(epoch!==catalogRequestEpoch)return
+    catalogVersions.value=versions
+    catalogError.value=''
+  }catch(error){
+    if(epoch!==catalogRequestEpoch)return
+    catalogVersions.value=[]
+    catalogError.value=String(error)
+  }finally{
+    if(epoch===catalogRequestEpoch)catalogVersionsLoading.value=false
+  }
+  if(epoch===catalogRequestEpoch)syncCreateOptions()
+}
+
+function setCreateCoreSource(source:CreateCoreSource){
+  if(pendingCoreUploadServerId.value&&source!==createForm.value.core_source){
+    flash('当前服务器仍在等待本地核心上传，请先重试上传或关闭向导后重新创建')
+    return
+  }
+  createForm.value.core_source=source
+  catalogError.value=''
+  if(source==='catalog'){
+    localCoreFile.value=null
+    syncCreateOptions()
+    const project=selectedCatalogCore.value
+    if(project){createForm.value.core_resource_id=project.slug;void loadCoreVersions(project.slug)}
+  }else{
+    createForm.value.core_resource_id='';createForm.value.core_resource_version='';catalogVersions.value=[]
+    if(!createForm.value.core)createForm.value.core='自定义核心'
+    if(!createForm.value.version)createForm.value.version='1.21.4'
+  }
+}
+
+function chooseCoreUpload(){if(!creating.value)coreUploadInput.value?.click()}
+function handleCoreUpload(event:Event){
+  const input=event.target as HTMLInputElement,file=input.files?.[0];input.value=''
+  if(!file)return
+  if(file.size>MAX_CORE_UPLOAD_BYTES){localCoreFile.value=null;flash('核心 JAR 不能超过 256 MiB');return}
+  if(!file.name.toLowerCase().endsWith('.jar')||/[\\/\u0000-\u001f]/.test(file.name)){localCoreFile.value=null;flash('请选择文件名安全且扩展名为 .jar 的核心');return}
+  localCoreFile.value=file
+}
+
+function choosePendingCoreUpload(){
+  if(!busy.value&&!provisionActive.value)pendingCoreUploadInput.value?.click()
+}
+async function handlePendingCoreUpload(event:Event){
+  const input=event.target as HTMLInputElement,file=input.files?.[0];input.value=''
+  if(!file||!selectedId.value)return
+  if(file.size>MAX_CORE_UPLOAD_BYTES){flash('核心 JAR 不能超过 256 MiB');return}
+  if(!file.name.toLowerCase().endsWith('.jar')||/[\\/\u0000-\u001f]/.test(file.name)){flash('请选择文件名安全且扩展名为 .jar 的核心');return}
+  busy.value=true
+  try{
+    const uploaded=await uploadCoreFile(selectedId.value,file)
+    upsertServer(uploaded.server)
+    if(uploaded.provision_task)upsertTask(uploaded.provision_task)
+    flash('本地核心已安装并开始初始化')
+    await loadDashboard(false)
+  }catch(error){flash('核心上传失败：'+String(error))}
+  finally{busy.value=false}
+}
+
 async function openCreate(){
   importedTemplateTitle.value=''
+  createForm.value={name:'',location:'local',core:'',version:'',memory_gb:8,port:25565,eula_accepted:false,core_source:'catalog',core_resource_id:'',core_resource_version:''}
+  localCoreFile.value=null;pendingCoreUploadServerId.value='';catalogVersions.value=[]
   showCreate.value=true;createStep.value=1;javaInstallState.value='idle';javaInstallError.value=''
   if(workspaceMode.value==='project'){
     projectForm.value={name:'',location:'local'}
@@ -1024,6 +1161,7 @@ async function openCreate(){
 }
 async function loadServerTemplate(template:ServerTemplate){
   importedTemplateTitle.value=template.title
+  pendingCoreUploadServerId.value='';localCoreFile.value=null
   showCreate.value=true;createStep.value=2;javaInstallState.value='idle';javaInstallError.value='';surface.value='control'
   await Promise.all([loadSystemInfo(),loadCreateCatalog(),loadUi().catch(()=>{})])
   createForm.value={
@@ -1034,6 +1172,9 @@ async function loadServerTemplate(template:ServerTemplate){
     memory_gb:template.server.memory_gb,
     port:template.server.port,
     eula_accepted:false,
+    core_source:'catalog',
+    core_resource_id:'',
+    core_resource_version:'',
   }
   const url=new URL(window.location.href);url.searchParams.delete('cloud');window.history.replaceState({},'',url.pathname+url.search+url.hash)
   flash(`已载入“${template.title}”；请确认本机兼容性与 EULA 后再创建`)
@@ -1079,21 +1220,72 @@ async function createProject(){
 }
 async function createNewServer(){
   if(creating.value)return
+  if(pendingCoreUploadServerId.value){await retryPendingCoreUpload();return}
   if(parameterIssue.value){createStep.value=2;flash(parameterIssue.value);return}
   if(environmentIssue.value){createStep.value=3;flash(environmentIssue.value);return}
   creating.value=true
-  let created:{server:ServerItem;provision_task?:TaskInfo}|null=null
+  let createdServer:ServerItem|null=null
+  let creationCompleted=false
   try{
-    const response=await api('/api/servers',{method:'POST',body:JSON.stringify(createForm.value)}) as {server:ServerItem;provision_task?:TaskInfo}
-    created=response
+    const source=createForm.value.core_source
+    const payload={
+      name:createForm.value.name,
+      location:createForm.value.location,
+      core:createForm.value.core,
+      version:createForm.value.version,
+      memory_gb:createForm.value.memory_gb,
+      port:createForm.value.port,
+      eula_accepted:createForm.value.eula_accepted,
+      core_source:source,
+      core_resource_id:source==='catalog'?createForm.value.core_resource_id:null,
+      core_resource_version:source==='catalog'?createForm.value.core_resource_version:null,
+    }
+    const response=await api('/api/servers',{method:'POST',body:JSON.stringify(payload)}) as {server:ServerItem;provision_task?:TaskInfo}
+    createdServer=response.server
     upsertServer(response.server)
     if(response.provision_task)upsertTask(response.provision_task)
-    selectedId.value=response.server.id;showCreate.value=false;surface.value='control';tab.value='overview'
-    flash('服务器已创建，正在下载并校验服务端核心')
+    selectedId.value=response.server.id
+    if(source==='local_upload'){
+      const file=localCoreFile.value
+      if(!file)throw new Error('请选择要上传的本地 JAR 核心文件')
+      pendingCoreUploadServerId.value=response.server.id
+      const uploaded=await uploadCoreFile(response.server.id,file)
+      createdServer=uploaded.server
+      upsertServer(uploaded.server)
+      if(uploaded.provision_task)upsertTask(uploaded.provision_task)
+      pendingCoreUploadServerId.value=''
+      flash('服务器已创建，本地核心已安装并开始初始化')
+    }else{
+      flash('服务器已创建，正在从资源库下载并校验核心')
+    }
+    showCreate.value=false;surface.value='control';tab.value='overview';localCoreFile.value=null
+    creationCompleted=true
   }catch(error){flash('创建失败：'+String(error))}finally{creating.value=false}
-  if(!created)return
-  const conversation=await createConversation(created.server.id,'服务器初始化')
+  if(!createdServer||!creationCompleted)return
+  const conversation=await createConversation(createdServer.id,'服务器初始化')
   if(!conversation)flash('服务器已创建并正在初始化；初始化对话暂未建立，可稍后新建对话')
+}
+
+async function uploadCoreFile(serverId:string,file:File):Promise<{server:ServerItem;provision_task?:TaskInfo;filename:string;size:number;sha256:string}>{
+  const formData=new FormData();formData.append('file',file,file.name)
+  const response=await fetch(API_BASE+'/api/servers/'+encodeURIComponent(serverId)+'/core/upload',{method:'POST',body:formData})
+  if(!response.ok)throw new Error(await fileTransferError(response))
+  return await response.json() as {server:ServerItem;provision_task?:TaskInfo;filename:string;size:number;sha256:string}
+}
+async function retryPendingCoreUpload(){
+  const serverId=pendingCoreUploadServerId.value,file=localCoreFile.value
+  if(!serverId||!file){flash('请重新选择本地 JAR 后再重试');return}
+  creating.value=true
+  try{
+    const uploaded=await uploadCoreFile(serverId,file)
+    upsertServer(uploaded.server)
+    if(uploaded.provision_task)upsertTask(uploaded.provision_task)
+    selectedId.value=serverId;pendingCoreUploadServerId.value='';localCoreFile.value=null;showCreate.value=false;surface.value='control';tab.value='overview'
+    flash('本地核心已安装并开始初始化')
+    const conversation=await createConversation(serverId,'服务器初始化')
+    if(!conversation)flash('服务器已创建并正在初始化；初始化对话暂未建立，可稍后新建对话')
+  }catch(error){flash('核心上传失败：'+String(error))}
+  finally{creating.value=false}
 }
 async function createSmartServer(){
   if(creating.value||!createForm.value.name.trim())return;creating.value=true
@@ -1294,7 +1486,7 @@ async function selectServer(id:string){
   if(project)await loadFiles()
   else if(server.value.status!=='planning')await Promise.all([loadLogs(),fetchDownloadStatus()])
 }
-async function openMirrorPanel(){if(!selectedId.value)return;mirrorPanel.value=!mirrorPanel.value;if(!mirrorPanel.value)return;try{mirrors.value=await api('/api/download/mirrors');selectedMirrorIds.value=mirrors.value.filter(mirror=>mirror.enabled).map(mirror=>mirror.id);previewCandidates.value=[]}catch(error){flash('镜像列表加载失败：'+String(error))}}
+async function openMirrorPanel(){if(!selectedId.value)return;if(server.value.core_source==='local_upload'){flash('当前服务器使用本地上传核心');return}mirrorPanel.value=!mirrorPanel.value;if(!mirrorPanel.value)return;try{mirrors.value=await api('/api/download/mirrors');selectedMirrorIds.value=mirrors.value.filter(mirror=>mirror.enabled).map(mirror=>mirror.id);previewCandidates.value=[]}catch(error){flash('镜像列表加载失败：'+String(error))}}
 const downloadStatus=ref<DownloadStatus|null>(null)
 let downloadTimer:number|undefined
 const downloadActive=computed(()=>!!downloadStatus.value&&['resolving','downloading','verifying'].includes(downloadStatus.value.phase))
@@ -1306,7 +1498,7 @@ const downloadSummary=computed(()=>{if(downloadStatus.value)return downloadPhase
 function stopDownloadPolling(){if(downloadTimer){window.clearInterval(downloadTimer);downloadTimer=undefined}}
 function startDownloadPolling(){if(downloadTimer)return;downloadTimer=window.setInterval(async()=>{await fetchDownloadStatus(false);if(!downloadActive.value){stopDownloadPolling();await loadDashboard(false)}},1000)}
 async function fetchDownloadStatus(schedule=true){const id=selectedId.value;if(!id){downloadStatus.value=null;return}try{const data=await api('/api/servers/'+id+'/download/status');if(selectedId.value!==id)return;downloadStatus.value=data.status??null;if(schedule&&downloadActive.value)startDownloadPolling()}catch{}}
-async function startCoreDownload(){if(!selectedId.value||downloadActive.value||serverOperationState.value!=='idle')return;busy.value=true;try{const task=await api('/api/servers/'+selectedId.value+'/download/core',{method:'POST',body:JSON.stringify({mirror_ids:selectedMirrorIds.value})});if(task?.id)upsertTask(task);flash('核心下载任务已启动（资源目录优先）');await fetchDownloadStatus()}catch(error){flash('下载启动失败：'+String(error))}finally{busy.value=false}}
+async function startCoreDownload(){if(!selectedId.value||downloadActive.value||serverOperationState.value!=='idle'||server.value.core_source==='local_upload')return;busy.value=true;try{const task=await api('/api/servers/'+selectedId.value+'/download/core',{method:'POST',body:JSON.stringify({mirror_ids:selectedMirrorIds.value})});if(task?.id)upsertTask(task);flash('核心下载任务已启动（资源目录优先）');await fetchDownloadStatus()}catch(error){flash('下载启动失败：'+String(error))}finally{busy.value=false}}
 async function cancelCoreDownload(){if(!selectedId.value)return;try{await api('/api/servers/'+selectedId.value+'/download/cancel',{method:'POST'});flash('已请求取消下载')}catch(error){flash('取消失败：'+String(error))}}
 async function previewDownloads(){if(!selectedId.value||!selectedMirrorIds.value.length)return;busy.value=true;try{const data=await api('/api/download/preview',{method:'POST',body:JSON.stringify({core:server.value.core,version:server.value.version,mirror_ids:selectedMirrorIds.value})});previewCandidates.value=data.candidates;flash('已生成 '+data.candidates.length+' 个下载候选地址')}catch(error){flash('预览失败：'+String(error))}finally{busy.value=false}}
 async function retryProvision(){const id=selectedId.value;if(!id||busy.value)return;busy.value=true;try{const data=await api('/api/servers/'+id+'/provision',{method:'POST'});if(data?.server)upsertServer(data.server);const task:TaskInfo|undefined=data?.provision_task??data?.task??(data?.id?data:undefined);if(task)upsertTask(task);flash('已重新开始首次初始化');await loadDashboard(false)}catch(error){flash('初始化重试失败：'+String(error))}finally{busy.value=false}}
@@ -1367,7 +1559,19 @@ async function loadDashboardOnce(loadRelated=true){
     dashboardState.value='error';dashboardError.value=String(error);servers.value=[];tasks.value=[];selectedId.value='';selectedConversationId.value='';messages.value=[];terminal.value=[];disconnectLogStream();stopDownloadPolling()
   }
 }
-watch(()=>createForm.value.core,()=>syncCreateOptions())
+watch(()=>[createForm.value.core,createForm.value.core_source] as const,async ([core,source],[previousCore,previousSource])=>{
+  syncCreateOptions()
+  if(source!=='catalog'||!core||catalogLoading.value)return
+  const project=selectedCatalogCore.value
+  if(!project)return
+  createForm.value.core_resource_id=project.slug
+  if(core!==previousCore||source!==previousSource)await loadCoreVersions(project.slug)
+})
+watch(()=>createForm.value.version,()=>{
+  if(createForm.value.core_source!=='catalog')return
+  const first=createArtifactVersions.value[0]
+  if(first&&!createArtifactVersions.value.some(item=>item.version===createForm.value.core_resource_version))createForm.value.core_resource_version=first.version
+})
 watch(input,()=>{if(!suppressedDraftWrites)saveCurrentDraft();nextTick(resizeComposer)})
 watch(messageSearch,()=>{activeSearchMatch.value=0;nextTick(()=>stepMessageSearch(0))})
 watch(conversationDrafts,value=>{try{localStorage.setItem(DRAFT_STORAGE_KEY,JSON.stringify(value))}catch{}},{deep:true})
@@ -1500,7 +1704,7 @@ onUnmounted(()=>{document.removeEventListener('click',closeMenus);if(refreshTime
         </section>
         <section v-if="isProject" class="project-workspace"><span><FolderTree/></span><small>GENERAL PROJECT</small><h2>{{server.name}}</h2><p>这是一个通用项目目录，不包含 Minecraft 核心、插件或开服引导。你可以直接编辑文件，并通过左侧独立对话让 Codex、Claude 或其他 ACP Agent 参与开发。</p><div><button @click="tab='files';loadFiles()"><Files/>打开文件</button><button @click="createConversation(selectedId)"><MessageSquareText/>新建对话</button></div></section>
         <section v-else-if="server.status==='planning'" class="planning-workspace"><span><BrainCircuit/></span><small>PLANNING WORKSPACE</small><h2>服务器尚在规划阶段</h2><p>当前只创建了用于迁移与接手的 sculk.yml 标识，还没有下载核心或生成服务端配置。确认方案后会创建受审计的开服任务；{{reviewMode==='full'?'当前为完全访问权限，任务会立即下载、写入和启动。':'在当前审核模式下，任务获批后才会下载、写入和启动。'}}</p><div class="planning-actions"><button @click="send('请根据我的需求推荐合适的服务端核心，并说明取舍')"><Sparkles/>继续规划</button><button class="next" :disabled="chatBusy||conversationSelectionPending||conversationCreationPending" @click="send('开始创建服务器')"><Play/>按当前方案创建</button><button class="discard" @click="openDeleteServer(server)"><Trash2/>删除此规划</button></div></section>
-        <section v-else class="server-hero"><div><span class="big-icon"><Server/></span><p><b>{{server.name}} <em :class="[server.status,serverOperationState]">{{serverStatusLabel}}</em></b><small>{{server.core}} {{server.version}} · {{systemState==='ready'?(systemInfo?.java_version||'未安装 Java'):'Java 状态未知'}} · 内存 {{serverMemoryLimit}} GB · 端口 {{server.port}}</small></p></div><aside><button :class="{active:mirrorPanel}" :disabled="serverTransitioning" @click="openMirrorPanel"><Download/>核心</button><button :disabled="serverOperationState==='provisioning'" @click="openProperties"><Settings/>配置</button><button @click="openServiceSettings"><SlidersHorizontal/>服务设置</button><button v-if="server.status==='online'" :disabled="busy||serverTransitioning||!serverCoreReady||!javaReady||provisionActive" @click="restartServer"><RotateCw/>重启</button><button :disabled="serverControlDisabled" :class="server.status==='online'?'stop':'start'" @click="toggleServer"><LoaderCircle v-if="serverTransitioning" class="spin"/><CircleStop v-else-if="server.status==='online'"/><Play v-else/>{{serverOperationLabel|| (server.status==='online'?'停止服务器':'启动服务器')}}</button></aside></section>
+        <section v-else class="server-hero"><div><span class="big-icon"><Server/></span><p><b>{{server.name}} <em :class="[server.status,serverOperationState]">{{serverStatusLabel}}</em></b><small>{{server.core}} {{server.version}} · {{systemState==='ready'?(systemInfo?.java_version||'未安装 Java'):'Java 状态未知'}} · 内存 {{serverMemoryLimit}} GB · 端口 {{server.port}}</small></p></div><aside><button v-if="server.core_source!=='local_upload'" :class="{active:mirrorPanel}" :disabled="serverTransitioning" @click="openMirrorPanel"><Download/>核心</button><button :disabled="serverOperationState==='provisioning'" @click="openProperties"><Settings/>配置</button><button @click="openServiceSettings"><SlidersHorizontal/>服务设置</button><button v-if="server.status==='online'" :disabled="busy||serverTransitioning||!serverCoreReady||!javaReady||provisionActive" @click="restartServer"><RotateCw/>重启</button><button :disabled="serverControlDisabled" :class="server.status==='online'?'stop':'start'" @click="toggleServer"><LoaderCircle v-if="serverTransitioning" class="spin"/><CircleStop v-else-if="server.status==='online'"/><Play v-else/>{{serverOperationLabel|| (server.status==='online'?'停止服务器':'启动服务器')}}</button></aside></section>
         <section v-if="!isProject" class="card lifecycle-card">
           <header><p><small>服务器生命周期</small><b>当前处于{{lifecyclePhase.label}}阶段</b></p><nav><button v-if="lifecyclePhase.key==='build'" :disabled="lifecycleSaving" @click="setLifecyclePhase('operate')"><Play/>进入运营</button><button v-else-if="lifecyclePhase.key==='operate'" :disabled="lifecycleSaving" @click="setLifecyclePhase('build')"><RotateCcw/>返回建设</button><button @click="openServiceSettings"><SlidersHorizontal/>服务设置</button></nav></header>
           <div class="lifecycle-track"><span v-for="stage in lifecycleStages" :key="stage.key" :class="lifecycleStageClass(stage.key)"><i><Check v-if="lifecycleStageClass(stage.key).done"/><em v-else/></i><b>{{stage.label}}</b></span></div>
@@ -1524,9 +1728,14 @@ onUnmounted(()=>{document.removeEventListener('click',closeMenus);if(refreshTime
           <footer><button @click="closeServiceSettings">取消</button><button class="primary" :disabled="serviceSettingsSaving" @click="saveServiceSettings"><LoaderCircle v-if="serviceSettingsSaving" class="spin"/><Check v-else/>保存设置</button></footer>
         </section>
         <section v-if="!isProject&&server.status!=='planning'&&(server.last_error||(server.status!=='online'&&serverStartBlocker))" class="server-blocker" :class="{error:!!server.last_error}"><AlertTriangle/><p><b>{{provisionFailed?'首次初始化未完成':server.last_error?'上次运行未正常完成':'当前还不能启动'}}</b><small>{{provisionFailed&&serverCoreReady?`${serverStartBlocker}${server.last_error?'：'+server.last_error:''}`:server.last_error||serverStartBlocker}}</small></p><button v-if="server.last_error&&!provisionFailed" @click="tab='terminal'"><SquareTerminal/>查看终端</button></section>
+        <section v-if="!isProject&&server.status!=='planning'&&server.core_source==='local_upload'&&!serverCoreReady&&!provisionActive" class="card bootstrap-card provision-card">
+          <header><p><small>本地核心</small><b>上传服务端 JAR 后继续初始化</b></p><span>等待上传</span></header>
+          <p class="provision-incomplete"><FileUp/>请选择已准备好的服务端 JAR；上传后会校验文件结构并继续完成环境初始化。</p>
+          <footer><p>仅接受 .jar 文件，最大 256 MiB</p><span><button :disabled="busy||serverOperationState!=='idle'" @click="choosePendingCoreUpload"><FileUp/>上传核心</button><input ref="pendingCoreUploadInput" type="file" accept=".jar,application/java-archive" style="display:none" @change="handlePendingCoreUpload"/></span></footer>
+        </section>
         <section v-if="!isProject&&server.status!=='planning'" class="metrics"><div><span class="cyan"><Users/></span><p><small>在线玩家</small><b>{{playerTelemetryValue}}</b><em>{{playerTelemetryDetail}}</em></p></div><div><span class="purple"><Cpu/></span><p><small>CPU 使用率</small><b>{{server.cpu}}%</b><em>受管进程采样值</em></p></div><div><span class="green"><Database/></span><p><small>进程内存</small><b>{{formatRuntimeMemory(server.memory)}}</b><em>RSS · 上限 {{serverMemoryLimit}} GB</em></p></div><div><span class="orange"><Gauge/></span><p><small>TPS / MSPT</small><b>{{tpsTelemetryValue}}</b><em>{{tpsTelemetryDetail}}</em></p></div><div><span class="orange"><Activity/></span><p><small>监听端口</small><b>{{server.port}}</b><em>{{server.status==='online'?'服务器运行中':'服务器未运行'}}</em></p></div></section>
         <section v-if="!isProject&&server.status!=='planning'&&bootstrapTask" class="card bootstrap-card provision-card" :class="bootstrapTask.status">
-          <header><p><small>首次初始化</small><b>{{server.core}} {{server.version}} · 下载、校验并安装核心</b></p><span>{{bootstrapTask.progress}}%</span></header>
+          <header><p><small>首次初始化</small><b>{{server.core}} {{server.version}} · {{server.core_source==='local_upload'?'校验并安装本地核心':'下载、校验并安装核心'}}</b></p><span>{{bootstrapTask.progress}}%</span></header>
           <div class="bootstrap-progress"><i :style="{width:bootstrapTask.progress+'%'}"/></div>
           <div v-if="bootstrapTask.events?.length" class="provision-events"><p v-for="(event,index) in bootstrapTask.events.slice(-3)" :key="`${event.at}-${index}`" :class="event.level"><i/>{{event.message}}</p></div>
           <p v-if="bootstrapTask.error||(provisionFailed&&server.last_error)" class="provision-error"><AlertTriangle/>{{bootstrapTask.error||server.last_error}}</p>
@@ -1612,13 +1821,22 @@ onUnmounted(()=>{document.removeEventListener('click',closeMenus);if(refreshTime
           <div class="location-preview wide"><MapPin/><p><b>{{selectedLocationLabel}}</b><small>服务器项目会使用独立目录；智能创建阶段只写入可迁移的 sculk.yml 标识，不下载核心。</small></p></div>
           <div class="portable-template-import wide"><FileUp/><p><b>载入便携配置</b><small>支持开放的 Sculk JSON 参数模板；导入只填充向导，不会创建文件或继承 EULA。</small></p><button @click="manifestInput?.click()">选择配置文件</button><input ref="manifestInput" type="file" accept="application/json,.json" @change="importServerTemplate"/></div>
           <div class="creation-mode wide"><article><span><FolderTree/></span><p><b>普通创建</b><small>继续选择核心、版本、内存和端口，完成环境检查后创建工作区。</small></p><button :disabled="!createForm.name.trim()" @click="createStep=2">继续配置<ChevronRight/></button></article><article class="smart"><span><BrainCircuit/></span><p><b>智能创建</b><small>先创建可迁移的 sculk.yml 标识，不预设或下载核心；随后通过独立对话完成选型与部署。</small></p><button :disabled="!createForm.name.trim()||creating" @click="createSmartServer"><LoaderCircle v-if="creating" class="spin"/><Sparkles v-else/>进入智能规划</button></article></div>
-        </main>
-        <main v-else-if="createStep===2" class="wizard-page">
-          <div class="field"><label>服务端核心</label><select v-model="createForm.core" :disabled="!availableCores.length"><option v-if="createForm.core&&!availableCores.includes(createForm.core)" :value="createForm.core" disabled>{{createForm.core}}（当前目录不可用）</option><option v-if="!availableCores.length" value="">核心目录不可用</option><option v-for="core in availableCores" :key="core">{{core}}</option></select></div>
-          <div class="field"><label>Minecraft 版本</label><select v-model="createForm.version" :disabled="!createMinecraftVersions.length"><option v-if="createForm.version&&!createMinecraftVersions.includes(createForm.version)" :value="createForm.version" disabled>{{createForm.version}}（当前核心不支持）</option><option v-if="!createMinecraftVersions.length" value="">版本目录不可用</option><option v-for="version in createMinecraftVersions" :key="version">{{version}}</option></select></div>
-          <div class="field"><label>最大内存</label><div class="input-unit"><input v-model.number="createForm.memory_gb" type="number" min="2" :max="Math.max(2,reasonableMemoryMax)" step="1"/><span>GB</span></div><small v-if="memoryIssue" class="field-error">{{memoryIssue}}</small><small v-else-if="totalMemoryGb!==null" class="field-hint">检测到 {{totalMemoryGb.toFixed(1)}} GB，总分配上限 {{reasonableMemoryMax}} GB</small></div>
-          <div class="field"><label>服务器端口</label><input v-model.number="createForm.port" type="number" min="1024" max="65535" step="1"/><small v-if="portIssue" class="field-error">{{portIssue}}</small></div>
-          <div class="core-note wide"><Sparkles/><p><b>{{importedTemplateTitle?`已载入模板：${importedTemplateTitle}`:'参数只用于普通创建'}}</b><small>{{importedTemplateTitle?'模板仍需通过本机目录、端口和资源检查；不兼容参数不会被静默替换。':'核心选择不再硬编码推荐。智能创建会在对话中结合玩法、插件生态和维护成本给出选型建议。'}}</small></p></div>
+         </main>
+         <main v-else-if="createStep===2" class="wizard-page">
+           <div class="core-source-switch wide"><button type="button" :class="{active:createForm.core_source==='catalog'}" @click="setCreateCoreSource('catalog')"><Database/>资源库核心</button><button type="button" :class="{active:createForm.core_source==='local_upload'}" @click="setCreateCoreSource('local_upload')"><FileUp/>本地上传 JAR</button></div>
+           <template v-if="createForm.core_source==='catalog'">
+             <div class="field"><label>服务端核心</label><select v-model="createForm.core" :disabled="catalogLoading||!availableCores.length"><option v-if="!availableCores.length" value="">{{catalogLoading?'正在加载资源库…':'资源库暂无核心'}}</option><option v-for="core in availableCores" :key="core" :value="core">{{core}}</option></select></div>
+             <div class="field"><label>Minecraft 版本</label><select v-model="createForm.version" :disabled="catalogVersionsLoading||!createMinecraftVersions.length"><option v-if="!createMinecraftVersions.length" value="">{{catalogVersionsLoading?'正在加载版本…':'暂无可用版本'}}</option><option v-for="version in createMinecraftVersions" :key="version" :value="version">{{version}}</option></select></div>
+             <div class="field wide"><label>资源库核心构建</label><select v-model="createForm.core_resource_version" :disabled="!createArtifactVersions.length"><option v-if="!createArtifactVersions.length" value="">暂无已发布构建</option><option v-for="artifact in createArtifactVersions" :key="artifact.id" :value="artifact.version">{{artifact.version}} · {{artifact.filename}}</option></select><small v-if="catalogError" class="field-hint">{{catalogError}}</small><small v-else class="field-hint">{{catalogOrigin==='resource'?'已连接远程资源库':'使用本机资源目录缓存'}}；创建时会固定该构建并校验 SHA-256。</small></div>
+           </template>
+           <template v-else>
+             <div class="field"><label>服务端核心名称</label><input v-model="createForm.core" maxlength="64" placeholder="例如：Paper、Leaves 或自定义核心"/></div>
+             <div class="field"><label>Minecraft 版本</label><input v-model="createForm.version" maxlength="64" placeholder="例如：1.21.4"/></div>
+             <div class="core-upload-box wide" :class="{selected:!!localCoreFile}" @click="chooseCoreUpload"><FileUp/><p><b>{{localCoreFile?.name||'选择本地服务端 JAR'}}</b><small>{{localCoreFile?`${(localCoreFile.size/1048576).toFixed(1)} MB · 上传后会先校验 ZIP/JAR 结构`:'只接受 .jar 文件，最大 256 MiB'}}</small></p><button type="button" @click.stop="chooseCoreUpload">选择文件</button><input ref="coreUploadInput" type="file" accept=".jar,application/java-archive" style="display:none" @change="handleCoreUpload"/></div>
+           </template>
+           <div class="field"><label>最大内存</label><div class="input-unit"><input v-model.number="createForm.memory_gb" type="number" min="2" :max="Math.max(2,reasonableMemoryMax)" step="1"/><span>GB</span></div><small v-if="memoryIssue" class="field-error">{{memoryIssue}}</small><small v-else-if="totalMemoryGb!==null" class="field-hint">检测到 {{totalMemoryGb.toFixed(1)}} GB，总分配上限 {{reasonableMemoryMax}} GB</small></div>
+           <div class="field"><label>服务器端口</label><input v-model.number="createForm.port" type="number" min="1024" max="65535" step="1"/><small v-if="portIssue" class="field-error">{{portIssue}}</small></div>
+           <div class="core-note wide"><Sparkles/><p><b>{{importedTemplateTitle?`已载入模板：${importedTemplateTitle}`:createForm.core_source==='catalog'?'核心来自资源库':'核心来自本地上传'}}</b><small>{{importedTemplateTitle?'模板仍需通过本机目录、端口和资源检查；不兼容参数不会被静默替换。':createForm.core_source==='catalog'?'选择具体构建后，后台会按资源库元数据下载并校验。':'本地 JAR 只会写入受管服务器目录，并在初始化任务中复用。'}}</small></p></div>
         </main>
         <main v-else-if="createStep===3" class="wizard-page environment-page">
           <div v-if="systemState==='loading'" class="environment-loading"><LoaderCircle class="spin"/>正在向后端查询环境…</div>
@@ -1632,11 +1850,11 @@ onUnmounted(()=>{document.removeEventListener('click',closeMenus);if(refreshTime
           <div class="environment-summary" :class="{blocked:!!environmentIssue,unknown:!environmentIssue&&environmentUnknown}"><ShieldCheck/><p><b>{{environmentIssue?'环境检查尚未通过':environmentUnknown?'基础检查通过，部分资源信息未知':'环境检查已通过'}}</b><small>{{environmentIssue||(environmentUnknown?'Java 与目录检查已通过；后端未返回完整磁盘或内存信息，因此不标记为全部正常。':'数据目录、Java 与资源条件满足普通创建要求。')}}</small></p></div>
         </main>
         <main v-else class="wizard-page review-page">
-          <div class="review-server"><span><Server/></span><p><b>{{createForm.name}}</b><small>{{createForm.core}} {{createForm.version}} · {{systemInfo?.java_version}}（兼容）</small></p></div>
-          <dl><div><dt>服务器位置</dt><dd>本机默认数据目录</dd></div><div><dt>内存限制</dt><dd>{{createForm.memory_gb}} GB</dd></div><div><dt>监听端口</dt><dd>{{createForm.port}}</dd></div><div><dt>初始状态</dt><dd>停止 · 等待核心下载</dd></div></dl>
+           <div class="review-server"><span><Server/></span><p><b>{{createForm.name}}</b><small>{{createForm.core}} {{createForm.version}}<template v-if="createForm.core_source==='catalog'&&createForm.core_resource_version"> · 构建 {{createForm.core_resource_version}}</template> · {{systemInfo?.java_version}}（兼容）</small></p></div>
+           <dl><div><dt>服务器位置</dt><dd>本机默认数据目录</dd></div><div><dt>内存限制</dt><dd>{{createForm.memory_gb}} GB</dd></div><div><dt>监听端口</dt><dd>{{createForm.port}}</dd></div><div><dt>初始状态</dt><dd>停止 · {{createForm.core_source==='catalog'?'等待资源库下载':'等待本地核心校验'}}</dd></div></dl>
           <label class="eula-check"><input v-model="createForm.eula_accepted" type="checkbox"/><span>我已阅读并同意 Minecraft EULA，允许工具生成 <code>eula=true</code></span></label>
         </main>
-        <footer><button class="back" :disabled="createStep===1||creating" @click="createStep--">上一步</button><button v-if="createStep===1" class="next" :disabled="!createForm.name.trim()" @click="createStep=2">普通创建<ChevronRight/></button><button v-else-if="createStep<4" class="next" :disabled="createStep===2?!!parameterIssue:!!environmentIssue" @click="advanceCreateStep">继续<ChevronRight/></button><button v-else class="next" :disabled="!createForm.eula_accepted||creating||!!parameterIssue||!!environmentIssue" @click="createNewServer"><LoaderCircle v-if="creating" class="spin"/><Plus v-else/>创建服务器</button></footer>
+         <footer><button class="back" :disabled="createStep===1||creating" @click="createStep--">上一步</button><button v-if="createStep===1" class="next" :disabled="!createForm.name.trim()" @click="createStep=2">普通创建<ChevronRight/></button><button v-else-if="createStep<4" class="next" :disabled="createStep===2?!!parameterIssue:!!environmentIssue" @click="advanceCreateStep">继续<ChevronRight/></button><button v-else class="next" :disabled="!createForm.eula_accepted||creating||!!parameterIssue||!!environmentIssue" @click="createNewServer"><LoaderCircle v-if="creating" class="spin"/><Plus v-else/>{{pendingCoreUploadServerId?'重试上传并初始化':'创建服务器'}}</button></footer>
       </section>
     </div>
 
@@ -1731,7 +1949,7 @@ onUnmounted(()=>{document.removeEventListener('click',closeMenus);if(refreshTime
 .server-blocker{display:flex;align-items:center;gap:10px;margin-top:10px;padding:11px 13px;border:1px solid rgba(243,167,92,.18);border-radius:9px;color:#d7a36d;background:rgba(243,167,92,.055)}.server-blocker.error{border-color:rgba(226,92,101,.2);color:#df7d83;background:rgba(226,92,101,.055)}.server-blocker>svg{width:16px;flex:none}.server-blocker p{display:flex;min-width:0;flex:1;flex-direction:column;margin:0}.server-blocker b{font-size:9px}.server-blocker small{margin-top:4px;font-size:8px;line-height:1.5}.server-blocker button{height:28px;display:flex;align-items:center;gap:5px;padding:0 9px;border:1px solid currentColor;border-radius:6px;color:inherit;background:transparent;font-size:8px}.server-blocker button svg{width:12px}.server-hero p em.provisioning,.server-hero p em.starting,.server-hero p em.stopping{color:#f2b579;background:rgba(243,167,92,.1)}.provision-card.cancelled,.provision-card.interrupted,.provision-card.rollback_failed{border-color:rgba(255,107,114,.2)}.provision-card>footer>span{display:flex;align-items:center;gap:6px}.provision-events{display:grid;gap:5px;margin-top:10px;padding-top:9px;border-top:1px solid rgba(255,255,255,.05)}.provision-events p{display:flex;align-items:flex-start;gap:6px;margin:0;color:#71808c;font-size:8px;line-height:1.5}.provision-events i{width:5px;height:5px;flex:none;margin-top:4px;border-radius:50%;background:#4b8f80}.provision-events p.warn i{background:#d99b59}.provision-events p.error{color:#d98388}.provision-events p.error i{background:#d95f67}.provision-error,.provision-incomplete{display:flex;align-items:flex-start;gap:7px;margin:10px 0 0;padding:9px;border-radius:7px;color:#e18a8f;background:rgba(226,92,101,.06);font-size:8px;line-height:1.55}.provision-incomplete{color:#d9a56d;background:rgba(243,167,92,.06)}.provision-error svg,.provision-incomplete svg{width:13px;flex:none}.terminal-view input:disabled{opacity:.55;cursor:not-allowed}.terminal-view form button:disabled{cursor:not-allowed}
 .lifecycle-card{margin-top:10px;padding:15px 16px;background:linear-gradient(135deg,rgba(50,213,176,.055),rgba(156,140,255,.035)),#11171d}.lifecycle-card>header{display:flex;align-items:center;justify-content:space-between}.lifecycle-card>header p{display:flex;flex-direction:column;margin:0}.lifecycle-card>header small{color:#6f7d89;font-size:10px}.lifecycle-card>header b{margin-top:4px;font-size:13px}.lifecycle-card>header nav{display:flex;align-items:center;gap:7px}.lifecycle-card>header nav button,.service-settings-card>header button{height:31px;display:flex;align-items:center;gap:6px;padding:0 10px;border:1px solid rgba(50,213,176,.18);border-radius:7px;color:#91dfcc;background:rgba(50,213,176,.06);font-size:10px}.lifecycle-card>header nav button:disabled{opacity:.45}.lifecycle-card>header nav button svg,.service-settings-card>header button svg{width:14px}.lifecycle-track{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:15px}.lifecycle-track>span{position:relative;display:flex;align-items:center;gap:8px;padding:10px;border:1px solid rgba(255,255,255,.065);border-radius:8px;color:#697682;background:rgba(255,255,255,.018)}.lifecycle-track>span:after{position:absolute;right:-9px;width:9px;height:1px;background:rgba(255,255,255,.09);content:''}.lifecycle-track>span:last-child:after{display:none}.lifecycle-track>span>i{width:20px;height:20px;display:grid;place-items:center;border:1px solid rgba(255,255,255,.12);border-radius:50%}.lifecycle-track>span>i em{width:6px;height:6px;border-radius:50%;background:#5b6671}.lifecycle-track>span>i svg{width:11px}.lifecycle-track>span b{font-size:11px}.lifecycle-track>span.active{border-color:rgba(50,213,176,.24);color:#c8f4e9;background:rgba(50,213,176,.07)}.lifecycle-track>span.active>i{border-color:#32d5b0}.lifecycle-track>span.active>i em{background:#32d5b0;box-shadow:0 0 8px rgba(50,213,176,.55)}.lifecycle-track>span.done{color:#85cdbc}.lifecycle-track>span.done>i{color:#32d5b0;border-color:rgba(50,213,176,.26);background:rgba(50,213,176,.08)}.lifecycle-detail{margin:12px 0 0;color:#b8c3cc;font-size:11px}.lifecycle-card>small{display:block;margin-top:6px;color:#6e7a86;font-size:10px;line-height:1.55}
 .service-settings-card{margin-top:10px;padding:16px;border-color:rgba(50,213,176,.16)}.service-settings-card>header{display:flex;align-items:center;justify-content:space-between}.service-settings-card>header p{display:flex;flex-direction:column;margin:0}.service-settings-card>header small{color:#6d7985;font-size:10px}.service-settings-card>header b{margin-top:4px;font-size:14px}.service-settings-card>header button{width:31px;padding:0;justify-content:center;border-color:rgba(255,255,255,.08);color:#73808c;background:transparent}.service-settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:14px}.service-settings-grid>label{display:flex;align-items:flex-start;gap:9px;padding:11px;border:1px solid rgba(255,255,255,.07);border-radius:8px;background:#0e1419;cursor:pointer}.service-settings-grid input,.social-service-settings input{accent-color:#32d5b0}.service-settings-grid>label>input{margin-top:3px}.service-settings-grid span{display:flex;min-width:0;flex-direction:column}.service-settings-grid b{font-size:11px}.service-settings-grid small{margin-top:5px;color:#6e7a86;font-size:10px;line-height:1.45}.social-service-settings{margin-top:10px;padding:13px;border:1px solid rgba(156,140,255,.14);border-radius:9px;background:rgba(156,140,255,.035)}.service-channel-row{display:flex;align-items:center;gap:14px;color:#87939e;font-size:10px}.service-channel-row>b{margin-right:auto;color:#b9c4cd;font-size:11px}.service-channel-row label{display:flex;align-items:center;gap:5px}.service-frequency-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}.service-frequency-grid label{display:grid;grid-template-columns:1fr 68px auto;align-items:center;gap:6px;color:#788591;font-size:10px}.service-frequency-grid input{width:100%;height:30px;padding:0 7px;border:1px solid rgba(255,255,255,.08);border-radius:6px;outline:0;color:#dbe4ea;background:#0d1217}.service-frequency-grid input:focus{border-color:rgba(50,213,176,.35)}.service-frequency-grid em{font:normal 9px Inter}.social-service-settings>p{margin:10px 0 0;color:#737f8b;font-size:10px;line-height:1.55}.service-settings-card>footer{display:flex;justify-content:flex-end;gap:8px;margin-top:14px;padding-top:12px;border-top:1px solid rgba(255,255,255,.06)}.service-settings-card>footer button{height:32px;display:flex;align-items:center;gap:5px;padding:0 12px;border:1px solid rgba(255,255,255,.08);border-radius:7px;color:#87939e;background:#141a20;font-size:10px}.service-settings-card>footer button.primary{border:0;color:#06251e;background:#32d5b0;font-weight:700}.service-settings-card>footer button:disabled{opacity:.45}.service-settings-card>footer svg{width:13px}
-.field-error,.field-hint{font-size:8px;line-height:1.45}.field-error{color:#e27c82}.field-hint{color:#64717e}.create-modal{max-height:calc(100vh - 40px);display:flex;flex-direction:column}.create-modal>.wizard-page{overflow-y:auto}.environment-loading{display:flex;align-items:center;gap:8px;padding:10px 12px;border:1px solid rgba(156,140,255,.14);border-radius:8px;color:#9f95de;background:rgba(156,140,255,.045);font-size:9px}.environment-loading>svg{width:16px}.environment-loading.error{border-color:rgba(226,92,101,.18);color:#df7c82;background:rgba(226,92,101,.04)}.environment-loading.error span{display:flex;flex:1;flex-direction:column}.environment-loading.error b{font-size:9px}.environment-loading.error small{margin-top:3px;color:#8a666a;font-size:8px}.environment-loading button{height:26px;padding:0 9px;border:1px solid rgba(226,92,101,.2);border-radius:6px;color:#e59a9e;background:rgba(226,92,101,.06);font-size:8px}
+ .core-source-switch{display:grid;grid-template-columns:1fr 1fr;gap:7px}.core-source-switch button{height:38px;display:flex;align-items:center;justify-content:center;gap:7px;border:1px solid rgba(255,255,255,.09);border-radius:7px;color:#8995a0;background:#121820;font-size:9px}.core-source-switch button svg{width:15px}.core-source-switch button.active{border-color:rgba(50,213,176,.35);color:#a8eddd;background:rgba(50,213,176,.08)}.core-upload-box{display:flex;align-items:center;gap:10px;padding:12px;border:1px dashed rgba(50,213,176,.22);border-radius:8px;color:#32d5b0;background:rgba(50,213,176,.035);cursor:pointer}.core-upload-box.selected{border-style:solid;background:rgba(50,213,176,.075)}.core-upload-box>svg{width:20px;flex:none}.core-upload-box p{display:flex;min-width:0;flex:1;flex-direction:column;margin:0}.core-upload-box b{overflow:hidden;color:#bcefe3;font-size:9px;text-overflow:ellipsis;white-space:nowrap}.core-upload-box small{margin-top:4px;color:#6e8985;font-size:8px}.core-upload-box button{height:28px;display:flex;align-items:center;gap:5px;padding:0 9px;border:1px solid rgba(50,213,176,.22);border-radius:6px;color:#9ce8d8;background:rgba(50,213,176,.07);font-size:8px;white-space:nowrap}.field-error,.field-hint{font-size:8px;line-height:1.45}.field-error{color:#e27c82}.field-hint{color:#64717e}.create-modal{max-height:calc(100vh - 40px);display:flex;flex-direction:column}.create-modal>.wizard-page{overflow-y:auto}.environment-loading{display:flex;align-items:center;gap:8px;padding:10px 12px;border:1px solid rgba(156,140,255,.14);border-radius:8px;color:#9f95de;background:rgba(156,140,255,.045);font-size:9px}.environment-loading>svg{width:16px}.environment-loading.error{border-color:rgba(226,92,101,.18);color:#df7c82;background:rgba(226,92,101,.04)}.environment-loading.error span{display:flex;flex:1;flex-direction:column}.environment-loading.error b{font-size:9px}.environment-loading.error small{margin-top:3px;color:#8a666a;font-size:8px}.environment-loading button{height:26px;padding:0 9px;border:1px solid rgba(226,92,101,.2);border-radius:6px;color:#e59a9e;background:rgba(226,92,101,.06);font-size:8px}
 .environment-card.error{border-color:rgba(226,92,101,.2);background:rgba(226,92,101,.045)}.environment-card.error>span{color:#e47178;background:rgba(226,92,101,.09)}.environment-card.error em{color:#e78389}.environment-card.unknown{border-color:rgba(255,255,255,.08);background:rgba(255,255,255,.02)}.environment-card.unknown>span{color:#707c88;background:rgba(255,255,255,.045)}.environment-card.unknown em{color:#697581}.environment-card.info:not(.unknown){border-color:rgba(156,140,255,.14);background:rgba(156,140,255,.04)}.environment-card.info:not(.unknown)>span{color:#9c8cff;background:rgba(156,140,255,.08)}.environment-card.info:not(.unknown) em{color:#9c91dc}.environment-actions{display:flex;align-items:flex-end;flex-direction:column;gap:7px}.environment-actions button{height:27px;display:flex;align-items:center;gap:5px;padding:0 9px;border:1px solid rgba(243,167,92,.2);border-radius:6px;color:#f0b477;background:rgba(243,167,92,.07);font-size:8px}.environment-actions button:disabled{opacity:.55;cursor:wait}.environment-actions button svg{width:12px}.install-result{padding:9px 12px;border-radius:7px;font-size:8px}.install-result.success{color:#71ceb6;background:rgba(50,213,176,.065)}.install-result.error{color:#e78389;background:rgba(226,92,101,.065)}.environment-summary.blocked>svg{color:#d87980}.environment-summary.blocked b{color:#d99ca0}.environment-summary.unknown>svg{color:#77838f}.environment-summary.unknown b{color:#9aa5b0}
 .action-modal{width:min(440px,calc(100vw - 40px));overflow:hidden;border:1px solid rgba(255,255,255,.1);border-radius:13px;background:#12171d;box-shadow:0 28px 80px rgba(0,0,0,.55)}.action-modal>header{height:66px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;border-bottom:1px solid rgba(255,255,255,.07)}.action-modal>header small{color:#5f6b77;font-size:7px;font-weight:700;letter-spacing:.13em}.action-modal>header h2{margin:5px 0 0;font-size:15px}.action-modal>header>button{width:28px;height:28px;display:grid;place-items:center;border:0;border-radius:6px;color:#77838f;background:transparent}.action-modal>header svg{width:15px}.action-modal>main{display:flex;flex-direction:column;gap:13px;padding:20px}.action-modal>footer{height:58px;display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:0 20px;border-top:1px solid rgba(255,255,255,.07);background:#10151b}.action-modal>footer button{height:32px;padding:0 12px;border-radius:7px;font-size:8px;font-weight:650}.action-modal .back{border:1px solid rgba(255,255,255,.08);color:#84909b;background:#161c23}.action-modal .next{border:0;color:#07251e;background:#32d5b0}.action-modal .next.danger{color:#fff;background:#c9575e}.action-modal button:disabled{opacity:.38}.danger-copy{display:flex;align-items:flex-start;gap:12px;padding:13px;border:1px solid rgba(226,92,101,.16);border-radius:9px;color:#e37178;background:rgba(226,92,101,.055)}.danger-copy>svg{width:19px;flex:none}.danger-copy p{display:flex;flex-direction:column;margin:0}.danger-copy b{color:#e6b7ba;font-size:10px}.danger-copy small{margin-top:5px;color:#7f6c70;font-size:8px;line-height:1.6}.danger-copy code{color:#ffb3b7}.danger-copy.critical{border-color:rgba(226,92,101,.28);background:rgba(226,92,101,.08)}.delete-files-check{display:flex;align-items:flex-start;gap:9px;padding:12px;border-radius:9px;background:#0e1318;color:#7c8793}.delete-files-check input{margin-top:2px;accent-color:#d75b63}.delete-files-check span{display:flex;flex-direction:column}.delete-files-check b{font-size:9px}.delete-files-check small{margin-top:4px;color:#606b76;font-size:7px;line-height:1.55}
 @media(max-width:700px){.creation-mode,.service-settings-grid,.service-frequency-grid{grid-template-columns:1fr}.wizard-steps{grid-template-columns:repeat(4,1fr)}.server-blocker{align-items:flex-start;flex-wrap:wrap}.server-blocker button{margin-left:26px}.provision-card>footer{align-items:flex-start;flex-direction:column;gap:9px}.provision-card>footer>span{flex-wrap:wrap}.service-channel-row{align-items:flex-start;flex-wrap:wrap}.service-channel-row>b{width:100%}.lifecycle-card>header{align-items:flex-start;flex-direction:column;gap:10px}.lifecycle-card>header nav{width:100%;flex-wrap:wrap}.lifecycle-track{gap:4px}.lifecycle-track>span{justify-content:center;padding:8px 4px}.lifecycle-track>span>i{display:none}}

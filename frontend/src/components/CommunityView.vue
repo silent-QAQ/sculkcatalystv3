@@ -35,7 +35,7 @@ interface PlayerListItem {
 
 interface Item {
   id: string
-  count: number
+  count: number | null
   slot?: number
   name?: string | null
   lore: string[]
@@ -56,7 +56,8 @@ interface Inventory {
 interface PlayerProfile extends PlayerListItem {
   note?: string | null
   tags: string[]
-  snapshot_available: boolean
+  inventory_available: boolean
+  ender_chest_available: boolean
   inventory: Inventory
   ender_chest: Inventory
 }
@@ -66,6 +67,9 @@ interface PlayerSource {
   available: boolean
   label: string
   detail: string
+  freshness: string
+  bridge_connected: boolean
+  fallback_reason?: string | null
 }
 
 interface PapiField {
@@ -106,9 +110,19 @@ interface RawInventory {
   slots?: RawInventorySlot[]
 }
 
+interface RawPlayerDataSource {
+  kind: string
+  available: boolean
+  world?: string | null
+  detail?: string
+  freshness?: string
+  bridge_connected?: boolean
+  fallback_reason?: string | null
+}
+
 interface RawPlayerItem {
   id: string
-  count?: number
+  count?: number | null
   name?: string | null
   lore?: string[]
   container?: {
@@ -124,7 +138,8 @@ interface RawPlayerRecord {
   name: string
   profile?: RawPlayerProfile
   status: string
-  source: string
+  source?: string
+  data_source?: string
   level?: number | null
   dimension?: string | null
   position?: RawPlayerPosition | null
@@ -141,19 +156,16 @@ interface RawPlayerDetail extends RawPlayerRecord {
 }
 
 interface RawPlayerListResponse {
-  source: {
-    kind: string
-    available: boolean
-    world?: string | null
-    detail?: string
-  }
+  source?: RawPlayerDataSource
+  data_source?: RawPlayerDataSource
   players: RawPlayerRecord[]
   total: number
 }
 
 interface RawPlayerDetailResponse {
   player: RawPlayerDetail
-  source: RawPlayerListResponse['source']
+  source?: RawPlayerDataSource
+  data_source?: RawPlayerDataSource
 }
 
 interface RawPapiFieldsResponse {
@@ -263,12 +275,13 @@ let playerRequest = 0
 let profileRequest = 0
 let papiRequest = 0
 let queryTimer: ReturnType<typeof setTimeout> | undefined
+let containerPreviewTimer: ReturnType<typeof setTimeout> | undefined
 
 const onlinePlayers = computed(() => players.value.filter((player) => player.status === 'online').length)
 const enabledPapiFieldCount = computed(() => papiFields.value.filter((field) => field.enabled).length)
 const serverFeedback = computed(() => feedback.value.filter((item) => item.server_id === props.serverId))
 const serverPolls = computed(() => polls.value.filter((poll) => poll.server_id === props.serverId))
-const activeContainerPreview = computed(() => pinnedContainer.value ?? hoveredContainer.value)
+const activeContainerPreview = computed(() => hoveredContainer.value ?? pinnedContainer.value)
 const inventoryCells = computed(() => toInventoryGrid(profile.value?.inventory, 36))
 const equipmentCells = computed(() => toEquipmentGrid(profile.value?.inventory))
 const enderChestCells = computed(() => toInventoryGrid(profile.value?.ender_chest, 27))
@@ -281,18 +294,34 @@ function cloneFields(fields: PapiField[]) {
   return fields.map((field) => ({ ...field }))
 }
 
-function normalizeSource(value: RawPlayerListResponse['source'] | null | undefined): PlayerSource | null {
+function normalizeSource(value: RawPlayerDataSource | null | undefined): PlayerSource | null {
   if (!value) return null
   const world = value.world?.trim()
-  return {
-    kind: value.kind,
-    available: Boolean(value.available),
-    label: value.available
-      ? `世界玩家数据${world ? ` · ${world}` : ''}`
-      : '世界玩家数据不可用',
-    detail: value.detail || (value.available
+  const kind = value.kind || 'unknown'
+  const bridgeConnected = Boolean(value.bridge_connected)
+  const bridgeSource = kind === 'paper_bridge'
+  const freshness = value.freshness || (bridgeConnected ? 'connected' : value.available ? 'stale' : 'unavailable')
+  const hasLiveBridge = bridgeConnected && freshness !== 'stale'
+  const label = bridgeSource
+    ? hasLiveBridge ? 'Paper/Folia 实时桥接' : '桥接缓存与离线兜底'
+    : kind === 'world_playerdata'
+      ? value.available ? `世界玩家数据${world ? ` · ${world}` : ''}` : '世界玩家数据不可用'
+      : value.available ? '玩家数据可用' : '玩家数据不可用'
+  const detail = value.detail?.trim() || (bridgeSource
+    ? hasLiveBridge
+      ? 'Paper/Folia 插件桥接在线，优先显示实时玩家数据。'
+      : '桥接暂时不可用，正在显示最近快照或离线数据。'
+    : value.available
       ? '来自世界 playerdata 的离线快照，在线玩家可能存在保存延迟。'
-      : '未发现可读取的世界 playerdata。'),
+      : '未发现可读取的世界 playerdata。')
+  return {
+    kind,
+    available: Boolean(value.available),
+    label,
+    detail,
+    freshness,
+    bridge_connected: bridgeConnected,
+    fallback_reason: value.fallback_reason ?? null,
   }
 }
 
@@ -320,7 +349,7 @@ function normalizeItem(value: RawPlayerItem | null | undefined): Item | null {
   const kind = container?.kind
   return {
     id: value.id,
-    count: Number.isFinite(value.count) ? Math.max(0, Number(value.count)) : 1,
+    count: Number.isFinite(value.count) ? Math.max(0, Math.trunc(Number(value.count))) : null,
     name: value.name ?? null,
     lore: Array.isArray(value.lore) ? value.lore.filter((line): line is string => typeof line === 'string') : [],
     container_kind: kind === 'shulker_box' || kind === 'bundle' ? kind : kind ? 'container' : null,
@@ -354,7 +383,7 @@ function normalizePlayerRecord(value: RawPlayerRecord, sourceWorld?: string | nu
     level: value.level ?? null,
     position: normalizePosition(value.position, value.dimension || sourceWorld),
     updated_at: value.updated_at ?? profile.updated_at ?? null,
-    source: value.source,
+    source: value.source || value.data_source || 'unknown',
   }
 }
 
@@ -364,7 +393,8 @@ function normalizePlayerDetail(value: RawPlayerDetail, sourceWorld?: string | nu
     ...normalizePlayerRecord(value, sourceWorld),
     note: profile.note ?? null,
     tags: Array.isArray(profile.tags) ? profile.tags.filter((tag): tag is string => typeof tag === 'string') : [],
-    snapshot_available: Boolean(value.inventory || value.ender_chest),
+    inventory_available: value.inventory !== null && value.inventory !== undefined,
+    ender_chest_available: value.ender_chest !== null && value.ender_chest !== undefined,
     inventory: normalizeInventory(value.inventory),
     ender_chest: normalizeInventory(value.ender_chest),
   }
@@ -375,7 +405,7 @@ function normalizePapiAvailability(detected: boolean, runtimeAvailable: boolean)
 }
 
 function normalizePapiStatus(status: string): PapiValueStatus {
-  if (status === 'available') return 'ok'
+  if (status === 'available' || status === 'ok') return 'ok'
   if (status === 'unresolved') return 'unresolved'
   return 'unavailable'
 }
@@ -407,10 +437,11 @@ async function loadPlayers() {
   try {
     const response = await apiRequest<RawPlayerListResponse>(`/api/servers/${encodeURIComponent(serverId)}/players?${params}`)
     if (request !== playerRequest || serverId !== props.serverId) return
+    const source = response.source ?? response.data_source
     players.value = Array.isArray(response.players)
-      ? response.players.map((player) => normalizePlayerRecord(player, response.source?.world))
+      ? response.players.map((player) => normalizePlayerRecord(player, source?.world))
       : []
-    playerSource.value = normalizeSource(response.source)
+    playerSource.value = normalizeSource(source)
     playerTotal.value = Number.isFinite(response.total) ? response.total : players.value.length
   } catch (error) {
     if (request !== playerRequest || serverId !== props.serverId) return
@@ -511,8 +542,9 @@ async function openProfile(player: PlayerListItem) {
   try {
     const response = await apiRequest<RawPlayerDetailResponse>(`${playerPath(player.id)}`)
     if (request !== profileRequest || serverId !== props.serverId || selectedPlayer.value?.id !== player.id) return
-    profile.value = normalizeProfile(normalizePlayerDetail(response.player, response.source?.world))
-    playerSource.value = normalizeSource(response.source) || playerSource.value
+    const source = response.source ?? response.data_source
+    profile.value = normalizeProfile(normalizePlayerDetail(response.player, source?.world))
+    playerSource.value = normalizeSource(source) || playerSource.value
     resetProfileDraft(profile.value)
     void loadPlayerPapi(profile.value.id)
   } catch (error) {
@@ -525,6 +557,10 @@ async function openProfile(player: PlayerListItem) {
 function closeProfile() {
   profileRequest += 1
   papiRequest += 1
+  if (containerPreviewTimer) {
+    clearTimeout(containerPreviewTimer)
+    containerPreviewTimer = undefined
+  }
   showProfile.value = false
   selectedPlayer.value = null
   profile.value = null
@@ -636,10 +672,11 @@ async function saveProfile() {
         tags: profileDraft.value.tags.split(/[,，\n]/).map((tag) => tag.trim()).filter(Boolean),
       }),
     })
-    const updated = normalizeProfile(normalizePlayerDetail(response.player, response.source?.world))
+    const source = response.source ?? response.data_source
+    const updated = normalizeProfile(normalizePlayerDetail(response.player, source?.world))
     if (profile.value?.id !== playerId) return
     profile.value = updated
-    playerSource.value = normalizeSource(response.source) || playerSource.value
+    playerSource.value = normalizeSource(source) || playerSource.value
     selectedPlayer.value = { ...selectedPlayer.value!, ...updated }
     players.value = players.value.map((player) => player.id === playerId ? { ...player, ...updated } : player)
     resetProfileDraft(updated)
@@ -727,25 +764,41 @@ function containerKindLabel(item: Item) {
   return '容器'
 }
 
+function hasStackCount(item: Item) {
+  return typeof item.count === 'number' && item.count > 1
+}
+
 function itemTooltip(item: Item) {
   const lore = Array.isArray(item.lore) && item.lore.length ? `\n${item.lore.join('\n')}` : ''
   const container = hasContents(item) ? `\n${containerKindLabel(item)}：${item.contents?.length ?? 0} 个物品` : ''
-  return `${itemName(item)} x${item.count}${container}${lore}`
+  const count = item.count === null ? '数量未记录' : `x${item.count}`
+  return `${itemName(item)} ${count}${container}${lore}`
 }
 
 function previewContainer(item: Item | null) {
+  if (containerPreviewTimer) {
+    clearTimeout(containerPreviewTimer)
+    containerPreviewTimer = undefined
+  }
   hoveredContainer.value = hasContents(item) ? item : null
 }
 
 function clearContainerPreview(item: Item | null) {
-  // Keep the last hover visible while the pointer moves from the grid into the preview.
-  // Hovering another slot (including an empty slot) replaces it immediately.
   if (pinnedContainer.value === item) return
+  if (containerPreviewTimer) clearTimeout(containerPreviewTimer)
+  containerPreviewTimer = setTimeout(() => {
+    if (pinnedContainer.value !== item && hoveredContainer.value === item) hoveredContainer.value = null
+  }, 100)
 }
 
 function toggleContainerPreview(item: Item | null) {
   if (!hasContents(item)) return
-  pinnedContainer.value = pinnedContainer.value === item ? null : item
+  if (pinnedContainer.value === item) {
+    pinnedContainer.value = null
+    return
+  }
+  previewContainer(item)
+  pinnedContainer.value = item
 }
 
 function statusClass(status: string) {
@@ -756,6 +809,7 @@ function statusLabel(status: string) {
   if (status === 'online') return '在线'
   if (status === 'offline') return '离线'
   if (status === 'banned') return '已封禁'
+  if (status === 'unknown') return '状态未确认'
   return status || '未知'
 }
 
@@ -763,6 +817,40 @@ function papiStatusLabel(status: PapiValueStatus) {
   if (status === 'ok') return '已解析'
   if (status === 'unresolved') return '未解析'
   return '不可用'
+}
+
+function papiValueDisplay(value: PapiValue) {
+  if (value.status === 'ok') return value.value === '' ? '空值' : value.value ?? '未返回'
+  return value.value ?? papiStatusLabel(value.status)
+}
+
+function sourceFreshnessLabel(source: PlayerSource | null) {
+  if (!source) return ''
+  if (source.freshness === 'live') return '实时'
+  if (source.freshness === 'connected') return '已连接'
+  if (source.freshness === 'stale') return '离线快照'
+  if (source.freshness === 'unavailable') return '不可用'
+  return '状态待确认'
+}
+
+function playerRecordSourceLabel(source: string) {
+  if (source === 'paper_bridge_live') return '实时数据'
+  if (source === 'paper_bridge_stale') return '桥接缓存'
+  if (source === 'paper_bridge_presence') return '在线状态'
+  if (source === 'paper_bridge_presence+world_playerdata') return '在线状态与离线快照'
+  if (source === 'world_playerdata') return '离线快照'
+  if (source === 'managed_console') return '仅在线记录'
+  return '来源待确认'
+}
+
+function inventorySummary(inventory: GridCell[], available: boolean) {
+  return available ? `${inventory.filter((cell) => cell.item).length} / ${inventory.length} 个格位有物品` : '数据未提供'
+}
+
+function unavailableInventoryMessage(label: string) {
+  if (playerSource.value?.bridge_connected) return `桥接当前未返回该玩家的${label}快照。`
+  if (playerSource.value?.kind === 'paper_bridge') return `桥接缓存与离线兜底中未包含该玩家的${label}数据。`
+  return `当前离线快照未包含该玩家的${label}数据。`
 }
 
 function formatPosition(position?: PlayerPosition | null) {
@@ -855,6 +943,7 @@ watch(() => props.serverId, (serverId) => {
 onMounted(() => window.addEventListener('keydown', handleKeydown))
 onUnmounted(() => {
   if (queryTimer) clearTimeout(queryTimer)
+  if (containerPreviewTimer) clearTimeout(containerPreviewTimer)
   window.removeEventListener('keydown', handleKeydown)
 })
 </script>
@@ -885,6 +974,7 @@ onUnmounted(() => {
           <small>PLAYER DIRECTORY</small>
           <b>玩家列表</b>
           <em class="source-status" :class="{available: playerSource?.available}"><Database/>{{ playerSource?.label || '数据源尚未返回' }}</em>
+          <em v-if="playerSource" class="source-freshness" :class="playerSource.freshness">{{ sourceFreshnessLabel(playerSource) }}</em>
         </div>
         <div class="player-tools">
           <label class="player-search"><Search/><input v-model="query" placeholder="搜索名称、身份或 UUID"/></label>
@@ -909,7 +999,7 @@ onUnmounted(() => {
           <article v-for="player in players" :key="player.id" class="player-row" @dblclick="openProfile(player)">
             <button class="player-identity" :title="`查看 ${player.display_name || player.name}`" @click="openProfile(player)">
               <i>{{ (player.display_name || player.name).slice(0, 1) }}</i>
-              <span><b>{{ player.display_name || player.name }}</b><small>{{ player.role || '未设置身份' }}<template v-if="player.uuid"> · {{ player.uuid }}</template></small></span>
+              <span><b>{{ player.display_name || player.name }}</b><small>{{ player.role || '未设置身份' }} · {{ playerRecordSourceLabel(player.source) }}<template v-if="player.uuid"> · {{ player.uuid }}</template></small></span>
             </button>
             <span class="player-status" :class="statusClass(player.status)">{{ statusLabel(player.status) }}</span>
             <span class="level-value">{{ player.level ?? '-' }}</span>
@@ -968,8 +1058,8 @@ onUnmounted(() => {
             <section class="profile-overview">
               <header><div><small>基本资料</small><b>玩家信息</b></div><div class="profile-actions"><button v-if="!profileEditMode" class="icon-button" title="编辑玩家资料" @click="profileEditMode=true"><Pencil/></button><template v-else><button class="text-button" :disabled="profileSaving" @click="cancelProfileEdit">取消</button><button class="save-button" :disabled="profileSaving" @click="saveProfile"><LoaderCircle v-if="profileSaving" class="spin"/><Save v-else/>保存</button></template></div></header>
               <div v-if="profileEditMode" class="profile-edit-form">
-                <label>显示名称<input v-model="profileDraft.display_name" maxlength="64" placeholder="留空使用游戏名"/></label>
-                <label>身份<input v-model="profileDraft.role" maxlength="64" placeholder="例如：会员、管理员"/></label>
+                <label>显示名称<input v-model="profileDraft.display_name" maxlength="48" placeholder="留空使用游戏名"/></label>
+                <label>身份<input v-model="profileDraft.role" maxlength="48" placeholder="例如：会员、管理员"/></label>
                 <label class="wide">标签<input v-model="profileDraft.tags" maxlength="300" placeholder="用逗号分隔，例如：建筑, 常驻"/></label>
                 <label class="wide">备注<textarea v-model="profileDraft.note" rows="3" maxlength="500" placeholder="仅用于管理备注"/></label>
               </div>
@@ -986,26 +1076,26 @@ onUnmounted(() => {
             </section>
 
             <section class="inventory-section">
-              <header><div><small>INVENTORY</small><b>背包</b><em>{{ profile.snapshot_available ? `${inventoryCells.filter((cell) => cell.item).length} / ${inventoryCells.length} 个格位有物品` : '世界快照不可用' }}</em></div></header>
-              <div v-if="!profile.snapshot_available" class="inventory-unavailable"><Database/><span>当前仅有在线控制台记录，尚未保存到世界玩家数据。</span></div>
+              <header><div><small>INVENTORY</small><b>背包</b><em>{{ inventorySummary(inventoryCells, profile.inventory_available) }}</em></div></header>
+              <div v-if="!profile.inventory_available" class="inventory-unavailable"><Database/><span>{{ unavailableInventoryMessage('背包') }}</span></div>
               <template v-else>
                 <div class="equipment-strip" aria-label="装备栏与副手">
                   <span class="equipment-caption">装备与副手</span>
-                  <button v-for="cell in equipmentCells" :key="cell.slot" class="equipment-cell" :class="[cell.item ? itemClass(cell.item) : 'empty', {active:activeContainerPreview === cell.item}]" :disabled="!cell.item" :title="cell.item ? itemTooltip(cell.item) : equipmentLabel(cell.slot)" @mouseenter="previewContainer(cell.item)" @focus="previewContainer(cell.item)" @click="toggleContainerPreview(cell.item)">
-                    <small>{{ equipmentLabel(cell.slot) }}</small><Box v-if="cell.item"/><i v-if="cell.item && cell.item.count > 1">{{ cell.item.count }}</i>
+                  <button v-for="cell in equipmentCells" :key="cell.slot" class="equipment-cell" :class="[cell.item ? itemClass(cell.item) : 'empty', {active:activeContainerPreview === cell.item}]" :disabled="!cell.item" :title="cell.item ? itemTooltip(cell.item) : equipmentLabel(cell.slot)" @mouseenter="previewContainer(cell.item)" @mouseleave="clearContainerPreview(cell.item)" @focus="previewContainer(cell.item)" @blur="clearContainerPreview(cell.item)" @click="toggleContainerPreview(cell.item)">
+                    <small>{{ equipmentLabel(cell.slot) }}</small><Box v-if="cell.item"/><i v-if="cell.item && hasStackCount(cell.item)">{{ cell.item.count }}</i>
                   </button>
                 </div>
                 <div class="inventory-layout" :class="{'has-preview':!!activeContainerPreview}">
                 <div class="inventory-grid" aria-label="背包物品格">
                   <button v-for="cell in inventoryCells" :key="cell.slot" class="inventory-slot" :class="[cell.item ? itemClass(cell.item) : 'empty', {active:activeContainerPreview === cell.item}]" :disabled="!cell.item" :title="cell.item ? itemTooltip(cell.item) : `格位 ${cell.slot + 1}`" @mouseenter="previewContainer(cell.item)" @mouseleave="clearContainerPreview(cell.item)" @focus="previewContainer(cell.item)" @blur="clearContainerPreview(cell.item)" @click="toggleContainerPreview(cell.item)">
-                    <Box v-if="cell.item"/><span v-if="cell.item" class="item-name">{{ itemShortName(cell.item) }}</span><i v-if="cell.item && cell.item.count > 1">{{ cell.item.count }}</i>
+                    <Box v-if="cell.item"/><span v-if="cell.item" class="item-name">{{ itemShortName(cell.item) }}</span><i v-if="cell.item && hasStackCount(cell.item)">{{ cell.item.count }}</i>
                   </button>
                 </div>
-                <aside v-if="activeContainerPreview" class="container-preview" @mouseenter="previewContainer(activeContainerPreview)">
+                <aside v-if="activeContainerPreview" class="container-preview" @mouseenter="previewContainer(activeContainerPreview)" @mouseleave="clearContainerPreview(activeContainerPreview)">
                   <header><div><small>{{ containerKindLabel(activeContainerPreview) }}</small><b>{{ itemName(activeContainerPreview) }}</b></div><button class="icon-button" title="关闭预览" @click="pinnedContainer=null;hoveredContainer=null"><X/></button></header>
                   <p>{{ activeContainerPreview.contents?.length || 0 }} 个已读取物品</p>
                   <div class="nested-grid">
-                    <button v-for="cell in containerCells(activeContainerPreview)" :key="cell.slot" class="nested-slot" :class="cell.item ? itemClass(cell.item) : 'empty'" :disabled="!cell.item" :title="cell.item ? itemTooltip(cell.item) : `格位 ${cell.slot + 1}`" @mouseenter="previewContainer(cell.item)" @focus="previewContainer(cell.item)" @click="toggleContainerPreview(cell.item)"><Box v-if="cell.item"/><i v-if="cell.item && cell.item.count > 1">{{ cell.item.count }}</i></button>
+                    <button v-for="cell in containerCells(activeContainerPreview)" :key="cell.slot" class="nested-slot" :class="[cell.item ? itemClass(cell.item) : 'empty', {active:activeContainerPreview === cell.item}]" :disabled="!cell.item" :title="cell.item ? itemTooltip(cell.item) : `格位 ${cell.slot + 1}`" @mouseenter="previewContainer(cell.item)" @focus="previewContainer(cell.item)" @click="toggleContainerPreview(cell.item)"><Box v-if="cell.item"/><i v-if="cell.item && hasStackCount(cell.item)">{{ cell.item.count }}</i></button>
                   </div>
                 </aside>
                 </div>
@@ -1013,19 +1103,19 @@ onUnmounted(() => {
             </section>
 
             <section class="inventory-section">
-              <header><div><small>ENDER CHEST</small><b>末影箱</b><em>{{ profile.snapshot_available ? `${enderChestCells.filter((cell) => cell.item).length} / ${enderChestCells.length} 个格位有物品` : '世界快照不可用' }}</em></div></header>
-              <div v-if="!profile.snapshot_available" class="inventory-unavailable"><Database/><span>当前仅有在线控制台记录，尚未保存到世界玩家数据。</span></div>
+              <header><div><small>ENDER CHEST</small><b>末影箱</b><em>{{ inventorySummary(enderChestCells, profile.ender_chest_available) }}</em></div></header>
+              <div v-if="!profile.ender_chest_available" class="inventory-unavailable"><Database/><span>{{ unavailableInventoryMessage('末影箱') }}</span></div>
               <div v-else class="inventory-layout" :class="{'has-preview':!!activeContainerPreview}">
                 <div class="inventory-grid ender-grid" aria-label="末影箱物品格">
                   <button v-for="cell in enderChestCells" :key="cell.slot" class="inventory-slot" :class="[cell.item ? itemClass(cell.item) : 'empty', {active:activeContainerPreview === cell.item}]" :disabled="!cell.item" :title="cell.item ? itemTooltip(cell.item) : `格位 ${cell.slot + 1}`" @mouseenter="previewContainer(cell.item)" @mouseleave="clearContainerPreview(cell.item)" @focus="previewContainer(cell.item)" @blur="clearContainerPreview(cell.item)" @click="toggleContainerPreview(cell.item)">
-                    <Box v-if="cell.item"/><span v-if="cell.item" class="item-name">{{ itemShortName(cell.item) }}</span><i v-if="cell.item && cell.item.count > 1">{{ cell.item.count }}</i>
+                    <Box v-if="cell.item"/><span v-if="cell.item" class="item-name">{{ itemShortName(cell.item) }}</span><i v-if="cell.item && hasStackCount(cell.item)">{{ cell.item.count }}</i>
                   </button>
                 </div>
-                <aside v-if="activeContainerPreview" class="container-preview" @mouseenter="previewContainer(activeContainerPreview)">
+                <aside v-if="activeContainerPreview" class="container-preview" @mouseenter="previewContainer(activeContainerPreview)" @mouseleave="clearContainerPreview(activeContainerPreview)">
                   <header><div><small>{{ containerKindLabel(activeContainerPreview) }}</small><b>{{ itemName(activeContainerPreview) }}</b></div><button class="icon-button" title="关闭预览" @click="pinnedContainer=null;hoveredContainer=null"><X/></button></header>
                   <p>{{ activeContainerPreview.contents?.length || 0 }} 个已读取物品</p>
                   <div class="nested-grid">
-                    <button v-for="cell in containerCells(activeContainerPreview)" :key="cell.slot" class="nested-slot" :class="cell.item ? itemClass(cell.item) : 'empty'" :disabled="!cell.item" :title="cell.item ? itemTooltip(cell.item) : `格位 ${cell.slot + 1}`" @mouseenter="previewContainer(cell.item)" @focus="previewContainer(cell.item)" @click="toggleContainerPreview(cell.item)"><Box v-if="cell.item"/><i v-if="cell.item && cell.item.count > 1">{{ cell.item.count }}</i></button>
+                    <button v-for="cell in containerCells(activeContainerPreview)" :key="cell.slot" class="nested-slot" :class="[cell.item ? itemClass(cell.item) : 'empty', {active:activeContainerPreview === cell.item}]" :disabled="!cell.item" :title="cell.item ? itemTooltip(cell.item) : `格位 ${cell.slot + 1}`" @mouseenter="previewContainer(cell.item)" @focus="previewContainer(cell.item)" @click="toggleContainerPreview(cell.item)"><Box v-if="cell.item"/><i v-if="cell.item && hasStackCount(cell.item)">{{ cell.item.count }}</i></button>
                   </div>
                 </aside>
               </div>
@@ -1036,7 +1126,7 @@ onUnmounted(() => {
               <div v-if="playerPapiLoading" class="papi-state"><LoaderCircle class="spin"/>正在解析指定变量</div>
               <p v-else-if="playerPapiError" class="inline-error"><AlertTriangle/>{{ playerPapiError }}</p>
               <div v-else-if="!playerPapiValues.length" class="papi-state"><PlugZap/>尚未添加可显示的变量字段</div>
-              <div v-else class="papi-values"><article v-for="value in playerPapiValues" :key="value.field_id" :class="value.status"><p><small>{{ value.label }}</small><code>{{ value.placeholder }}</code></p><b>{{ value.value || papiStatusLabel(value.status) }}</b><em>{{ papiStatusLabel(value.status) }}</em></article></div>
+              <div v-else class="papi-values"><article v-for="value in playerPapiValues" :key="value.field_id" :class="value.status"><p><small>{{ value.label }}</small><code>{{ value.placeholder }}</code></p><b>{{ papiValueDisplay(value) }}</b><em>{{ papiStatusLabel(value.status) }}</em></article></div>
             </section>
           </template>
         </main>
@@ -1052,8 +1142,8 @@ onUnmounted(() => {
           <div class="papi-field-list">
             <article v-for="(field, index) in papiDraft" :key="field.id">
               <label class="field-enabled"><input v-model="field.enabled" type="checkbox"/><span>{{ field.enabled ? '显示' : '隐藏' }}</span></label>
-              <label>名称<input v-model="field.label" maxlength="64" :placeholder="`变量 ${index + 1}`"/></label>
-              <label>占位符<input v-model="field.placeholder" maxlength="256" placeholder="例如 %player_level%"/></label>
+              <label>名称<input v-model="field.label" maxlength="48" :placeholder="`变量 ${index + 1}`"/></label>
+              <label>占位符<input v-model="field.placeholder" maxlength="128" placeholder="例如 %player_level%"/></label>
               <button class="icon-button delete-field" title="删除变量" :disabled="papiSaving" @click="removePapiField(field.id)"><Trash2/></button>
             </article>
           </div>
@@ -1068,5 +1158,5 @@ onUnmounted(() => {
 
 <style scoped>
 .community-scroll{position:relative;flex:1;overflow:auto;padding:18px;color:#e8edf2}.community-hero,.player-management-card,.feedback-card,.poll-card,.poll-creator,.papi-status-card{border:1px solid rgba(255,255,255,.075);border-radius:8px;background:#11161c}.community-hero{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px;background:linear-gradient(120deg,rgba(156,140,255,.07),rgba(50,213,176,.035) 52%,#11161c)}.community-hero>div:first-child{display:flex;align-items:center;gap:12px}.community-hero>div:first-child>span{width:43px;height:43px;display:grid;place-items:center;border-radius:8px;color:#a89cff;background:rgba(156,140,255,.1)}.community-hero svg{width:20px}.community-hero p{display:flex;flex-direction:column;margin:0}.community-hero small,.player-management-card header small,.feedback-card header small,.poll-card header small,.poll-creator header small,.papi-status-card header small,.modal-header small,.profile-overview small,.inventory-section small,.papi-values-section small{color:#66727f;font-size:8px;text-transform:uppercase}.community-hero b{margin-top:4px;font-size:15px}.community-hero em{margin-top:5px;color:#6c7885;font:normal 8px Inter}.hero-actions{display:flex;align-items:center;gap:7px}.icon-button{width:30px;height:30px;display:grid;place-items:center;padding:0;border:1px solid rgba(255,255,255,.08);border-radius:6px;color:#85919d;background:#161d24}.icon-button:hover:not(:disabled){color:#dce4ea;border-color:rgba(50,213,176,.22);background:rgba(50,213,176,.07)}.icon-button:disabled{opacity:.45;cursor:not-allowed}.icon-button svg{width:14px}.papi-button,.save-button,.text-button,.row-action,.add-field,.papi-status-card footer button{height:31px;display:flex;align-items:center;justify-content:center;gap:6px;padding:0 10px;border:1px solid rgba(156,140,255,.22);border-radius:6px;color:#c0b7ff;background:rgba(156,140,255,.08);font-size:9px}.papi-button svg,.save-button svg,.row-action svg,.add-field svg,.papi-status-card footer button svg{width:13px}.player-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin-top:10px}.player-stats article{display:flex;align-items:center;gap:10px;padding:13px;border:1px solid rgba(255,255,255,.075);border-radius:8px;background:#12171d}.player-stats article>span{width:32px;height:32px;display:grid;place-items:center;flex:none;border-radius:7px}.player-stats svg{width:16px}.mint{color:#32d5b0;background:rgba(50,213,176,.09)}.green{color:#82d98d;background:rgba(83,190,100,.1)}.violet{color:#a99dff;background:rgba(156,140,255,.1)}.amber{color:#f3a75c;background:rgba(243,167,92,.09)}.player-stats p{display:flex;min-width:0;flex-direction:column;margin:0}.player-stats small{color:#697582;font-size:8px}.player-stats b{margin-top:2px;font-size:14px}.player-stats em{overflow:hidden;margin-top:2px;color:#56616e;font:normal 7px Inter;text-overflow:ellipsis;white-space:nowrap}.player-management-card{margin-top:10px;padding:15px}.player-card-header,.feedback-card>header,.poll-card>header,.poll-creator>header,.papi-status-card>header{display:flex;align-items:center;justify-content:space-between;gap:12px}.player-card-header>div:first-child,.feedback-card header>div,.poll-card header>div,.poll-creator header>div,.papi-status-card header>div{display:flex;min-width:0;flex-direction:column}.player-card-header b,.feedback-card header b,.poll-card header b,.poll-creator header b,.papi-status-card header b{margin-top:4px;font-size:12px}.source-status{display:flex;align-items:center;gap:4px;margin-top:5px;color:#d3a36e;font:normal 8px Inter}.source-status.available{color:#70ceb7}.source-status svg{width:11px}.player-tools{display:flex;align-items:center;gap:6px}.player-search{height:30px;display:flex;align-items:center;gap:6px;padding:0 9px;border:1px solid rgba(255,255,255,.08);border-radius:6px;color:#65717e;background:#0e1318}.player-search svg{width:13px}.player-search input{width:180px;min-width:0;border:0;outline:0;color:#d1d9e0;background:transparent;font-size:9px}.source-detail{margin:9px 0 0;color:#6d7985;font-size:8px;line-height:1.5}.inline-error{display:flex;align-items:flex-start;gap:7px;margin:10px 0 0;padding:9px;border-radius:6px;color:#ec989e;background:rgba(255,107,114,.065);font-size:8px;line-height:1.55}.inline-error svg{width:13px;flex:none}.player-table-wrap{min-width:0;margin-top:12px;overflow-x:auto}.player-table{min-width:720px}.table-head,.player-row{display:grid;grid-template-columns:minmax(180px,1.55fr) .75fr .55fr minmax(155px,1.25fr) minmax(114px,.95fr) 64px;align-items:center;gap:8px}.table-head{min-height:30px;padding:0 8px;color:#687480;font-size:7px;text-transform:uppercase}.table-head>span{padding-left:6px}.sort-button{height:26px;display:flex;align-items:center;gap:2px;padding:0 6px;border:0;border-radius:5px;color:inherit;background:transparent;font-size:7px;text-align:left;text-transform:uppercase}.sort-button:hover,.sort-button.active{color:#c9d2da;background:rgba(255,255,255,.045)}.sort-button svg{width:11px}.player-row{min-height:54px;padding:7px 8px;border-top:1px solid rgba(255,255,255,.055);color:#7c8794;font-size:8px}.player-row:hover{background:rgba(50,213,176,.025)}.player-identity{display:flex;align-items:center;min-width:0;gap:8px;padding:0;border:0;color:inherit;background:transparent;text-align:left}.player-identity i{width:28px;height:28px;display:grid;place-items:center;flex:none;border-radius:6px;color:#8ee2cf;background:rgba(50,213,176,.09);font:normal 10px Inter}.player-identity span{display:flex;min-width:0;flex-direction:column}.player-identity b{overflow:hidden;color:#c9d0d8;font-size:9px;text-overflow:ellipsis;white-space:nowrap}.player-identity small{overflow:hidden;margin-top:4px;color:#66727f;font-size:7px;text-overflow:ellipsis;white-space:nowrap}.player-status{width:max-content;padding:3px 6px;border-radius:5px;color:#697683;background:rgba(255,255,255,.05);font:normal 7px Inter}.player-status.online{color:#67d2b6;background:rgba(50,213,176,.08)}.player-status.banned{color:#ff9096;background:rgba(255,107,114,.08)}.level-value{color:#c7d0d8;font:600 10px Inter}.position-value{display:flex;align-items:center;min-width:0;gap:5px}.position-value svg{width:12px;color:#aa9eff}.position-value em{overflow:hidden;color:#8995a0;font:normal 8px Inter;text-overflow:ellipsis;white-space:nowrap}.player-row time{overflow:hidden;color:#65717d;font:7px Inter;text-overflow:ellipsis;white-space:nowrap}.row-action{height:27px;padding:0 7px;border-color:rgba(255,255,255,.08);color:#9ba7b3;background:#171d24;font-size:7px}.table-state{min-height:130px;display:flex;align-items:center;justify-content:center;gap:8px;color:#687480;font-size:9px}.table-state svg{width:18px}.content-grid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(250px,.82fr);gap:10px;margin-top:10px}.feedback-card,.poll-card,.poll-creator,.papi-status-card{padding:15px}.content-grid>aside{display:grid;align-content:start;gap:10px}.feedback-card header>button{display:flex;align-items:center;gap:4px;border:0;color:#a99dff;background:transparent;font-size:8px}.feedback-card header svg{width:13px}.feedback-card>article{display:flex;gap:8px;padding:9px 0;border-top:1px solid rgba(255,255,255,.055)}.feedback-card>article>span{width:6px;height:6px;flex:none;margin-top:3px;border-radius:50%;background:#818c98}.feedback-card>article>span.positive{background:#32d5b0}.feedback-card>article>span.negative{background:#ff747b}.feedback-card>article p{display:flex;flex-direction:column;margin:0}.feedback-card>article b{font-size:8px}.feedback-card>article small{margin-top:4px;color:#687480;font-size:7px;line-height:1.5}.community-empty{display:flex;align-items:center;justify-content:center;gap:7px;min-height:82px;color:#65717d;font-size:8px;text-align:center}.community-empty svg{width:15px}.cluster-result{padding:9px;margin-top:7px;border-radius:6px;color:#9bcfc3;background:rgba(50,213,176,.05);font-size:8px;line-height:1.5}.cluster-result span{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}.cluster-result i{padding:2px 4px;border-radius:4px;background:rgba(50,213,176,.07);font-style:normal}.poll-card>article{padding-top:10px;margin-top:10px;border-top:1px solid rgba(255,255,255,.055)}.poll-card>article>b{display:block;margin-bottom:8px;font-size:9px}.poll-card>article>button{width:100%;display:flex;justify-content:space-between;padding:7px 8px;margin-top:5px;border:1px solid rgba(255,255,255,.065);border-radius:6px;color:#87929f;background:#0e1318;font-size:7px;text-align:left}.poll-card>article>button:hover{border-color:rgba(156,140,255,.2)}.poll-card em{color:#a69bf4;font-style:normal}.papi-status-card{border-color:rgba(156,140,255,.14);background:rgba(156,140,255,.035)}.papi-status-card.available{border-color:rgba(50,213,176,.17);background:rgba(50,213,176,.035)}.papi-status-card>p{display:flex;align-items:flex-start;gap:6px;margin:12px 0 0;color:#77838f;font-size:8px;line-height:1.55}.papi-status-card>p i{width:6px;height:6px;flex:none;margin-top:3px;border-radius:50%;background:#d4a76e}.papi-status-card.available>p i{background:#32d5b0}.papi-status-card footer{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:12px}.papi-status-card footer>span{color:#66727f;font-size:7px}.papi-status-card footer button{height:26px;padding:0 7px;border-color:rgba(156,140,255,.18);font-size:7px}.poll-creator{margin-top:10px}.poll-creator>input,.option-inputs input{width:100%;height:31px;padding:0 9px;border:1px solid rgba(255,255,255,.08);border-radius:6px;outline:0;color:#cbd2da;background:#0e1318;font-size:8px}.option-inputs{display:grid;grid-template-columns:repeat(2,1fr);gap:7px;margin-top:7px}.poll-creator footer{display:flex;justify-content:flex-end;gap:6px;margin-top:9px}.poll-creator footer button{height:27px;display:flex;align-items:center;gap:4px;padding:0 8px;border:1px solid rgba(255,255,255,.08);border-radius:6px;color:#85909d;background:#171d24;font-size:7px}.poll-creator footer button.primary{border:0;color:#161121;background:#a89cff}.poll-creator footer svg{width:11px}.community-modal-backdrop{position:fixed;inset:0;z-index:70;display:grid;place-items:center;padding:20px;background:rgba(2,5,8,.72);backdrop-filter:blur(10px)}.player-modal,.papi-manager-modal{display:flex;flex-direction:column;width:min(1100px,calc(100vw - 40px));max-height:calc(100vh - 40px);overflow:hidden;border:1px solid rgba(255,255,255,.12);border-radius:8px;background:#12171d;box-shadow:0 30px 100px rgba(0,0,0,.55)}.papi-manager-modal{width:min(760px,calc(100vw - 40px))}.modal-header{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;padding:18px 20px;border-bottom:1px solid rgba(255,255,255,.07);background:#10151b}.modal-header h2{margin:5px 0 0;font-size:16px}.modal-header p{display:flex;gap:7px;margin:7px 0 0;color:#697582;font-size:8px}.modal-header p>span.available{color:#70ceb7}.profile-body{min-height:0;overflow:auto;padding:18px 20px 24px}.profile-state{min-height:240px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:9px;color:#6c7884;font-size:9px;text-align:center}.profile-state svg{width:24px}.profile-state.error{color:#e79a9e}.profile-state button{height:28px;display:flex;align-items:center;gap:5px;margin-top:4px;padding:0 9px;border:1px solid rgba(255,107,114,.2);border-radius:6px;color:#ef9da2;background:rgba(255,107,114,.06);font-size:8px}.profile-state button svg{width:12px}.profile-overview,.inventory-section,.papi-values-section{margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,.065)}.profile-overview{margin-top:0;padding-top:0;border-top:0}.profile-overview>header,.inventory-section>header,.papi-values-section>header{display:flex;align-items:center;justify-content:space-between;gap:10px}.profile-overview header>div:first-child,.inventory-section header>div,.papi-values-section header>div{display:flex;min-width:0;flex-direction:column}.profile-overview header b,.inventory-section header b,.papi-values-section header b{margin-top:4px;font-size:12px}.inventory-section header em,.papi-values-section header em{margin-top:4px;color:#697582;font:normal 8px Inter;text-transform:none}.papi-values-section header em.available{color:#70ceb7}.profile-actions,.papi-values-section>header>span{display:flex;align-items:center;gap:6px}.text-button{border-color:rgba(255,255,255,.08);color:#8995a1;background:#171d24}.save-button{border:0;color:#06251e;background:#32d5b0;font-weight:700}.save-button:disabled,.text-button:disabled{opacity:.5;cursor:not-allowed}.profile-facts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:12px}.profile-facts>p{display:flex;min-width:0;flex-direction:column;gap:5px;margin:0;padding:9px;border-radius:6px;background:#0e1318}.profile-facts small{color:#64717d;font-size:7px}.profile-facts b{overflow:hidden;color:#c7d0d8;font-size:9px;text-overflow:ellipsis;white-space:nowrap}.profile-facts p.wide{grid-column:span 2}.profile-facts p.wide b{display:flex;align-items:center;gap:5px;overflow:visible;white-space:normal}.profile-facts p.wide b svg{width:12px;color:#a99dff}.profile-facts .tags span{display:flex;flex-wrap:wrap;gap:4px}.profile-facts .tags i{padding:3px 5px;border-radius:4px;color:#9ce1cf;background:rgba(50,213,176,.08);font:normal 7px Inter}.profile-facts .note b{color:#99a6b2;font-weight:400;line-height:1.5}.profile-edit-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:12px}.profile-edit-form label{display:flex;flex-direction:column;gap:5px;color:#7c8995;font-size:8px}.profile-edit-form label.wide{grid-column:1/-1}.profile-edit-form input,.profile-edit-form textarea,.papi-field-list input{width:100%;border:1px solid rgba(255,255,255,.08);border-radius:6px;outline:0;color:#d6dde4;background:#0d1217;font-size:9px}.profile-edit-form input{height:32px;padding:0 9px}.profile-edit-form textarea{padding:8px 9px;resize:vertical;line-height:1.5}.profile-edit-form input:focus,.profile-edit-form textarea:focus,.papi-field-list input:focus{border-color:rgba(50,213,176,.34)}.inventory-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(210px,.38fr);gap:12px;margin-top:12px}.inventory-layout:has(.container-preview:only-child){grid-template-columns:1fr}.inventory-grid,.nested-grid{display:grid;grid-template-columns:repeat(9,minmax(0,1fr));gap:4px}.inventory-slot,.nested-slot{position:relative;aspect-ratio:1;min-width:0;display:flex;align-items:center;justify-content:center;padding:2px;border:1px solid rgba(255,255,255,.09);border-radius:4px;color:#93a1ad;background:#10161d}.inventory-slot:disabled,.nested-slot:disabled{cursor:default}.inventory-slot:not(:disabled):hover,.inventory-slot:not(:disabled):focus,.inventory-slot.active{border-color:rgba(50,213,176,.55);outline:0;background:rgba(50,213,176,.08)}.inventory-slot.shulker,.nested-slot.shulker{color:#bc8ee9;border-color:rgba(185,128,231,.35);background:rgba(185,128,231,.08)}.inventory-slot.bundle,.nested-slot.bundle{color:#ebbc7e;border-color:rgba(234,184,114,.34);background:rgba(234,184,114,.08)}.inventory-slot.container,.nested-slot.container{color:#82b4e9;border-color:rgba(109,164,225,.34);background:rgba(109,164,225,.08)}.inventory-slot svg,.nested-slot svg{width:15px}.inventory-slot .item-name{position:absolute;right:3px;bottom:2px;left:3px;overflow:hidden;color:#d4dce2;font:6px Inter;text-align:center;text-overflow:ellipsis;white-space:nowrap}.inventory-slot>i,.nested-slot>i{position:absolute;right:2px;bottom:1px;color:#fff;font:700 8px Inter;text-shadow:0 1px 2px #000}.container-preview{min-width:0;padding:11px;border:1px solid rgba(156,140,255,.2);border-radius:7px;background:#0d1217}.container-preview>header{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.container-preview header>div{display:flex;min-width:0;flex-direction:column}.container-preview small{color:#9f93e8;font-size:7px;text-transform:uppercase}.container-preview b{overflow:hidden;margin-top:4px;color:#d5d9e9;font-size:9px;text-overflow:ellipsis;white-space:nowrap}.container-preview>p{margin:8px 0;color:#697582;font-size:7px}.nested-slot svg{width:11px}.papi-state{display:flex;align-items:center;justify-content:center;gap:7px;min-height:70px;margin-top:10px;color:#6c7885;font-size:8px}.papi-state svg{width:15px}.papi-values{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:10px}.papi-values article{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:6px;padding:9px;border:1px solid rgba(50,213,176,.12);border-radius:6px;background:#0e1419}.papi-values article.unresolved{border-color:rgba(243,167,92,.18)}.papi-values article.unavailable{border-color:rgba(255,107,114,.16)}.papi-values p{display:flex;min-width:0;flex-direction:column;margin:0}.papi-values small{color:#82909c;font-size:7px;text-transform:none}.papi-values code{overflow:hidden;margin-top:3px;color:#7f73cc;font:7px 'Cascadia Code',monospace;text-overflow:ellipsis;white-space:nowrap}.papi-values b{overflow:hidden;color:#c7d9d5;font-size:9px;text-align:right;text-overflow:ellipsis;white-space:nowrap}.papi-values em{grid-column:2;color:#68cdb3;font:normal 7px Inter}.papi-values article.unresolved em{color:#e5aa70}.papi-values article.unavailable em{color:#e78f95}.manager-backdrop{z-index:80}.papi-manager-modal>main{min-height:0;overflow:auto;padding:18px 20px}.manager-hint{margin:0;color:#71808c;font-size:9px;line-height:1.6}.papi-field-list{display:grid;gap:7px;margin-top:14px}.papi-field-list article{display:grid;grid-template-columns:70px minmax(110px,.65fr) minmax(180px,1.3fr) 30px;align-items:end;gap:7px;padding:9px;border:1px solid rgba(255,255,255,.07);border-radius:6px;background:#0e1318}.papi-field-list label{display:flex;flex-direction:column;gap:4px;color:#75818d;font-size:7px}.papi-field-list label.field-enabled{height:31px;align-items:center;justify-content:flex-start;flex-direction:row;gap:5px;color:#8996a1}.papi-field-list input{height:31px;padding:0 8px}.papi-field-list .field-enabled input{width:auto;height:auto;accent-color:#32d5b0}.delete-field{height:31px;color:#e78c92}.add-field{height:30px;margin-top:10px;border-color:rgba(50,213,176,.18);color:#8fe2cd;background:rgba(50,213,176,.06)}.papi-manager-modal>footer{height:58px;display:flex;align-items:center;justify-content:flex-end;gap:7px;padding:0 20px;border-top:1px solid rgba(255,255,255,.07);background:#10151b}.spin{animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}@media(max-width:1050px){.player-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.content-grid{grid-template-columns:1fr}.content-grid>aside{grid-template-columns:repeat(2,minmax(0,1fr))}.inventory-layout{grid-template-columns:1fr}.container-preview{max-width:420px}.papi-values{grid-template-columns:1fr}}@media(max-width:700px){.community-scroll{padding:12px}.community-hero{align-items:flex-start;flex-direction:column}.hero-actions{width:100%;justify-content:flex-end}.player-card-header{align-items:flex-start;flex-direction:column}.player-tools{width:100%}.player-search{flex:1}.player-search input{width:100%}.content-grid>aside{grid-template-columns:1fr}.option-inputs,.profile-edit-form,.profile-facts{grid-template-columns:1fr}.profile-facts p.wide{grid-column:auto}.community-modal-backdrop{padding:8px}.player-modal,.papi-manager-modal{width:100%;max-height:calc(100vh - 16px)}.modal-header,.profile-body,.papi-manager-modal>main{padding-right:14px;padding-left:14px}.papi-field-list article{grid-template-columns:1fr 30px}.papi-field-list label.field-enabled{grid-column:1}.papi-field-list label:not(.field-enabled){grid-column:1}.papi-field-list .delete-field{grid-column:2;grid-row:1;align-self:center}.inventory-grid{gap:3px}.inventory-slot .item-name{display:none}}
-.inventory-layout{grid-template-columns:1fr}.inventory-layout.has-preview{grid-template-columns:minmax(0,1fr) minmax(210px,.38fr)}.modal-header-actions{display:flex;align-items:center;gap:6px}.inventory-unavailable{display:flex;align-items:center;justify-content:center;gap:8px;min-height:82px;margin-top:12px;padding:12px;border:1px dashed rgba(255,255,255,.1);border-radius:6px;color:#71808c;background:#0e1318;font-size:8px;text-align:center}.inventory-unavailable svg{width:16px;color:#d4a76e}.equipment-strip{display:flex;align-items:center;gap:6px;margin-top:12px;padding:8px 9px;border:1px solid rgba(255,255,255,.065);border-radius:6px;background:#0e1318}.equipment-caption{margin-right:3px;color:#697582;font-size:8px;white-space:nowrap}.equipment-cell{position:relative;width:48px;height:48px;display:flex;align-items:center;justify-content:center;flex:none;padding:11px 2px 2px;border:1px solid rgba(255,255,255,.09);border-radius:4px;color:#93a1ad;background:#10161d}.equipment-cell small{position:absolute;top:3px;right:2px;left:2px;overflow:hidden;color:#687480;font-size:6px;line-height:1;text-align:center;text-overflow:ellipsis;white-space:nowrap}.equipment-cell svg{width:15px}.equipment-cell>i{position:absolute;right:2px;bottom:1px;color:#fff;font:700 8px Inter;text-shadow:0 1px 2px #000}.equipment-cell:not(:disabled):hover,.equipment-cell:not(:disabled):focus,.equipment-cell.active{border-color:rgba(50,213,176,.55);outline:0;background:rgba(50,213,176,.08)}.equipment-cell.shulker{color:#bc8ee9;border-color:rgba(185,128,231,.35);background:rgba(185,128,231,.08)}.equipment-cell.bundle{color:#ebbc7e;border-color:rgba(234,184,114,.34);background:rgba(234,184,114,.08)}.equipment-cell.container{color:#82b4e9;border-color:rgba(109,164,225,.34);background:rgba(109,164,225,.08)}@media(max-width:1050px){.inventory-layout.has-preview{grid-template-columns:1fr}}@media(max-width:700px){.equipment-strip{overflow-x:auto;align-items:stretch}.equipment-caption{align-self:center}.equipment-cell{width:46px;height:46px}}
+.inventory-layout{grid-template-columns:1fr}.inventory-layout.has-preview{grid-template-columns:minmax(0,1fr) minmax(210px,.38fr)}.modal-header-actions{display:flex;align-items:center;gap:6px}.inventory-unavailable{display:flex;align-items:center;justify-content:center;gap:8px;min-height:82px;margin-top:12px;padding:12px;border:1px dashed rgba(255,255,255,.1);border-radius:6px;color:#71808c;background:#0e1318;font-size:8px;text-align:center}.inventory-unavailable svg{width:16px;color:#d4a76e}.equipment-strip{display:flex;align-items:center;gap:6px;margin-top:12px;padding:8px 9px;border:1px solid rgba(255,255,255,.065);border-radius:6px;background:#0e1318}.equipment-caption{margin-right:3px;color:#697582;font-size:8px;white-space:nowrap}.equipment-cell{position:relative;width:48px;height:48px;display:flex;align-items:center;justify-content:center;flex:none;padding:11px 2px 2px;border:1px solid rgba(255,255,255,.09);border-radius:4px;color:#93a1ad;background:#10161d}.equipment-cell small{position:absolute;top:3px;right:2px;left:2px;overflow:hidden;color:#687480;font-size:6px;line-height:1;text-align:center;text-overflow:ellipsis;white-space:nowrap}.equipment-cell svg{width:15px}.equipment-cell>i{position:absolute;right:2px;bottom:1px;color:#fff;font:700 8px Inter;text-shadow:0 1px 2px #000}.equipment-cell:not(:disabled):hover,.equipment-cell:not(:disabled):focus,.equipment-cell.active{border-color:rgba(50,213,176,.55);outline:0;background:rgba(50,213,176,.08)}.equipment-cell.shulker{color:#bc8ee9;border-color:rgba(185,128,231,.35);background:rgba(185,128,231,.08)}.equipment-cell.bundle{color:#ebbc7e;border-color:rgba(234,184,114,.34);background:rgba(234,184,114,.08)}.equipment-cell.container{color:#82b4e9;border-color:rgba(109,164,225,.34);background:rgba(109,164,225,.08)}.source-freshness{width:max-content;margin-top:4px;color:#8e9aa5;font:normal 7px Inter}.source-freshness.live,.source-freshness.connected{color:#70ceb7}.source-freshness.stale{color:#d3a36e}.source-freshness.unavailable{color:#e79298}.nested-slot:not(:disabled):hover,.nested-slot:not(:disabled):focus,.nested-slot.active{border-color:rgba(50,213,176,.55);outline:0;background:rgba(50,213,176,.08)}@media(max-width:1050px){.inventory-layout.has-preview{grid-template-columns:1fr}}@media(max-width:700px){.equipment-strip{overflow-x:auto;align-items:stretch}.equipment-caption{align-self:center}.equipment-cell{width:46px;height:46px}}
 </style>

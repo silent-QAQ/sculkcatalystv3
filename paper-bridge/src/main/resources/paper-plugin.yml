@@ -1,0 +1,26 @@
+# 插件注册名称。
+name: SculkCatalystPaperBridge
+# 构建时展开的插件版本。
+version: '${version}'
+# Paper 加载的主类。
+main: com.sculkcatalyst.paperbridge.PaperBridgePlugin
+# 最低 Paper API 版本。
+api-version: '1.21'
+# 管理员可见的插件说明。
+description: Read-only bridge for Sculk Catalyst player management.
+# 插件作者信息。
+authors: [SculkCatalyst]
+# 声明插件按 Folia 调度约束实现。
+folia-supported: true
+# 可选服务端依赖集合。
+dependencies:
+  # 服务端插件依赖集合。
+  server:
+    # 可选的 PlaceholderAPI 依赖。
+    PlaceholderAPI:
+      # 在本插件之前加载。
+      load: BEFORE
+      # 未安装时仍允许桥接启动。
+      required: false
+      # 允许可选 API 类与本插件共享类路径。
+      join-classpath: true

@@ -7,6 +7,7 @@ mod cloud;
 mod conversations;
 mod download;
 mod msl_sync;
+mod player_bridge;
 mod player_management;
 mod prefs;
 mod process_platform;
@@ -35,6 +36,7 @@ use axum::{
 use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
 use chrono::{Datelike, Local};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs::{File as StdFile, OpenOptions as StdOpenOptions},
@@ -73,6 +75,7 @@ struct AppState {
     runtime_install: Arc<Mutex<()>>,
     task_controls: Arc<RwLock<HashMap<Uuid, Arc<AtomicBool>>>>,
     cloud: cloud::CloudRuntime,
+    bridge: player_bridge::BridgeRuntime,
 }
 
 const TELEMETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -149,8 +152,15 @@ pub(crate) struct ServerInfo {
     /// Human-facing core name and its catalog/resource identifier are kept
     /// separate. A fork such as `LSQFK` may resolve through a slug like
     /// `leavesslientqaqfork` without being mislabeled as Leaves.
+    #[serde(default = "default_core_source")]
+    pub(crate) core_source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) core_resource_id: Option<String>,
+    /// Exact published artifact version selected from the resource catalog.
+    /// This is deliberately separate from `version`, which remains the
+    /// Minecraft compatibility version shown to users.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) core_resource_version: Option<String>,
     version: String,
     pub(crate) status: String,
     players: String,
@@ -473,6 +483,15 @@ struct CreateServerRequest {
     memory_gb: u8,
     port: u16,
     eula_accepted: bool,
+    /// `catalog` keeps the normal resource-library provisioning flow;
+    /// `local_upload` creates the workspace and waits for the dedicated JAR
+    /// upload endpoint before starting provisioning.
+    #[serde(default = "default_core_source")]
+    core_source: String,
+    #[serde(default)]
+    core_resource_id: Option<String>,
+    #[serde(default)]
+    core_resource_version: Option<String>,
     #[serde(default)]
     location: Option<String>,
 }
@@ -545,7 +564,7 @@ struct DeleteServerResponse {
 #[derive(Serialize)]
 struct CreateServerResponse {
     server: ServerInfo,
-    provision_task: TaskInfo,
+    provision_task: Option<TaskInfo>,
     directory: String,
     files: Vec<String>,
 }
@@ -749,9 +768,22 @@ struct FileTransferResponse {
     size: u64,
 }
 
+#[derive(Serialize)]
+struct CoreUploadResponse {
+    server: ServerInfo,
+    provision_task: TaskInfo,
+    filename: String,
+    size: u64,
+    sha256: String,
+}
+
 type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
 
 const MAX_FILE_TRANSFER_BYTES: usize = 256 * 1024 * 1024;
+
+fn default_core_source() -> String {
+    "catalog".into()
+}
 
 #[tokio::main]
 async fn main() {
@@ -777,6 +809,7 @@ async fn main() {
         runtime_install: Arc::new(Mutex::new(())),
         task_controls: Arc::new(RwLock::new(HashMap::new())),
         cloud,
+        bridge: player_bridge::BridgeRuntime::from_env(),
     };
     resource_sync::spawn_worker(state.clone());
     msl_sync::spawn_worker(state.clone());
@@ -861,6 +894,10 @@ async fn main() {
             "/api/servers/{id}/file/upload",
             post(upload_file).layer(DefaultBodyLimit::max(MAX_FILE_TRANSFER_BYTES + 1024 * 1024)),
         )
+        .route(
+            "/api/servers/{id}/core/upload",
+            post(upload_core).layer(DefaultBodyLimit::max(MAX_FILE_TRANSFER_BYTES + 1024 * 1024)),
+        )
         .route("/api/servers/{id}/file/download", get(download_file))
         .route("/api/servers/{id}/file/rename", post(rename_file))
         .route("/api/servers/{id}/directory", post(create_directory))
@@ -881,6 +918,7 @@ async fn main() {
         .route("/api/feedback/cluster", post(cluster_feedback))
         .route("/api/players/{id}/action", post(player_action))
         .merge(player_management::router())
+        .merge(player_bridge::router())
         .route("/api/integrations", get(get_integrations))
         .route("/api/integrations/{id}/toggle", post(toggle_integration))
         .route("/api/integrations/{id}/test", post(test_integration))
@@ -996,6 +1034,7 @@ fn default_import_kind() -> String {
 
 async fn shutdown_backend(state: &AppState) {
     state.shutting_down.store(true, Ordering::Release);
+    state.bridge.shutdown().await;
     shutdown_all_processes(state).await;
 }
 
@@ -1661,7 +1700,9 @@ async fn import_workspace(
         kind: detected.kind.clone(),
         name: detected.name.clone(),
         core: detected.core.clone(),
+        core_source: "catalog".into(),
         core_resource_id: None,
+        core_resource_version: None,
         version: detected.version.clone(),
         status: if is_server {
             "stopped".into()
@@ -1728,6 +1769,52 @@ async fn create_server(
     validate_server_name(&request.name)
         .map_err(|message| (StatusCode::BAD_REQUEST, message.into()))?;
     let name = request.name.trim().to_string();
+    validate_core_name(&request.core)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message.into()))?;
+    validate_minecraft_version(&request.version)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message.into()))?;
+    let core_source = request.core_source.trim().to_ascii_lowercase();
+    if !matches!(core_source.as_str(), "catalog" | "local_upload") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "core_source must be catalog or local_upload".into(),
+        ));
+    }
+    let core_resource_id = request
+        .core_resource_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let core_resource_version = request
+        .core_resource_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if core_source == "local_upload" {
+        if core_resource_id.is_some() || core_resource_version.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "本地上传模式不能同时指定资源库版本".into(),
+            ));
+        }
+    } else {
+        if let Some(value) = core_resource_id.as_deref() {
+            validate_resource_token(value)
+                .map_err(|message| (StatusCode::BAD_REQUEST, message.into()))?;
+        }
+        if let Some(value) = core_resource_version.as_deref() {
+            if core_resource_id.is_none() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "指定资源库构建版本时必须同时提供项目标识".into(),
+                ));
+            }
+            validate_resource_token(value)
+                .map_err(|message| (StatusCode::BAD_REQUEST, message.into()))?;
+        }
+    }
     validate_location(request.location.as_deref())?;
     validate_server_port(request.port)
         .map_err(|message| (StatusCode::BAD_REQUEST, message.into()))?;
@@ -1742,8 +1829,12 @@ async fn create_server(
     let shell_start_script = render_shell_start_script(request.memory_gb)
         .map_err(|message| (StatusCode::BAD_REQUEST, message.into()))?;
     let mut data = state.inner.write().await;
-    validate_catalog_server_template(&data.catalog, &request.core, &request.version)
-        .map_err(|message| (StatusCode::BAD_REQUEST, message.into()))?;
+    if core_source == "catalog" {
+        if core_resource_id.is_none() {
+            validate_catalog_server_template(&data.catalog, &request.core, &request.version)
+                .map_err(|message| (StatusCode::BAD_REQUEST, message.into()))?;
+        }
+    }
     if data
         .servers
         .iter()
@@ -1787,27 +1878,38 @@ async fn create_server(
     make_shell_script_executable(&shell_script_path)
         .await
         .map_err(|error| internal(error.to_string()))?;
+    let local_upload = core_source == "local_upload";
     let server = ServerInfo {
         id: id.clone(),
         kind: "server".into(),
         name,
-        core: request.core,
-        core_resource_id: None,
-        version: request.version,
+        core: request.core.trim().to_string(),
+        core_source: core_source.clone(),
+        core_resource_id,
+        core_resource_version,
+        version: request.version.trim().to_string(),
         status: "stopped".into(),
         players: "0 / 60".into(),
         memory: 0,
         memory_gb: request.memory_gb,
         cpu: 0,
         port: request.port,
-        task: "环境初始化".into(),
+        task: if local_upload {
+            "等待上传本地核心".into()
+        } else {
+            "环境初始化".into()
+        },
         location: "local".into(),
         workspace_path: None,
         launch_jar: None,
         pid: None,
         runtime_generation: None,
         started_at: None,
-        operation_state: "provisioning".into(),
+        operation_state: if local_upload {
+            "idle".into()
+        } else {
+            "provisioning".into()
+        },
         core_ready: false,
         last_error: None,
         lifecycle_phase: "create".into(),
@@ -1817,27 +1919,36 @@ async fn create_server(
     data.logs.insert(
         id.clone(),
         vec![format!(
-            "[{} AI]: 服务器工作区已创建，等待选择核心镜像源。",
-            Local::now().format("%H:%M:%S")
+            "[{} AI]: {}",
+            Local::now().format("%H:%M:%S"),
+            if local_upload {
+                "服务器工作区已创建，等待上传本地 server JAR。"
+            } else {
+                "服务器工作区已创建，等待资源库核心初始化。"
+            }
         )],
     );
-    data.tasks.insert(
-        0,
-        new_task_record(
+    let provision_task = if local_upload {
+        None
+    } else {
+        let task = new_task_record(
             id.clone(),
-            "选择核心镜像并预览下载接口".into(),
+            "从资源库选择并校验核心".into(),
             "server_provision".into(),
             "queued".into(),
             0,
             "low".into(),
             None,
-        ),
-    );
-    let provision_task = data.tasks[0].clone();
+        );
+        data.tasks.insert(0, task.clone());
+        Some(task)
+    };
     data.servers.push(server.clone());
     persist(&state, &data).await.map_err(internal)?;
     drop(data);
-    task_executor::spawn(state.clone(), provision_task.id).await;
+    if let Some(task) = provision_task.as_ref() {
+        task_executor::spawn(state.clone(), task.id).await;
+    }
     Ok(Json(CreateServerResponse {
         server,
         provision_task,
@@ -1878,7 +1989,9 @@ async fn create_project(
         kind: "project".into(),
         name: request.name.trim().to_string(),
         core: String::new(),
+        core_source: "catalog".into(),
         core_resource_id: None,
+        core_resource_version: None,
         version: String::new(),
         status: "ready".into(),
         players: "- / -".into(),
@@ -2013,6 +2126,12 @@ async fn provision_server(
         fs::metadata(workspace_directory_for_server(&current_server).join("server.jar"))
             .await
             .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0);
+    if current_server.core_source == "local_upload" && !core_ready {
+        return Err((
+            StatusCode::CONFLICT,
+            "该服务器正在等待本地核心上传，请先上传 JAR".into(),
+        ));
+    }
     let (server, provision_task) = {
         let mut data = state.inner.write().await;
         let server_index = data
@@ -2124,7 +2243,9 @@ async fn plan_server(
         kind: "server".into(),
         name: name.clone(),
         core: String::new(),
+        core_source: "catalog".into(),
         core_resource_id: None,
+        core_resource_version: None,
         version: String::new(),
         status: "planning".into(),
         players: "- / -".into(),
@@ -4708,6 +4829,276 @@ async fn upload_file(
     }))
 }
 
+/// Upload a server core through a dedicated endpoint. The normal workspace
+/// upload intentionally cannot touch root JAR artifacts; this path is the
+/// only operation that may install `server.jar`, and it always does so via
+/// the downloader's backup-and-rename routine.
+async fn upload_core(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> ApiResult<CoreUploadResponse> {
+    if state.shutting_down.load(Ordering::Acquire) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "后端正在关闭，暂时不能上传核心".into(),
+        ));
+    }
+
+    let operation = server_operation_lock(&state, &id).await;
+    let operation_guard = operation.lock().await;
+    let server = {
+        let data = state.inner.read().await;
+        let server = data
+            .servers
+            .iter()
+            .find(|server| server.id == id)
+            .cloned()
+            .ok_or((StatusCode::NOT_FOUND, "server not found".into()))?;
+        require_server_kind(&server, "core upload")?;
+        if server.workspace_path.is_some() {
+            return Err((
+                StatusCode::CONFLICT,
+                "已有服务器目录不能由创建向导覆盖核心".into(),
+            ));
+        }
+        if server.core_source != "local_upload" {
+            return Err((
+                StatusCode::CONFLICT,
+                "该服务器不是本地上传核心工作区，请通过资源库初始化".into(),
+            ));
+        }
+        if server.core_ready {
+            return Err((
+                StatusCode::CONFLICT,
+                "服务器核心已经就绪，不能由创建向导覆盖核心".into(),
+            ));
+        }
+        if state.processes.read().await.contains_key(&id) {
+            return Err((
+                StatusCode::CONFLICT,
+                "服务器正在运行，请先停止后再上传核心".into(),
+            ));
+        }
+        if state
+            .downloads
+            .read()
+            .await
+            .get(&id)
+            .is_some_and(download::is_active)
+        {
+            return Err((StatusCode::CONFLICT, "已有核心下载任务在进行中".into()));
+        }
+        if data.tasks.iter().any(|task| {
+            task.server_id == id
+                && task.kind == "server_provision"
+                && matches!(task.status.as_str(), "queued" | "running" | "cancelling")
+        }) {
+            return Err((StatusCode::CONFLICT, "服务器初始化任务正在执行".into()));
+        }
+        server
+    };
+
+    let root = ensure_workspace(&state, &id).await?;
+    let staging = root.join(format!(".sculk-core-upload-{}.part", Uuid::new_v4()));
+    let upload = async {
+        let mut uploaded_name: Option<String> = None;
+        let mut uploaded_size = 0u64;
+        let mut uploaded_hash = Sha256::new();
+
+        while let Some(mut field) = multipart.next_field().await.map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid multipart body: {error}"),
+            )
+        })? {
+            let field_name = field.name().map(str::to_owned);
+            if field_name.as_deref() != Some("file") {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "核心上传只接受一个 file 字段".into(),
+                ));
+            }
+            if uploaded_name.is_some() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "file field appears more than once".into(),
+                ));
+            }
+            let filename = field.file_name().map(str::to_owned).ok_or((
+                StatusCode::BAD_REQUEST,
+                "uploaded core file name is required".into(),
+            ))?;
+            validate_core_upload_filename(&filename)?;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staging)
+                .await
+                .map_err(|error| internal(error.to_string()))?;
+            while let Some(chunk) = field.chunk().await.map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("unable to read core upload: {error}"),
+                )
+            })? {
+                uploaded_size = uploaded_size
+                    .checked_add(chunk.len() as u64)
+                    .ok_or((StatusCode::PAYLOAD_TOO_LARGE, "上传文件大小溢出".into()))?;
+                if uploaded_size > MAX_FILE_TRANSFER_BYTES as u64 {
+                    return Err((
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        format!(
+                            "核心文件超过 {} MiB 限制",
+                            MAX_FILE_TRANSFER_BYTES / 1024 / 1024
+                        ),
+                    ));
+                }
+                uploaded_hash.update(&chunk);
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|error| internal(error.to_string()))?;
+            }
+            file.sync_all()
+                .await
+                .map_err(|error| internal(error.to_string()))?;
+            drop(file);
+            uploaded_name = Some(filename);
+        }
+
+        let filename =
+            uploaded_name.ok_or((StatusCode::BAD_REQUEST, "file field is required".into()))?;
+        if uploaded_size == 0 {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, "核心文件不能为空".into()));
+        }
+        validate_core_jar(&staging).await.map_err(|error| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("上传文件不是有效的 JAR 核心：{error}"),
+            )
+        })?;
+        let sha256 = download::hex_string(&uploaded_hash.finalize());
+        Ok::<_, (StatusCode, String)>((filename, uploaded_size, sha256))
+    }
+    .await;
+
+    let (filename, size, sha256) = match upload {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = fs::remove_file(&staging).await;
+            return Err(error);
+        }
+    };
+
+    let target = root.join("server.jar");
+    if fs::symlink_metadata(&target)
+        .await
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        let _ = fs::remove_file(&staging).await;
+        return Err((StatusCode::FORBIDDEN, "server.jar 不能是符号链接".into()));
+    }
+    if let Err(error) = download::install_download(&staging, &target).await {
+        let _ = fs::remove_file(&staging).await;
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, error));
+    }
+
+    let (server, provision_task) = {
+        let mut data = state.inner.write().await;
+        let index = data
+            .servers
+            .iter()
+            .position(|item| item.id == id)
+            .ok_or((StatusCode::NOT_FOUND, "server not found".into()))?;
+        let mut task = new_task_record(
+            id.clone(),
+            format!("校验本地核心 {}", filename),
+            "server_provision".into(),
+            "queued".into(),
+            0,
+            "low".into(),
+            None,
+        );
+        task.events.push(TaskEvent {
+            at: task.created_at.clone(),
+            level: "info".into(),
+            message: format!("本地 JAR 已接收（{} 字节，SHA-256 {sha256}）。", size),
+        });
+        data.tasks.insert(0, task.clone());
+        trim_task_history(&mut data.tasks, 50);
+        let item = &mut data.servers[index];
+        // A local upload supersedes a previously selected catalog artifact.
+        item.core_resource_id = None;
+        item.core_resource_version = None;
+        item.core_source = "local_upload".into();
+        item.core_ready = false;
+        item.operation_state = "provisioning".into();
+        item.last_error = None;
+        item.task = "正在校验本地核心".into();
+        let server = item.clone();
+        data.logs.entry(id.clone()).or_default().push(format!(
+            "[{} INFO]: 已上传本地核心 {}，SHA-256 {}；开始执行初始化。",
+            Local::now().format("%H:%M:%S"),
+            filename,
+            sha256
+        ));
+        persist(&state, &data).await.map_err(internal)?;
+        (server, task)
+    };
+    drop(operation_guard);
+    task_executor::spawn(state.clone(), provision_task.id).await;
+    Ok(Json(CoreUploadResponse {
+        server,
+        provision_task,
+        filename,
+        size,
+        sha256,
+    }))
+}
+
+fn validate_core_upload_filename(value: &str) -> Result<(), (StatusCode, String)> {
+    validate_upload_filename(value)?;
+    if !value.to_ascii_lowercase().ends_with(".jar") {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "本地核心文件扩展名必须为 .jar".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_core_jar(path: &StdPath) -> Result<(), String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let metadata = std::fs::metadata(&path).map_err(|error| error.to_string())?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Err("文件为空或不是普通文件".into());
+        }
+        let file = StdFile::open(&path).map_err(|error| error.to_string())?;
+        let mut archive =
+            zip::ZipArchive::new(file).map_err(|error| format!("ZIP 结构无效：{error}"))?;
+        if archive.len() == 0 {
+            return Err("JAR 压缩包不包含任何条目".into());
+        }
+        let mut has_manifest = false;
+        for index in 0..archive.len() {
+            let entry = archive
+                .by_index(index)
+                .map_err(|error| format!("无法读取 JAR 条目：{error}"))?;
+            if entry.name().eq_ignore_ascii_case("META-INF/MANIFEST.MF") {
+                has_manifest = true;
+                break;
+            }
+        }
+        if !has_manifest {
+            return Err("JAR 缺少 META-INF/MANIFEST.MF".into());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("JAR 校验任务失败：{error}"))?
+}
+
 async fn write_file(
     Path(id): Path<String>,
     State(state): State<AppState>,
@@ -5909,6 +6300,52 @@ fn validate_server_name(name: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn validate_core_name(name: &str) -> Result<(), &'static str> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("server core name is required");
+    }
+    if name.chars().count() > 64 {
+        return Err("server core name cannot exceed 64 characters");
+    }
+    if name.chars().any(char::is_control) {
+        return Err("server core name cannot contain control characters");
+    }
+    Ok(())
+}
+
+fn validate_minecraft_version(version: &str) -> Result<(), &'static str> {
+    let version = version.trim();
+    if version.is_empty() {
+        return Err("minecraft version is required");
+    }
+    if version.len() > 64
+        || version.chars().any(char::is_control)
+        || version.chars().any(char::is_whitespace)
+        || version.contains('/')
+    {
+        return Err("minecraft version contains unsafe characters");
+    }
+    Ok(())
+}
+
+fn validate_resource_token(value: &str) -> Result<(), &'static str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("resource catalog identifier is required");
+    }
+    if value.len() > 180
+        || !value.is_ascii()
+        || value.chars().any(char::is_control)
+        || value.chars().any(char::is_whitespace)
+        || value.contains('/')
+        || value.contains('\\')
+    {
+        return Err("resource catalog identifier contains unsafe characters");
+    }
+    Ok(())
+}
+
 fn validate_project_name(name: &str) -> Result<(), &'static str> {
     let name = name.trim();
     if name.is_empty() {
@@ -5946,11 +6383,15 @@ fn validate_catalog_server_template(
         })
         .ok_or("server core is not available in the catalog")?;
     if catalog.core_versions.iter().any(|version| {
-        version.project == project.slug
+        version.project.eq_ignore_ascii_case(&project.slug)
+            && version.status.eq_ignore_ascii_case("published")
+            && version.channel.eq_ignore_ascii_case("stable")
             && version
                 .minecraft_versions
                 .iter()
-                .any(|item| item == minecraft_version)
+                .any(|item| item.eq_ignore_ascii_case(minecraft_version))
+            && catalog::resolve_core_download(catalog, &project.slug, minecraft_version, "stable")
+                .is_some()
     }) {
         Ok(())
     } else {
@@ -6291,7 +6732,9 @@ mod tests {
             kind: "server".into(),
             name: format!("{id} server"),
             core: "Paper".into(),
+            core_source: "catalog".into(),
             core_resource_id: None,
+            core_resource_version: None,
             version: "1.21.4".into(),
             status: status.into(),
             players: "0 / 60".into(),
@@ -6367,6 +6810,7 @@ mod tests {
             runtime_install: Arc::new(Mutex::new(())),
             task_controls: Arc::new(RwLock::new(HashMap::new())),
             cloud: cloud::CloudRuntime::disabled_for_test(),
+            bridge: player_bridge::BridgeRuntime::default(),
         };
         (state, directory)
     }
@@ -6529,6 +6973,36 @@ mod tests {
             safe_download_filename(StdPath::new("备份 文件.zip")),
             "_____.zip"
         );
+    }
+
+    #[test]
+    fn core_upload_names_require_a_safe_jar_filename() {
+        for name in ["server.jar", "Paper-1.21.4.JAR", "核心.jar"] {
+            assert!(
+                validate_core_upload_filename(name).is_ok(),
+                "rejected {name}"
+            );
+        }
+        for name in ["server.zip", "server.jar.part", "a/b.jar"] {
+            assert!(
+                validate_core_upload_filename(name).is_err(),
+                "accepted {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn core_source_and_resource_tokens_are_validated() {
+        assert!(validate_resource_token("paper").is_ok());
+        assert!(validate_resource_token("1.21.4-232").is_ok());
+        for value in ["", "../paper", "paper build", "核心"] {
+            assert!(
+                validate_resource_token(value).is_err(),
+                "accepted {value:?}"
+            );
+        }
+        assert!(validate_minecraft_version("1.21.4").is_ok());
+        assert!(validate_minecraft_version("1/21").is_err());
     }
 
     #[test]
@@ -7532,6 +8006,7 @@ mod tests {
             runtime_install: Arc::new(Mutex::new(())),
             task_controls: Arc::new(RwLock::new(HashMap::new())),
             cloud: cloud::CloudRuntime::disabled_for_test(),
+            bridge: player_bridge::BridgeRuntime::default(),
         };
 
         tokio::spawn(run_process_actor(

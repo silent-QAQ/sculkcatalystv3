@@ -1,0 +1,44 @@
+# 是否启用桥接。首次部署前请先填写 server-id、backend-ws-url 和 token。
+enabled: false
+
+# 后端为该 Paper 服务器分配的稳定标识；不要用玩家名或公开地址代替。
+server-id: "change-me"
+
+# 后端桥接 WebSocket 地址。生产环境必须使用 wss://。
+backend-ws-url: "ws://127.0.0.1:8787/api/bridge/v1/ws"
+
+# 每服独立的高熵密钥；不要提交真实值，也不要在日志中打印它。
+token: "CHANGE_ME"
+
+# 网络传输与重连设置。
+network:
+  # 网络层的有界出站队列容量。满时会丢弃新消息并记录告警，避免拖慢主线程。
+  outbound-queue-capacity: 256
+  # 与后端连接、握手或写入超时秒数。
+  connect-timeout-seconds: 10
+  # 断线后的指数退避上限秒数。
+  reconnect-max-seconds: 30
+  # 已完成 hello_ack 后发送心跳的间隔秒数。
+  heartbeat-seconds: 15
+
+# 玩家快照与容器预览的上限。
+snapshot:
+  # 物品显示名、Lore 和 PAPI 结果的最大 UTF-8 字节数。
+  max-text-length: 256
+  # 单个物品最多发送的 Lore 行数。
+  max-lore-lines: 12
+  # 潜影盒与收纳袋预览的最大递归深度；0 表示不展开预览。
+  max-preview-depth: 1
+  # 每个容器预览最多发送的槽位数。
+  max-preview-items: 27
+
+# PlaceholderAPI 读取开关与变量白名单。
+papi:
+  # PlaceholderAPI 不存在时，PAPI 请求会明确返回 unavailable，不会回退到控制台命令。
+  enabled: true
+  # 只允许请求值精确匹配这里任一 value 的变量；响应仍按后端请求的字段 ID 返回。
+  fields:
+    # Vault 经济余额变量示例。
+    balance: "%vault_eco_balance%"
+    # LuckPerms 主权限组变量示例。
+    primary_group: "%luckperms_primary_group_name%"

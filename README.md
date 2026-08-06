@@ -37,6 +37,7 @@ Sculk Catalyst V3 是一个 AI 驱动的 Minecraft 服务器工作台。它把�
 
 - [项目状态](#项目状态)
 - [功能概览](#功能概览)
+- [玩家管理与 Paper/Folia 桥接](#玩家管理与-paperfolia-桥接)
 - [运行架构](#运行架构)
 - [运行模式](#运行模式)
 - [API 快速参考](#api-快速参考)
@@ -74,7 +75,7 @@ Sculk Catalyst V3 是一个 AI 驱动的 Minecraft 服务器工作台。它把�
 | 模块 | 当前状态 | 已具备能力 | 主要缺口 |
 | --- | --- | --- | --- |
 | 本地工作台 | 已实现 MVP | 多服务器导航、项目模式、对话树、可调主栏分隔、服务器控制、任务和设置中心 | 以 Web 工作台交付；桌面应用打包、系统托盘和自动更新不在产品范围内 |
-| 开服向导 | 已实现 MVP | 普通创建、智能规划、Java/端口/磁盘检查、核心选择和工作区生成 | 远程路径创建、完整核心兼容矩阵 |
+| 开服向导 | 已实现 MVP | 普通创建、智能规划、Java/端口/磁盘检查、远程资源库精确构建选择、本地 JAR 上传和工作区生成 | 远程路径创建、完整核心兼容矩阵 |
 | 首次初始化 | 已实现 MVP | 持久化 `server_provision` 任务、核心下载与校验、Java 检查、取消、重试和后端重启后重新入队 | 字节级跨重启续传、限速和模板版本管理 |
 | 服务器进程 | 部分实现 | 真实 Java 子进程、就绪检测、优雅停止、超时强杀、原子重启、Windows Job Object、Unix 进程组、真实 CPU/RSS 指标 | 后端重启后不会重新接管已有 Java；崩溃自动恢复和历史进程重连 |
 | 实时终端 | 已实现 | WebSocket 日志、运行中的 stdin 转发、未运行时明确拒绝、断线回退轮询 | 命令历史、补全、多会话终端 |
@@ -84,7 +85,7 @@ Sculk Catalyst V3 是一个 AI 驱动的 Minecraft 服务器工作台。它把�
 | 资源中心 | 已实现，可独立部署 | 七类资源目录、版本管理、上传、大小与 SHA-256、稳定下载、Range/ETag 静态对象、OpenAPI | 多管理员 RBAC、分页、对象回收和更完整的限流审计 |
 | Sculk Cloud | 部分实现 | 账号、团队、设备、设置同步、审批、Token、用量、数据库迁移 | 云资源创建/调度接口仍返回 `501 deployment_planned` |
 | 主机 Agent | 部分实现 | 出站配对、指纹确认、心跳、任务租约、团队审批、Shell、持久终端、checkpoint、取消、重试、回滚、日志路径限制与脱敏 | 更细粒度文件/日志/进程权限、租约恢复和断线审计 |
-| 社区与运营 | 部分实现 | 玩家/反馈/投票/经济模块入口和本地持久化 | RCON/Query/管理插件接入、真实玩家和 TPS 数据 |
+| 社区与运营 | 部分实现 | 玩家搜索、排序、管理资料、等级/坐标、背包/末影箱与容器预览；Paper/Folia v2 实时桥接、PAPI 白名单字段、反馈/投票/经济模块入口 | 权限组与游戏数据写入、RCON/Query、真实 TPS、Paper/Folia 实服联调矩阵 |
 | Skills / MCP / 机器人 | 部分实现 | Minecraft 插件 Skill 编译期加载、参考注入、迁移；QQ/NapCat 与评论 webhook 适配器 | 通用 Skill 沙箱、签名、依赖升级、真实 MCP 客户端和更多平台适配 |
 
 能直接验证当前实现细节和路线的状态文档见 [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md)。
@@ -102,7 +103,27 @@ Sculk Catalyst V3 是一个 AI 驱动的 Minecraft 服务器工作台。它把�
 - 支持启动、停止、重启、状态查询、实时日志、终端命令和文本配置编辑。
 - 文件管理器限制在服务器工作区内，拒绝绝对路径、路径穿越和符号链接；文本编辑上限约 2 MB。
 - 文件和目录可在工作区内重命名；可直接变更 `.md`、`.txt`、`.yml`/`.yaml` 等后缀。扩展名不决定可编辑性，读取仍要求内容是 UTF-8 文本且不超过约 2 MB。
-- 文件上传/下载单文件上限 256 MiB，上传采用临时文件 + 原子重命名，默认不覆盖既有文件，并保护根目录 `server.jar`、`server.jar.part` 和 `server.jar.backup`。
+- 文件上传/下载单文件上限 256 MiB，上传采用临时文件 + 原子重命名，默认不覆盖既有文件，并保护根目录 `server.jar`、`server.jar.part` 和 `server.jar.backup`。创建向导的本地核心上传使用独立接口，校验 JAR 结构后才安装并初始化。
+
+### 玩家管理与 Paper/Folia 桥接
+
+社区页可以按游戏名、UUID、显示名、身份、标签或备注搜索玩家，并按玩家名、在线状态、等级和更新时间排序。管理员可维护显示名、身份、标签和备注；这些资料只保存在 Sculk 管理状态中，不会改写玩家的游戏数据。
+
+- 已连接 `SculkCatalystPaperBridge` 时，在线玩家的等级、维度、坐标、背包、装备栏、副手和末影箱由专属 Paper/Folia 插件实时提供；打开详情会按需刷新完整快照。
+- 潜影盒和收纳袋可查看受限的嵌套物品预览，格位中可显示物品名称、数量和 Lore；原始 NBT、序列化 `ItemStack` 和第三方插件私有数据不会传出。
+- 桥接断开会清空实时在线 presence，但保留短期只读快照供界面明确标记为缓存数据。`world/playerdata/*.dat` 只用于离线玩家或桥接不可用时的只读兜底，不能当作在线状态或即时背包数据。
+- 前端可为每台服务器指定最多 10 个 PlaceholderAPI 显示字段。插件只会解析其 `config.yml` 的 `papi.fields` 中精确列出的变量；PlaceholderAPI 为可选依赖，未安装、未启用或变量不在白名单时会返回可见状态，不会伪造值。
+
+桥接协议为 v2：连接依次经过 `hello_init -> 一次性 challenge -> 签名 hello -> 签名 hello_ack`。握手完成后，双向会话帧均使用 HMAC 签名，`payload_json` 是无填充 Base64URL 编码的 UTF-8 JSON；密钥只保存在后端受控环境变量和插件配置中，不会放入 WebSocket 帧。
+
+#### 部署
+
+1. 使用 Java 21 构建或取得桥接 JAR，并放入目标 Paper/Folia 服务器的 `plugins/` 目录。插件以 Paper API `1.21.6` 为编译基线，声明 `folia-supported: true`，只读取玩家数据。
+2. 首次启动后，在 `plugins/SculkCatalystPaperBridge/config.yml` 设置 `enabled: true`、稳定的 `server-id`、`backend-ws-url` 和每服独立的高熵 `token`；生产环境使用 `wss://<面板地址>/api/bridge/v1/ws`。
+3. 在后端配置同一密钥。推荐使用 `SCULK_BRIDGE_TOKENS=server-id=token` 为每服单独绑定；仅本机开发可使用 `SCULK_BRIDGE_TOKEN` 作为默认密钥。需要变量展示时，再启用 `papi.enabled` 并在 `papi.fields` 中配置允许的 PlaceholderAPI 表达式。
+4. 重启服务器后，通过 `GET /api/servers/{server_id}/bridge/status` 确认连接、能力和快照数量。反向代理应只暴露受控端点并使用 TLS。
+
+当前尚未在真实 Paper/Folia 服务端完成联调。上线前仍应分别验证插件启停、断线重连、跨区移动、玩家退出、潜影盒/收纳袋预览及每个启用的 PlaceholderAPI 扩展。
 
 ### 初始化、下载和 Java
 
@@ -189,11 +210,15 @@ flowchart LR
 | --- | --- | --- |
 | `GET` | `/api/health` | 后端健康检查，返回 `ok` |
 | `GET` | `/api/dashboard` | 读取工作台总览、服务器和任务状态 |
-| `POST` | `/api/servers` | 创建服务器并生成首次初始化任务 |
+| `POST` | `/api/servers` | 创建服务器；资源库模式生成首次初始化任务，本地上传模式等待 JAR |
+| `POST` | `/api/servers/{id}/core/upload` | 上传并校验本地核心 JAR，安装为 `server.jar` 后启动初始化 |
 | `POST` | `/api/servers/{id}/provision` | 启动或重试核心初始化 |
 | `POST` | `/api/servers/{id}/action` | 启动、停止或重启服务器进程 |
 | `POST` | `/api/servers/{id}/command` | 向运行中的服务器 stdin 发送命令 |
 | `GET` | `/api/servers/{id}/ws/logs` | 订阅实时日志 WebSocket |
+| `GET` | `/api/servers/{id}/players?query=&sort=&order=` | 搜索、排序并读取玩家列表 |
+| `GET` / `PUT` | `/api/servers/{id}/players/{player_key}` | 查看玩家快照或维护管理资料 |
+| `GET` | `/api/servers/{id}/bridge/status` | 读取 Paper/Folia 玩家桥接连接与缓存状态 |
 | `POST` | `/api/chat/stream` | 获取 SSE 流式 AI 对话回复 |
 | `GET` | `/api/resource-catalog/...` | 主控制台读取远程资源目录的同源只读代理 |
 | `GET` | `/api/openapi.json` | 独立资源中心的 OpenAPI 描述 |
@@ -536,6 +561,8 @@ npm run build
 | `SCULK_STATE_FILE` | JSON 状态文件路径 | 默认是 `SCULK_DATA_DIR/state.json` |
 | `SCULK_JAVA_BIN` | 指定 Java 可执行文件 | 优先级高于托管 Java、`JAVA_HOME` 和 PATH |
 | `SCULK_ALLOWED_ORIGINS` | CORS 允许的前端来源 | 生产环境填写精确来源，不要使用宽泛通配 |
+| `SCULK_BRIDGE_TOKEN` | Paper/Folia 玩家桥接的默认 HMAC 密钥 | 至少 24 个字符；仅适合所有受控服务器共用密钥的本机开发场景 |
+| `SCULK_BRIDGE_TOKENS` | Paper/Folia 玩家桥接的每服 HMAC 密钥 | 推荐生产使用；逗号分隔的 `server_id=token`，同名服务器配置优先于默认密钥 |
 | `SCULK_RESOURCE_API_BASE` | 主控制台只读代理连接的资源 API 上游 | 未配置时回退到 `https://res.mcmy.love` |
 | `SCULK_RESOURCE_PROXY_MAX_BYTES` | 主控制台资源代理的单响应上限 | 默认 16 MiB，实际范围 64 KiB–64 MiB |
 | `SCULK_RESOURCE_API_TOKEN` | 反向代理层校验资源同步写请求的令牌 | 由 Caddy 使用，应与 `SCULK_CATALOG_ADMIN_TOKEN` 保持一致 |

@@ -1,6 +1,4 @@
-use super::{
-    AppState, ProcessCommand, ServerInfo, log_channel, persist, workspace_directory_for_server,
-};
+use super::{AppState, ServerInfo, persist, player_bridge, workspace_directory_for_server};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -8,7 +6,7 @@ use axum::{
     routing::get,
 };
 use cap_std::{ambient_authority, fs::Dir as CapDir};
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Utc};
 use fastnbt::Value as NbtValue;
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
@@ -18,11 +16,7 @@ use std::{
     io::Read,
     path::{Path as StdPath, PathBuf},
 };
-use tokio::{
-    fs,
-    sync::oneshot,
-    time::{Duration, Instant, timeout},
-};
+use tokio::fs;
 use uuid::Uuid;
 
 const MAX_PLAYER_DATA_FILES: usize = 1_000;
@@ -104,6 +98,12 @@ struct PlayerDataSource {
     available: bool,
     world: Option<String>,
     detail: String,
+    #[serde(default)]
+    freshness: String,
+    #[serde(default)]
+    bridge_connected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fallback_reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -177,7 +177,7 @@ struct InventorySlot {
 #[derive(Clone, Serialize)]
 struct PlayerItem {
     id: String,
-    count: u32,
+    count: Option<u32>,
     name: Option<String>,
     lore: Vec<String>,
     container: Option<ContainerPreview>,
@@ -192,16 +192,16 @@ struct ContainerPreview {
 
 #[derive(Clone)]
 struct PlayerSnapshot {
-    level: i32,
-    experience_progress: f32,
-    total_experience: i32,
+    level: Option<i32>,
+    experience_progress: Option<f32>,
+    total_experience: Option<i32>,
     dimension: Option<String>,
     position: Option<PlayerPosition>,
     game_mode: Option<String>,
     health: Option<f32>,
     food_level: Option<i32>,
-    inventory: InventoryView,
-    ender_chest: InventoryView,
+    inventory: Option<InventoryView>,
+    ender_chest: Option<InventoryView>,
 }
 
 #[derive(Clone)]
@@ -291,11 +291,45 @@ async fn get_player(
     Path((server_id, player_key)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> ApiResult<PlayerDetailResponse> {
-    let (source, records, _) = collect_player_records(&state, &server_id).await?;
-    let record = records
+    let (mut source, records, _) = collect_player_records(&state, &server_id).await?;
+    let mut record = records
         .into_iter()
         .find(|record| record.key == player_key)
         .ok_or((StatusCode::NOT_FOUND, "未找到玩家快照或在线记录".into()))?;
+    let bridge_status = state.bridge.status(&server_id).await;
+    let can_refresh_snapshot = record.status == "online"
+        && record.uuid.is_some()
+        && bridge_status.connected
+        && bridge_status
+            .capabilities
+            .iter()
+            .any(|capability| capability == "snapshot");
+    if can_refresh_snapshot && let Some(uuid) = record.uuid {
+        match state.bridge.request_snapshot(&server_id, uuid).await {
+            Ok(live) => {
+                let freshness = live.freshness();
+                let snapshot = live.snapshot;
+                record.name = snapshot.name.clone();
+                record.status = if snapshot.online { "online" } else { "offline" }.into();
+                record.source = format!("paper_bridge_{freshness}");
+                record.snapshot = Some(player_snapshot_from_bridge(&snapshot));
+                record.updated_at = bridge_timestamp(snapshot.observed_at);
+                source.available = true;
+                source.kind = "paper_bridge".into();
+                source.freshness = freshness.into();
+                source.bridge_connected = true;
+                source.fallback_reason = None;
+                source.detail = "Paper/Folia 插件已按需返回该玩家的实时快照。".into();
+            }
+            Err(_) => {
+                source.freshness = "stale".into();
+                source.fallback_reason = Some("snapshot_request_failed".into());
+                source.detail =
+                    "Paper/Folia 实时快照请求未完成；详情使用最近桥接缓存或 playerdata 兜底。"
+                        .into();
+            }
+        }
+    }
     let profile = profile_snapshot(&state, &server_id)
         .await
         .get(&record.key)
@@ -348,9 +382,9 @@ async fn get_papi_fields(
     Path(server_id): Path<String>,
     State(state): State<AppState>,
 ) -> ApiResult<PapiFieldsResponse> {
-    let (server, root) = player_server_context(&state, &server_id).await?;
-    let detected = placeholder_api_detected(&root).await;
-    let runtime_available = state.processes.read().await.contains_key(&server_id);
+    let _ = player_server_context(&state, &server_id).await?;
+    let (detected, runtime_available, message) =
+        papi_fields_runtime_status(&state, &server_id).await;
     let fields = state
         .inner
         .read()
@@ -360,7 +394,6 @@ async fn get_papi_fields(
         .get(&server_id)
         .cloned()
         .unwrap_or_default();
-    let message = papi_status_message(detected, runtime_available, &server);
     Ok(Json(PapiFieldsResponse {
         detected,
         runtime_available,
@@ -374,10 +407,10 @@ async fn update_papi_fields(
     State(state): State<AppState>,
     Json(request): Json<UpdatePapiFieldsRequest>,
 ) -> ApiResult<PapiFieldsResponse> {
-    let (server, root) = player_server_context(&state, &server_id).await?;
+    let _ = player_server_context(&state, &server_id).await?;
     let fields = normalize_papi_fields(request.fields)?;
-    let detected = placeholder_api_detected(&root).await;
-    let runtime_available = state.processes.read().await.contains_key(&server_id);
+    let (detected, runtime_available, message) =
+        papi_fields_runtime_status(&state, &server_id).await;
     let mut data = state.inner.write().await;
     data.player_management
         .papi_fields
@@ -387,7 +420,7 @@ async fn update_papi_fields(
         detected,
         runtime_available,
         fields,
-        message: papi_status_message(detected, runtime_available, &server),
+        message,
     }))
 }
 
@@ -395,7 +428,7 @@ async fn get_player_papi_values(
     Path((server_id, player_key)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> ApiResult<PapiValuesResponse> {
-    let (server, root) = player_server_context(&state, &server_id).await?;
+    let _ = player_server_context(&state, &server_id).await?;
     let (_, records, _) = collect_player_records(&state, &server_id).await?;
     let record = records
         .into_iter()
@@ -413,56 +446,99 @@ async fn get_player_papi_values(
         .into_iter()
         .filter(|field| field.enabled)
         .collect::<Vec<_>>();
-    let detected = placeholder_api_detected(&root).await;
-    let runtime_available = state.processes.read().await.contains_key(&server_id);
-    if fields.is_empty() {
-        return Ok(Json(PapiValuesResponse {
-            detected,
-            runtime_available,
-            fields: Vec::new(),
-            message: "尚未配置要显示的 PlaceholderAPI 变量".into(),
-        }));
+    let bridge_status = state.bridge.status(&server_id).await;
+    if bridge_status.connected {
+        let papi_available = bridge_supports_papi(&bridge_status.capabilities);
+        if !papi_available {
+            return Ok(Json(PapiValuesResponse {
+                detected: false,
+                runtime_available: true,
+                fields: unavailable_papi_values(&fields, "bridge_capability_unavailable"),
+                message: "Paper/Folia 桥接已连接，但插件未声明 papi_read 能力，无法解析 PlaceholderAPI 变量。"
+                    .into(),
+            }));
+        }
+        if fields.is_empty() {
+            return Ok(Json(PapiValuesResponse {
+                detected: papi_available,
+                runtime_available: true,
+                fields: Vec::new(),
+                message: "尚未配置要显示的 PlaceholderAPI 变量".into(),
+            }));
+        }
+        let Some(uuid) = record.uuid else {
+            return Ok(Json(PapiValuesResponse {
+                detected: papi_available,
+                runtime_available: true,
+                fields: unavailable_papi_values(&fields, "player_unresolved"),
+                message: "当前在线记录尚未解析 UUID，不能通过 Paper/Folia 桥接查询变量".into(),
+            }));
+        };
+        let request_fields = fields
+            .iter()
+            .map(|field| player_bridge::BridgePapiRequestField {
+                id: field.id.to_string(),
+                placeholder: field.placeholder.clone(),
+            })
+            .collect();
+        return match state
+            .bridge
+            .request_papi(&server_id, uuid, request_fields)
+            .await
+        {
+            Ok(response) if response.player_uuid == uuid => Ok(Json(PapiValuesResponse {
+                detected: papi_available,
+                runtime_available: true,
+                fields: bridge_papi_values(&fields, &response),
+                message: if response.status == "ok" {
+                    "通过 Paper/Folia 插件的 PlaceholderAPI API 即时解析".into()
+                } else {
+                    format!(
+                        "Paper/Folia 插件未能解析变量：{}",
+                        response.error_code.as_deref().unwrap_or("unavailable")
+                    )
+                },
+            })),
+            Ok(_) => Ok(Json(PapiValuesResponse {
+                detected: false,
+                runtime_available: true,
+                fields: unavailable_papi_values(&fields, "response_mismatch"),
+                message: "Paper/Folia 桥接返回了不匹配的玩家变量响应".into(),
+            })),
+            Err(error) => Ok(Json(PapiValuesResponse {
+                detected: papi_available,
+                runtime_available: true,
+                fields: unavailable_papi_values(&fields, "bridge_query_failed"),
+                message: format!("Paper/Folia 桥接变量查询失败：{error}"),
+            })),
+        };
     }
-    if !detected {
-        return Ok(Json(PapiValuesResponse {
-            detected,
-            runtime_available,
-            fields: unavailable_papi_values(&fields, "not_detected"),
-            message: "未在 plugins 目录检测到 PlaceholderAPI JAR".into(),
-        }));
-    }
-    if !runtime_available {
-        return Ok(Json(PapiValuesResponse {
-            detected,
-            runtime_available,
-            fields: unavailable_papi_values(&fields, "server_stopped"),
-            message: "服务器未运行，无法通过 PlaceholderAPI 解析变量".into(),
-        }));
-    }
-    if !is_valid_player_name(&record.name) {
-        return Ok(Json(PapiValuesResponse {
-            detected,
-            runtime_available,
-            fields: unavailable_papi_values(&fields, "player_unresolved"),
-            message: "未能解析为有效 Minecraft 玩家名，无法调用 PlaceholderAPI".into(),
-        }));
-    }
-    let marker = format!("SCULK_PAPI_{}", Uuid::new_v4().simple());
-    let command = papi_parse_command(&record.name, &fields, &marker);
-    match run_console_query(&state, &server_id, &command, &marker).await {
-        Ok(line) => Ok(Json(PapiValuesResponse {
-            detected,
-            runtime_available,
-            fields: parse_papi_values(&line, &fields, &marker),
-            message: format!("通过 {} 的 PlaceholderAPI 控制台命令即时解析", server.name),
-        })),
-        Err(error) => Ok(Json(PapiValuesResponse {
-            detected,
-            runtime_available,
-            fields: unavailable_papi_values(&fields, "query_failed"),
-            message: format!("变量查询失败：{error}"),
-        })),
-    }
+    Ok(Json(bridge_unavailable_papi_values_response(&fields)))
+}
+
+fn bridge_papi_values(
+    fields: &[PapiField],
+    response: &player_bridge::BridgePapiResponse,
+) -> Vec<PapiValue> {
+    fields
+        .iter()
+        .map(|field| {
+            let key = field.id.to_string();
+            let value = response.fields.get(&key);
+            PapiValue {
+                id: field.id,
+                label: field.label.clone(),
+                placeholder: field.placeholder.clone(),
+                value: value.and_then(|value| value.value.clone()),
+                status: value.map(|value| value.status.clone()).unwrap_or_else(|| {
+                    response
+                        .error_code
+                        .clone()
+                        .unwrap_or_else(|| "unavailable".into())
+                }),
+            }
+        })
+        .collect()
 }
 
 fn internal_error(error: String) -> (StatusCode, String) {
@@ -496,37 +572,118 @@ async fn collect_player_records(
     server_id: &str,
 ) -> Result<(PlayerDataSource, Vec<PlayerRecord>, Vec<String>), (StatusCode, String)> {
     let (_, root) = player_server_context(state, server_id).await?;
-    let (world, source) = player_data_source(&root).await;
+    let (world, mut source) = player_data_source(&root).await;
     let online_names = online_player_names(state, server_id).await;
     let names = load_player_names(&root).await;
+    let bridge_status = state.bridge.status(server_id).await;
+    let bridge_snapshots = state.bridge.snapshots(server_id).await;
+    let bridge_presence = state.bridge.presences(server_id).await;
+    let bridge_connected = bridge_status.connected;
+    let mut bridge_by_uuid = bridge_snapshots
+        .iter()
+        .cloned()
+        .map(|snapshot| (snapshot.snapshot.uuid, snapshot))
+        .collect::<HashMap<_, _>>();
+    let presence_by_uuid = bridge_presence
+        .iter()
+        .cloned()
+        .map(|presence| (presence.uuid, presence))
+        .collect::<HashMap<_, _>>();
     let mut warnings = Vec::new();
     let mut records = Vec::new();
     let mut known_online_names = HashSet::new();
+
+    if bridge_connected || !bridge_snapshots.is_empty() || !bridge_presence.is_empty() {
+        source.available = true;
+        source.bridge_connected = bridge_connected;
+        source.kind = "paper_bridge".into();
+        source.freshness = bridge_snapshots
+            .iter()
+            .map(player_bridge::BridgeSnapshotView::freshness)
+            .min_by_key(|freshness| match *freshness {
+                "live" => 0,
+                "stale" => 1,
+                _ => 2,
+            })
+            .unwrap_or(if bridge_connected {
+                "connected"
+            } else {
+                "stale"
+            })
+            .into();
+        source.detail = if bridge_connected {
+            "Paper/Folia 插件桥接在线；玩家实时数据优先于 playerdata。".into()
+        } else {
+            "Paper/Folia 插件桥接暂时断开；当前显示的是最近桥接快照或 playerdata 兜底。".into()
+        };
+        if !bridge_connected {
+            source.fallback_reason = Some("paper_bridge_unavailable".into());
+        }
+    }
 
     if let Some(world) = world {
         match collect_player_data_files(&root, &world).await {
             Ok(players) => {
                 for player in players {
                     let uuid = player.uuid;
-                    let name = names
+                    let fallback_name = names
                         .get(&uuid)
                         .cloned()
                         .unwrap_or_else(|| short_uuid(&uuid));
-                    let online = online_names
+                    let telemetry_online = online_names
                         .iter()
-                        .any(|candidate| candidate.eq_ignore_ascii_case(&name));
+                        .any(|candidate| candidate.eq_ignore_ascii_case(&fallback_name));
                     if let Some(error) = player.error {
                         warnings.push(format!("无法读取玩家数据 {uuid}：{error}"));
                     }
+                    if let Some(live) = bridge_by_uuid.remove(&uuid) {
+                        let live_snapshot = live.snapshot.clone();
+                        if live_snapshot.online {
+                            known_online_names.insert(live_snapshot.name.to_ascii_lowercase());
+                        }
+                        records.push(PlayerRecord {
+                            key: uuid.to_string(),
+                            uuid: Some(uuid),
+                            name: live_snapshot.name.clone(),
+                            status: if live_snapshot.online {
+                                "online"
+                            } else {
+                                "offline"
+                            }
+                            .into(),
+                            source: format!("paper_bridge_{}", live.freshness()),
+                            snapshot: Some(player_snapshot_from_bridge(&live_snapshot)),
+                            updated_at: bridge_timestamp(live_snapshot.observed_at)
+                                .or(player.updated_at),
+                        });
+                        continue;
+                    }
+                    let presence = presence_by_uuid.get(&uuid);
+                    let online = presence.map_or(telemetry_online, |presence| presence.online);
+                    let name = presence
+                        .map(|presence| presence.name.clone())
+                        .unwrap_or(fallback_name);
                     if online {
                         known_online_names.insert(name.to_ascii_lowercase());
                     }
+                    let source_name = if presence.is_some() {
+                        "paper_bridge_presence+world_playerdata"
+                    } else {
+                        "world_playerdata"
+                    };
                     records.push(PlayerRecord {
                         key: uuid.to_string(),
                         uuid: Some(uuid),
                         name,
-                        status: if online { "online" } else { "offline" }.into(),
-                        source: "world_playerdata".into(),
+                        status: if bridge_connected && presence.is_none() {
+                            "unknown"
+                        } else if online {
+                            "online"
+                        } else {
+                            "offline"
+                        }
+                        .into(),
+                        source: source_name.into(),
                         snapshot: player.snapshot,
                         updated_at: player.updated_at,
                     });
@@ -536,8 +693,49 @@ async fn collect_player_records(
         }
     }
 
-    for name in online_names {
-        if !known_online_names.contains(&name.to_ascii_lowercase()) {
+    for live in bridge_by_uuid.into_values() {
+        let freshness = live.freshness();
+        let snapshot = live.snapshot;
+        if snapshot.online {
+            known_online_names.insert(snapshot.name.to_ascii_lowercase());
+        }
+        records.push(PlayerRecord {
+            key: snapshot.uuid.to_string(),
+            uuid: Some(snapshot.uuid),
+            name: snapshot.name.clone(),
+            status: if snapshot.online { "online" } else { "offline" }.into(),
+            source: format!("paper_bridge_{freshness}"),
+            snapshot: Some(player_snapshot_from_bridge(&snapshot)),
+            updated_at: bridge_timestamp(snapshot.observed_at),
+        });
+    }
+
+    for presence in bridge_presence {
+        if records
+            .iter()
+            .any(|record| record.uuid == Some(presence.uuid))
+        {
+            continue;
+        }
+        if presence.online {
+            known_online_names.insert(presence.name.to_ascii_lowercase());
+        }
+        records.push(PlayerRecord {
+            key: presence.uuid.to_string(),
+            uuid: Some(presence.uuid),
+            name: presence.name,
+            status: if presence.online { "online" } else { "offline" }.into(),
+            source: "paper_bridge_presence".into(),
+            snapshot: None,
+            updated_at: bridge_timestamp(presence.observed_at),
+        });
+    }
+
+    if !bridge_connected {
+        for name in online_names {
+            if known_online_names.contains(&name.to_ascii_lowercase()) {
+                continue;
+            }
             records.push(PlayerRecord {
                 key: runtime_player_key(&name),
                 uuid: None,
@@ -550,6 +748,60 @@ async fn collect_player_records(
         }
     }
     Ok((source, records, warnings))
+}
+
+fn player_snapshot_from_bridge(snapshot: &player_bridge::BridgePlayerSnapshot) -> PlayerSnapshot {
+    PlayerSnapshot {
+        level: snapshot.level,
+        experience_progress: snapshot.experience_progress,
+        total_experience: snapshot.total_experience,
+        dimension: snapshot.dimension.clone(),
+        position: snapshot.position.as_ref().map(|position| PlayerPosition {
+            x: position.x,
+            y: position.y,
+            z: position.z,
+        }),
+        game_mode: snapshot.game_mode.clone(),
+        health: snapshot.health,
+        food_level: snapshot.food_level,
+        inventory: snapshot.inventory.as_ref().map(bridge_inventory),
+        ender_chest: snapshot.ender_chest.as_ref().map(bridge_inventory),
+    }
+}
+
+fn bridge_inventory(inventory: &player_bridge::BridgeInventoryView) -> InventoryView {
+    InventoryView {
+        slots: inventory.slots.iter().map(bridge_slot).collect(),
+    }
+}
+
+fn bridge_slot(slot: &player_bridge::BridgeInventorySlot) -> InventorySlot {
+    InventorySlot {
+        slot: slot.slot,
+        item: slot.item.as_ref().map(bridge_item),
+    }
+}
+
+fn bridge_item(item: &player_bridge::BridgeItem) -> PlayerItem {
+    PlayerItem {
+        id: item.id.clone(),
+        count: Some(item.count),
+        name: item.name.clone(),
+        lore: item.lore.clone(),
+        container: item.container.as_ref().map(bridge_container),
+    }
+}
+
+fn bridge_container(container: &player_bridge::BridgeContainerPreview) -> ContainerPreview {
+    ContainerPreview {
+        kind: container.kind.clone(),
+        size: container.size,
+        slots: container.slots.iter().map(bridge_slot).collect(),
+    }
+}
+
+fn bridge_timestamp(timestamp: i64) -> Option<String> {
+    DateTime::<Utc>::from_timestamp_millis(timestamp).map(|value| value.to_rfc3339())
 }
 
 async fn player_data_source(root: &StdPath) -> (Option<PathBuf>, PlayerDataSource) {
@@ -566,6 +818,9 @@ async fn player_data_source(root: &StdPath) -> (Option<PathBuf>, PlayerDataSourc
                 available: false,
                 world: world_name,
                 detail: "server.properties 的 level-name 无效，未读取玩家数据".into(),
+                freshness: "unavailable".into(),
+                bridge_connected: false,
+                fallback_reason: None,
             },
         );
     };
@@ -587,6 +842,9 @@ async fn player_data_source(root: &StdPath) -> (Option<PathBuf>, PlayerDataSourc
             available,
             world: world_name,
             detail,
+            freshness: if available { "stale" } else { "unavailable" }.into(),
+            bridge_connected: false,
+            fallback_reason: None,
         },
     )
 }
@@ -844,15 +1102,18 @@ async fn online_player_names(state: &AppState, server_id: &str) -> Vec<String> {
 
 fn parse_player_snapshot(root: &NbtValue) -> Result<PlayerSnapshot, String> {
     let data = nbt_compound(root).ok_or_else(|| "玩家 NBT 根节点不是 Compound".to_string())?;
-    let inventory_items = nbt_list(data, "Inventory")
-        .map(|items| parse_inventory_items(items, 0))
-        .unwrap_or_default();
-    let ender_items = nbt_list(data, "EnderItems")
-        .map(|items| parse_inventory_items(items, 0))
-        .unwrap_or_default();
-    let level = nbt_i32(data, "XpLevel").unwrap_or_default();
-    let experience_progress = nbt_f32(data, "XpP").unwrap_or_default();
-    let total_experience = nbt_i32(data, "XpTotal").unwrap_or_default();
+    let inventory = nbt_list(data, "Inventory").map(|items| InventoryView {
+        slots: fill_slots(&parse_inventory_items(items, 0), &player_inventory_slots()),
+    });
+    let ender_chest = nbt_list(data, "EnderItems").map(|items| InventoryView {
+        slots: fill_slots(
+            &parse_inventory_items(items, 0),
+            &(0..27).collect::<Vec<_>>(),
+        ),
+    });
+    let level = nbt_i32(data, "XpLevel");
+    let experience_progress = nbt_f32(data, "XpP");
+    let total_experience = nbt_i32(data, "XpTotal");
     let dimension = nbt_string(data, "Dimension").map(ToString::to_string);
     let position = nbt_list(data, "Pos").and_then(parse_position);
     let game_mode = nbt_i32(data, "playerGameType").map(game_mode_name);
@@ -867,12 +1128,8 @@ fn parse_player_snapshot(root: &NbtValue) -> Result<PlayerSnapshot, String> {
         game_mode,
         health,
         food_level,
-        inventory: InventoryView {
-            slots: fill_slots(&inventory_items, &player_inventory_slots()),
-        },
-        ender_chest: InventoryView {
-            slots: fill_slots(&ender_items, &(0..27).collect::<Vec<_>>()),
-        },
+        inventory,
+        ender_chest,
     })
 }
 
@@ -921,8 +1178,7 @@ fn parse_item(
     let id = nbt_string(item, "id")?.to_string();
     let count = nbt_i32(item, "count")
         .or_else(|| nbt_i32(item, "Count"))
-        .unwrap_or(1)
-        .max(0) as u32;
+        .map(|count| count.max(0) as u32);
     let (name, lore) = item_display_text(item);
     let container = (depth < MAX_CONTAINER_DEPTH)
         .then(|| item_container(item, &id, depth + 1))
@@ -1195,7 +1451,7 @@ fn player_list_item(record: PlayerRecord, profile: PlayerProfileMetadata) -> Pla
         profile,
         status: record.status,
         source: record.source,
-        level: snapshot.map(|snapshot| snapshot.level),
+        level: snapshot.and_then(|snapshot| snapshot.level),
         dimension: snapshot.and_then(|snapshot| snapshot.dimension.clone()),
         position: snapshot.and_then(|snapshot| snapshot.position.clone()),
         game_mode: snapshot.and_then(|snapshot| snapshot.game_mode.clone()),
@@ -1212,11 +1468,13 @@ fn player_detail(record: PlayerRecord, profile: PlayerProfileMetadata) -> Player
         profile,
         status: record.status,
         source: record.source,
-        level: snapshot.as_ref().map(|snapshot| snapshot.level),
+        level: snapshot.as_ref().and_then(|snapshot| snapshot.level),
         experience_progress: snapshot
             .as_ref()
-            .map(|snapshot| snapshot.experience_progress),
-        total_experience: snapshot.as_ref().map(|snapshot| snapshot.total_experience),
+            .and_then(|snapshot| snapshot.experience_progress),
+        total_experience: snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.total_experience),
         dimension: snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.dimension.clone()),
@@ -1229,8 +1487,12 @@ fn player_detail(record: PlayerRecord, profile: PlayerProfileMetadata) -> Player
         health: snapshot.as_ref().and_then(|snapshot| snapshot.health),
         food_level: snapshot.as_ref().and_then(|snapshot| snapshot.food_level),
         updated_at: record.updated_at,
-        inventory: snapshot.as_ref().map(|snapshot| snapshot.inventory.clone()),
-        ender_chest: snapshot.map(|snapshot| snapshot.ender_chest),
+        inventory: snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.inventory.clone()),
+        ender_chest: snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.ender_chest.clone()),
     }
 }
 
@@ -1406,46 +1668,52 @@ fn is_valid_player_name(value: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
-async fn placeholder_api_detected(root: &StdPath) -> bool {
-    let root = root.to_owned();
-    tokio::task::spawn_blocking(move || {
-        let workspace = CapDir::open_ambient_dir(root, ambient_authority()).ok()?;
-        let plugins = StdPath::new("plugins");
-        super::reject_workspace_symlink(&workspace, plugins).ok()?;
-        let metadata = workspace.metadata(plugins).ok()?;
-        if !metadata.is_dir() {
-            return None;
-        }
-        let entries = workspace.read_dir(plugins).ok()?;
-        for entry in entries {
-            let entry = entry.ok()?;
-            let file_type = entry.file_type().ok()?;
-            if file_type.is_symlink() || !file_type.is_file() {
-                continue;
-            }
-            let filename = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            if filename.ends_with(".jar") && filename.contains("placeholderapi") {
-                return Some(true);
-            }
-        }
-        Some(false)
-    })
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or(false)
+async fn papi_fields_runtime_status(state: &AppState, server_id: &str) -> (bool, bool, String) {
+    let bridge_status = state.bridge.status(server_id).await;
+    if bridge_status.connected {
+        return bridge_papi_fields_status(&bridge_status.capabilities);
+    }
+
+    bridge_unavailable_papi_fields_status()
 }
 
-fn papi_status_message(detected: bool, runtime_available: bool, server: &ServerInfo) -> String {
-    if !detected {
-        "未在 plugins 目录检测到 PlaceholderAPI JAR；可先安装后再配置变量。".into()
-    } else if !runtime_available {
-        "已检测到 PlaceholderAPI，服务器启动后可解析已配置变量。".into()
-    } else {
-        format!(
-            "已检测到 PlaceholderAPI，可通过 {} 的受管控制台解析变量。",
-            server.name
+fn bridge_papi_fields_status(capabilities: &[String]) -> (bool, bool, String) {
+    if bridge_supports_papi(capabilities) {
+        (
+            true,
+            true,
+            "Paper/Folia 桥接已连接，PlaceholderAPI 变量将通过插件 API 解析。".into(),
         )
+    } else {
+        (
+            false,
+            true,
+            "Paper/Folia 桥接已连接，但插件未声明 papi_read 能力，无法通过桥接解析 PlaceholderAPI 变量。".into(),
+        )
+    }
+}
+
+fn bridge_supports_papi(capabilities: &[String]) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability == "papi_read")
+}
+
+fn bridge_unavailable_papi_fields_status() -> (bool, bool, String) {
+    (
+        false,
+        false,
+        "Paper/Folia 桥接未连接。为遵守桥接插件的 PlaceholderAPI 白名单，系统不会通过受管控制台解析变量。".into(),
+    )
+}
+
+fn bridge_unavailable_papi_values_response(fields: &[PapiField]) -> PapiValuesResponse {
+    let (detected, runtime_available, message) = bridge_unavailable_papi_fields_status();
+    PapiValuesResponse {
+        detected,
+        runtime_available,
+        fields: unavailable_papi_values(fields, "bridge_unavailable"),
+        message,
     }
 }
 
@@ -1458,102 +1726,6 @@ fn unavailable_papi_values(fields: &[PapiField], status: &str) -> Vec<PapiValue>
             placeholder: field.placeholder.clone(),
             value: None,
             status: status.into(),
-        })
-        .collect()
-}
-
-fn papi_parse_command(player_name: &str, fields: &[PapiField], marker: &str) -> String {
-    let mut template = String::new();
-    for (index, field) in fields.iter().enumerate() {
-        template.push_str(marker);
-        template.push('_');
-        template.push_str(&index.to_string());
-        template.push(':');
-        template.push_str(&field.placeholder);
-    }
-    template.push_str(marker);
-    template.push_str("_END");
-    format!("papi parse {player_name} {template}")
-}
-
-async fn run_console_query(
-    state: &AppState,
-    server_id: &str,
-    command: &str,
-    marker: &str,
-) -> Result<String, String> {
-    let mut receiver = log_channel(state, server_id).await.subscribe();
-    let process = state
-        .processes
-        .read()
-        .await
-        .get(server_id)
-        .cloned()
-        .ok_or_else(|| "服务器进程未运行".to_string())?;
-    let (reply, response) = oneshot::channel();
-    process
-        .control
-        .send(ProcessCommand::WriteLine {
-            line: command.to_string(),
-            reply,
-        })
-        .await
-        .map_err(|_| "服务器控制通道已关闭".to_string())?;
-    timeout(Duration::from_secs(2), response)
-        .await
-        .map_err(|_| "控制台命令发送超时".to_string())?
-        .map_err(|_| "服务器控制任务已退出".to_string())?
-        .map_err(|error| format!("无法写入控制台：{error}"))?;
-
-    let deadline = Instant::now() + Duration::from_secs(4);
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err("未收到 PlaceholderAPI 解析结果".into());
-        }
-        match timeout(remaining, receiver.recv()).await {
-            Ok(Ok(line)) if line.contains(marker) => return Ok(line),
-            Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                return Err("服务器日志通道已关闭".into());
-            }
-            Err(_) => return Err("等待 PlaceholderAPI 解析结果超时".into()),
-        }
-    }
-}
-
-fn parse_papi_values(line: &str, fields: &[PapiField], marker: &str) -> Vec<PapiValue> {
-    fields
-        .iter()
-        .enumerate()
-        .map(|(index, field)| {
-            let start_marker = format!("{marker}_{index}:");
-            let next_marker = if index + 1 < fields.len() {
-                format!("{marker}_{}:", index + 1)
-            } else {
-                format!("{marker}_END")
-            };
-            let value = line
-                .find(&start_marker)
-                .and_then(|start| {
-                    let value_start = start + start_marker.len();
-                    line[value_start..]
-                        .find(&next_marker)
-                        .map(|end| line[value_start..value_start + end].trim().to_string())
-                })
-                .filter(|value| !value.is_empty());
-            let status = match value.as_deref() {
-                Some(value) if value == field.placeholder => "unresolved",
-                Some(_) => "available",
-                None => "malformed_response",
-            };
-            PapiValue {
-                id: field.id,
-                label: field.label.clone(),
-                placeholder: field.placeholder.clone(),
-                value,
-                status: status.into(),
-            }
         })
         .collect()
 }
@@ -1614,12 +1786,13 @@ mod tests {
             ("EnderItems", NbtValue::List(Vec::new())),
         ]);
         let snapshot = parse_player_snapshot(&root).unwrap();
-        assert_eq!(snapshot.level, 24);
+        assert_eq!(snapshot.level, Some(24));
+        let inventory = snapshot.inventory.as_ref().unwrap();
         assert_eq!(
-            snapshot.inventory.slots[0].item.as_ref().unwrap().id,
+            inventory.slots[0].item.as_ref().unwrap().id,
             "minecraft:purple_shulker_box"
         );
-        let container = snapshot.inventory.slots[0]
+        let container = inventory.slots[0]
             .item
             .as_ref()
             .unwrap()
@@ -1634,7 +1807,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_bundle_contents_and_papi_response() {
+    fn parses_bundle_contents() {
         let bundle = compound([
             ("id", NbtValue::String("minecraft:bundle".into())),
             ("count", NbtValue::Int(1)),
@@ -1654,6 +1827,31 @@ mod tests {
             item.container.unwrap().slots[0].item.as_ref().unwrap().id,
             "minecraft:apple"
         );
+    }
+
+    #[test]
+    fn reports_bridge_papi_capability_for_field_configuration() {
+        let available_capabilities = vec!["snapshot".into(), "papi_read".into()];
+        let (detected, runtime_available, message) =
+            bridge_papi_fields_status(&available_capabilities);
+        assert!(detected);
+        assert!(runtime_available);
+        assert!(message.contains("插件 API"));
+
+        let unavailable_capabilities = vec!["snapshot".into()];
+        let (detected, runtime_available, message) =
+            bridge_papi_fields_status(&unavailable_capabilities);
+        assert!(!detected);
+        assert!(runtime_available);
+        assert!(message.contains("未声明 papi_read 能力"));
+    }
+
+    #[test]
+    fn reports_papi_as_unavailable_without_the_bridge() {
+        let (detected, runtime_available, message) = bridge_unavailable_papi_fields_status();
+        assert!(!detected);
+        assert!(!runtime_available);
+        assert!(message.contains("不会通过受管控制台"));
 
         let field = PapiField {
             id: Uuid::nil(),
@@ -1661,13 +1859,35 @@ mod tests {
             placeholder: "%player_level%".into(),
             enabled: true,
         };
-        let values = parse_papi_values(
-            "[PAPI] SCULK_PAPI_abc_0:24SCULK_PAPI_abc_END",
-            &[field],
-            "SCULK_PAPI_abc",
-        );
-        assert_eq!(values[0].value.as_deref(), Some("24"));
-        assert_eq!(values[0].status, "available");
+        let response = bridge_unavailable_papi_values_response(&[field]);
+        assert!(!response.detected);
+        assert!(!response.runtime_available);
+        assert_eq!(response.fields[0].status, "bridge_unavailable");
+    }
+
+    #[test]
+    fn preserves_missing_nbt_item_count_and_bridge_item_count() {
+        let offline_item = compound([("id", NbtValue::String("minecraft:diamond".into()))]);
+        let parsed = parse_item(nbt_compound(&offline_item).unwrap(), None, 0).unwrap();
+        assert_eq!(parsed.count, None);
+
+        let bridge = player_bridge::BridgeItem {
+            id: "minecraft:diamond".into(),
+            count: 32,
+            name: None,
+            lore: Vec::new(),
+            container: None,
+        };
+        assert_eq!(bridge_item(&bridge).count, Some(32));
+    }
+
+    #[test]
+    fn keeps_missing_snapshot_sections_unavailable() {
+        let snapshot = parse_player_snapshot(&compound([])).unwrap();
+
+        assert_eq!(snapshot.level, None);
+        assert!(snapshot.inventory.is_none());
+        assert!(snapshot.ender_chest.is_none());
     }
 
     #[test]

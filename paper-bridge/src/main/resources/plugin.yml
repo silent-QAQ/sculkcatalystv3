@@ -1,0 +1,16 @@
+# 插件注册名称。
+name: SculkCatalystPaperBridge
+# 构建时展开的插件版本。
+version: '${version}'
+# Bukkit 兼容描述符的主类。
+main: com.sculkcatalyst.paperbridge.PaperBridgePlugin
+# 最低 Bukkit API 版本。
+api-version: '1.21'
+# 管理员可见的插件说明。
+description: Read-only bridge for Sculk Catalyst player management.
+# 插件作者信息。
+authors: [SculkCatalyst]
+# 旧描述符中的可选 PlaceholderAPI 依赖。
+softdepend: [PlaceholderAPI]
+# 声明插件按 Folia 调度约束实现。
+folia-supported: true
