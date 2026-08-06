@@ -118,8 +118,9 @@ done
 
 [[ "$confirm_public_admin_console" == true ]] || \
   die 'Pass --confirm-public-admin-console to acknowledge the remotely reachable administrative console.'
-[[ "$backend_port" =~ ^[0-9]+$ ]] && (($backend_port >= 1 && $backend_port <= 65535)) || \
+if [[ ! "$backend_port" =~ ^[0-9]+$ ]] || ((backend_port < 1 || backend_port > 65535)); then
   die "Invalid port: $backend_port"
+fi
 
 if [[ -z "$caddy_command" ]]; then
   caddy_command="$(command -v caddy || true)"
@@ -230,7 +231,9 @@ if [[ -z "$backend_pid" ]]; then
   SCULK_PUBLIC_PROXY_MANAGED=true "$script_dir/start-local.sh" --port "$backend_port"
   [[ -f "$backend_pid_file" ]] || die 'The loopback backend did not start.'
   backend_pid="$(<"$backend_pid_file")"
-  [[ "$backend_pid" =~ ^[0-9]+$ ]] && process_is_running "$backend_pid" || die 'The loopback backend did not start.'
+  if [[ ! "$backend_pid" =~ ^[0-9]+$ ]] || ! process_is_running "$backend_pid"; then
+    die 'The loopback backend did not start.'
+  fi
   actual_executable="$(readlink -f "/proc/$backend_pid/exe" 2>/dev/null || true)"
   [[ "$actual_executable" == "$backend" ]] || die "Backend PID file points to a different process: $backend_pid"
   printf '%s\n' "$backend_pid" > "$public_backend_pid_file"
