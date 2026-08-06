@@ -2782,6 +2782,7 @@ async fn read_cli_output<R: AsyncRead + Unpin>(
     }
 }
 
+#[cfg(windows)]
 async fn read_cli_last_message_file(
     child: &mut Child,
     path: &FsPath,
@@ -3148,11 +3149,6 @@ fn windows_cli_working_directory(path: &FsPath) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-#[cfg(not(windows))]
-fn windows_cli_working_directory(path: &FsPath) -> Result<PathBuf, String> {
-    Ok(path.to_owned())
-}
-
 #[cfg(windows)]
 fn windows_batch_invocation(shim: &FsPath, args: &[String]) -> Result<String, String> {
     let shim = windows_cmd_compatible_batch_path(shim)?;
@@ -3197,27 +3193,25 @@ fn cli_command(agent: &AiAgent, invocation: &CliInvocation) -> Result<Command, S
     Ok(command)
 }
 
+#[cfg(windows)]
 enum CliResponseCapture {
     Stdout,
-    #[cfg(windows)]
     LastMessageFile(PathBuf),
 }
 
+#[cfg(windows)]
 impl CliResponseCapture {
     fn uses_last_message_file(&self) -> bool {
-        #[cfg(windows)]
-        if matches!(self, Self::LastMessageFile(_)) {
-            return true;
-        }
-        false
+        matches!(self, Self::LastMessageFile(_))
     }
 }
 
+#[cfg(windows)]
 struct CliOutputFileCleanup(Option<PathBuf>);
 
+#[cfg(windows)]
 impl CliOutputFileCleanup {
     fn for_capture(capture: &CliResponseCapture) -> Self {
-        #[cfg(windows)]
         if let CliResponseCapture::LastMessageFile(path) = capture {
             return Self(Some(path.clone()));
         }
@@ -3225,6 +3219,7 @@ impl CliOutputFileCleanup {
     }
 }
 
+#[cfg(windows)]
 impl Drop for CliOutputFileCleanup {
     fn drop(&mut self) {
         let Some(path) = self.0.take() else {
@@ -3239,32 +3234,29 @@ impl Drop for CliOutputFileCleanup {
     }
 }
 
+#[cfg(windows)]
 fn configure_cli_response_capture(
     agent: &AiAgent,
     invocation: &mut CliInvocation,
     working_directory: &FsPath,
 ) -> Result<CliResponseCapture, String> {
-    #[cfg(windows)]
-    {
-        let configured = PathBuf::from(&agent.command);
-        if agent.kind == "codex" && configured.is_absolute() && is_windows_batch_script(&configured)
-        {
-            let output_name = format!(".sculk-codex-{}.txt", Uuid::new_v4().simple());
-            let output_path = working_directory.join(&output_name);
-            if output_path.exists() {
-                return Err("无法分配 Codex CLI 输出文件".into());
-            }
-            let stdin_index = invocation
-                .args
-                .iter()
-                .rposition(|argument| argument == "-")
-                .ok_or_else(|| "Codex CLI 缺少受控标准输入参数".to_string())?;
-            invocation.args.splice(
-                stdin_index..stdin_index,
-                ["--output-last-message".into(), output_name],
-            );
-            return Ok(CliResponseCapture::LastMessageFile(output_path));
+    let configured = PathBuf::from(&agent.command);
+    if agent.kind == "codex" && configured.is_absolute() && is_windows_batch_script(&configured) {
+        let output_name = format!(".sculk-codex-{}.txt", Uuid::new_v4().simple());
+        let output_path = working_directory.join(&output_name);
+        if output_path.exists() {
+            return Err("无法分配 Codex CLI 输出文件".into());
         }
+        let stdin_index = invocation
+            .args
+            .iter()
+            .rposition(|argument| argument == "-")
+            .ok_or_else(|| "Codex CLI 缺少受控标准输入参数".to_string())?;
+        invocation.args.splice(
+            stdin_index..stdin_index,
+            ["--output-last-message".into(), output_name],
+        );
+        return Ok(CliResponseCapture::LastMessageFile(output_path));
     }
     Ok(CliResponseCapture::Stdout)
 }
@@ -3297,12 +3289,12 @@ async fn stream_cli_agent(
     tx: &mpsc::Sender<Event>,
     full_reply: &mut String,
 ) -> StreamOutcome {
-    let mut invocation =
-        match cli_invocation(agent, reasoning_effort, review_mode, full_access_allowed) {
-            Ok(invocation) => invocation,
-            Err(error) if agent.kind == "codex" => return StreamOutcome::PolicyDenied(error),
-            Err(error) => return StreamOutcome::FailedBeforeOutput(error),
-        };
+    let invocation = match cli_invocation(agent, reasoning_effort, review_mode, full_access_allowed)
+    {
+        Ok(invocation) => invocation,
+        Err(error) if agent.kind == "codex" => return StreamOutcome::PolicyDenied(error),
+        Err(error) => return StreamOutcome::FailedBeforeOutput(error),
+    };
     if invocation.codex_full_access && !codex_command_is_trusted(&agent.command) {
         return StreamOutcome::PolicyDenied(
             "Codex 完全访问要求当前 Agent 的启动命令与 SCULK_CODEX_TRUSTED_COMMAND 指向同一个绝对可执行文件。".into(),
@@ -3313,6 +3305,7 @@ async fn stream_cli_agent(
             Ok(directory) => directory,
             Err(error) => return StreamOutcome::PolicyDenied(error),
         };
+    #[cfg(windows)]
     let working_directory = match windows_cli_working_directory(&working_directory) {
         Ok(directory) => directory,
         Err(error) => return StreamOutcome::PolicyDenied(error),
@@ -3325,12 +3318,23 @@ async fn stream_cli_agent(
         skill_context,
         plugin_context,
     );
-    let response_capture =
-        match configure_cli_response_capture(agent, &mut invocation, &working_directory) {
+    #[cfg(windows)]
+    let (invocation, response_capture) = {
+        let mut configured_invocation = invocation;
+        let response_capture = match configure_cli_response_capture(
+            agent,
+            &mut configured_invocation,
+            &working_directory,
+        ) {
             Ok(capture) => capture,
             Err(error) => return StreamOutcome::FailedBeforeOutput(error),
         };
+        (configured_invocation, response_capture)
+    };
+    #[cfg(windows)]
     let _output_file_cleanup = CliOutputFileCleanup::for_capture(&response_capture);
+    #[cfg(windows)]
+    let uses_last_message_file = response_capture.uses_last_message_file();
     let mut command = match cli_command(agent, &invocation) {
         Ok(command) => command,
         Err(error) => return StreamOutcome::FailedBeforeOutput(error),
@@ -3339,11 +3343,16 @@ async fn stream_cli_agent(
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(false);
-    if response_capture.uses_last_message_file() {
-        command.stdout(Stdio::null());
-    } else {
-        command.stdout(Stdio::piped());
+    #[cfg(windows)]
+    {
+        if uses_last_message_file {
+            command.stdout(Stdio::null());
+        } else {
+            command.stdout(Stdio::piped());
+        }
     }
+    #[cfg(not(windows))]
+    command.stdout(Stdio::piped());
     configure_cli_environment(&mut command, invocation.codex_full_access);
     command.current_dir(&working_directory);
     if crate::process_platform::configure_managed_command(&mut command).is_err() {
@@ -3396,7 +3405,8 @@ async fn stream_cli_agent(
         return StreamOutcome::FailedBeforeOutput(format!("关闭 CLI 标准输入失败：{error}"));
     }
 
-    let stdout = if response_capture.uses_last_message_file() {
+    #[cfg(windows)]
+    let stdout = if uses_last_message_file {
         None
     } else {
         match child.stdout.take() {
@@ -3405,6 +3415,14 @@ async fn stream_cli_agent(
                 terminate_cli_process_tree(&mut child, pid, &guard).await;
                 return StreamOutcome::FailedBeforeOutput("CLI 标准输出不可用".into());
             }
+        }
+    };
+    #[cfg(not(windows))]
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_cli_process_tree(&mut child, pid, &guard).await;
+            return StreamOutcome::FailedBeforeOutput("CLI 标准输出不可用".into());
         }
     };
     let stderr = match child.stderr.take() {
@@ -3418,6 +3436,7 @@ async fn stream_cli_agent(
     let output_budget = Arc::new(CliOutputBudget::new(CLI_MAX_TOTAL_OUTPUT_BYTES));
     let (output_limit_tx, output_limit_rx) = watch::channel(false);
     let mut exit_output_limit_rx = output_limit_rx.clone();
+    #[cfg(windows)]
     let mut file_output_limit_rx = output_limit_rx.clone();
     let stderr_task = tokio::spawn(read_cli_stderr(
         stderr,
@@ -3438,6 +3457,7 @@ async fn stream_cli_agent(
         return StreamOutcome::ClientGone;
     }
 
+    #[cfg(windows)]
     let read = match &response_capture {
         CliResponseCapture::Stdout => {
             let stdout = stdout.expect("stdout capture is configured");
@@ -3482,6 +3502,26 @@ async fn stream_cli_agent(
             }
         }
     };
+    #[cfg(not(windows))]
+    let read = {
+        match tokio::time::timeout(
+            Duration::from_secs(30 * 60),
+            read_cli_output(
+                stdout,
+                tx,
+                full_reply,
+                &redaction_secrets,
+                output_budget,
+                output_limit_rx,
+                Duration::from_secs(120),
+            ),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => CliOutputRead::TimedOut("CLI 总执行时间超过 30 分钟，已终止".into()),
+        }
+    };
     match read {
         CliOutputRead::ClientGone => {
             terminate_cli_process_tree(&mut child, pid, &guard).await;
@@ -3518,7 +3558,8 @@ async fn stream_cli_agent(
         }
         CliOutputRead::Eof => {}
     }
-    if response_capture.uses_last_message_file() {
+    #[cfg(windows)]
+    if uses_last_message_file {
         // The npm Windows command wrapper can retain handles after the last
         // message is written. Once the official CLI output file is read, the
         // managed process tree can be closed.

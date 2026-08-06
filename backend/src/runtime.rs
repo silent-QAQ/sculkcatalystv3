@@ -898,7 +898,7 @@ fn extract_tar_gz_archive_sync(archive: &Path, destination: &Path) -> Result<(),
             InstallError::new(InstallErrorKind::Archive, "无法读取 Java 下载包条目")
         })?;
         let kind = entry.header().entry_type();
-        if !kind.is_file() && !kind.is_dir() {
+        if !(kind.is_file() || kind.is_dir()) {
             return Err(InstallError::new(
                 InstallErrorKind::Archive,
                 "Java 下载包包含不允许的链接或特殊文件",
